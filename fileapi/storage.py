@@ -38,7 +38,21 @@ class Edit:
     new_text: str
 
 
+def normalize(p: str | None) -> str:
+    """Canonical relative path: forward slashes, no leading slash, no '.', '..' or empty segments."""
+    segs = []
+    for seg in (p or "").replace("\\", "/").split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise StorageError(f"Path may not contain '..': {p}")
+        segs.append(seg)
+    return "/".join(segs)
+
+
 class Storage:
+    """Local filesystem backend."""
+
     def __init__(self, root: str | os.PathLike):
         self.root = Path(root).resolve()
 
@@ -54,6 +68,15 @@ class Storage:
         if target != self.root and self.root not in target.parents:
             raise StorageError(f"Path escapes storage root: {p}")
         return target
+
+    def is_dir(self, p: str) -> bool:
+        return self.resolve(p).is_dir()
+
+    def _mkparents(self, path: Path, p: str) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise StorageError(f"Not a directory: a parent of {p} is a file") from None
 
     def _rel(self, abs_path: Path) -> str:
         return abs_path.relative_to(self.root).as_posix()
@@ -116,7 +139,7 @@ class Storage:
         existed = path.exists()
         if existed and not overwrite:
             raise Conflict(f"File already exists: {p} (use write_file or edit_file to change it)")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._mkparents(path, p)
         data = content.encode("utf-8")
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".fileapi-tmp")
         try:
@@ -147,7 +170,7 @@ class Storage:
         path = self.resolve(p)
         if path == self.root or path.is_dir():
             raise StorageError(f"Not a file: {p}")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._mkparents(path, p)
         with path.open("a", encoding="utf-8") as f:
             f.write(content)
         return path.stat().st_size
@@ -174,5 +197,5 @@ class Storage:
             raise NotFound(f"No such file: {src}")
         if b.exists() and not overwrite:
             raise Conflict(f"Destination exists: {dst}")
-        b.parent.mkdir(parents=True, exist_ok=True)
+        self._mkparents(b, dst)
         os.replace(a, b)

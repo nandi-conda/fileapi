@@ -1,0 +1,254 @@
+"""Postgres backend for hosts without a persistent disk (e.g. FastAPI Cloud with Neon or Supabase).
+
+Files are rows keyed by their normalized path. Directories are implicit: a directory exists while
+some file lives under it, so there are no empty directories.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
+
+from .storage import Conflict, Edit, Entry, NotFound, StorageError, normalize
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS fileapi_files (
+    path     text PRIMARY KEY,
+    content  text NOT NULL,
+    size     integer NOT NULL,
+    modified timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS fileapi_kv (
+    key   text PRIMARY KEY,
+    value jsonb NOT NULL
+);
+"""
+
+
+def _like_prefix(prefix: str) -> str:
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "%"
+
+
+class PostgresStorage:
+    def __init__(self, dsn: str, pool: ConnectionPool | None = None):
+        self.pool = pool or ConnectionPool(dsn, min_size=1, max_size=5, open=True, kwargs={"autocommit": True})
+        self.root = "postgres"
+
+    def init(self) -> None:
+        with self.pool.connection() as c:
+            c.execute(SCHEMA)
+
+    # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _iso(ts: datetime) -> str:
+        return ts.astimezone(timezone.utc).isoformat()
+
+    def _file_row(self, path: str):
+        with self.pool.connection() as c:
+            return c.execute("SELECT content, size, modified FROM fileapi_files WHERE path = %s", (path,)).fetchone()
+
+    def _has_children(self, prefix: str) -> bool:
+        if not prefix:
+            return True
+        with self.pool.connection() as c:
+            return (
+                c.execute(
+                    "SELECT 1 FROM fileapi_files WHERE path LIKE %s LIMIT 1", (_like_prefix(prefix + "/"),)
+                ).fetchone()
+                is not None
+            )
+
+    def is_dir(self, p: str) -> bool:
+        return self._has_children(normalize(p))
+
+    def _require_file_path(self, p: str) -> str:
+        path = normalize(p)
+        if not path:
+            raise StorageError("A file path is required")
+        if self._has_children(path):
+            raise StorageError(f"Is a directory: {p}")
+        # A file may not sit where a parent directory needs to be (e.g. writing a/b when a is a file).
+        parts = path.split("/")
+        parents = ["/".join(parts[:i]) for i in range(1, len(parts))]
+        if parents:
+            with self.pool.connection() as c:
+                hit = c.execute("SELECT path FROM fileapi_files WHERE path = ANY(%s) LIMIT 1", (parents,)).fetchone()
+            if hit:
+                raise StorageError(f"Not a directory: {hit[0]}")
+        return path
+
+    # -- operations ----------------------------------------------------------
+    def list(self, directory: str = "", recursive: bool = False) -> list[Entry]:
+        base = normalize(directory)
+        if base and self._file_row(base):
+            raise StorageError(f"Not a directory: {directory}")
+        prefix = base + "/" if base else ""
+        with self.pool.connection() as c:
+            rows = c.execute(
+                "SELECT path, size, modified FROM fileapi_files WHERE path LIKE %s ORDER BY path",
+                (_like_prefix(prefix),),
+            ).fetchall()
+        if base and not rows:
+            raise NotFound(f"No such directory: {directory}")
+        files: dict[str, Entry] = {}
+        dirs: dict[str, datetime] = {}
+        for path, size, modified in rows:
+            rest = path[len(prefix):].split("/")
+            # every intermediate directory under base
+            depth = len(rest) - 1 if recursive else min(1, len(rest) - 1)
+            for i in range(1, depth + 1):
+                d = prefix + "/".join(rest[:i])
+                dirs[d] = max(dirs.get(d, modified), modified)
+            if recursive or len(rest) == 1:
+                files[path] = Entry(path=path, type="file", size=size, modified=self._iso(modified))
+        out = list(files.values()) + [
+            Entry(path=d + "/", type="dir", size=0, modified=self._iso(m)) for d, m in dirs.items()
+        ]
+        return sorted(out, key=lambda e: e.path.rstrip("/").split("/"))
+
+    def stat(self, p: str) -> Entry:
+        path = normalize(p)
+        row = self._file_row(path)
+        if row:
+            return Entry(path=path, type="file", size=row[1], modified=self._iso(row[2]))
+        if self._has_children(path):
+            return Entry(path=path + "/", type="dir", size=0, modified="")
+        raise NotFound(f"No such file: {p}")
+
+    def read(self, p: str) -> str:
+        path = normalize(p)
+        row = self._file_row(path)
+        if row is None:
+            if self._has_children(path):
+                raise StorageError(f"Is a directory: {p}")
+            raise NotFound(f"No such file: {p}")
+        return row[0]
+
+    def write(self, p: str, content: str, overwrite: bool) -> tuple[bool, int]:
+        path = self._require_file_path(p)
+        size = len(content.encode("utf-8"))
+        with self.pool.connection() as c:
+            if overwrite:
+                row = c.execute(
+                    """INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s)
+                       ON CONFLICT (path) DO UPDATE SET content = EXCLUDED.content, size = EXCLUDED.size,
+                       modified = now() RETURNING (xmax = 0)""",
+                    (path, content, size),
+                ).fetchone()
+                return (bool(row[0]), size)
+            row = c.execute(
+                "INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1",
+                (path, content, size),
+            ).fetchone()
+        if row is None:
+            raise Conflict(f"File already exists: {p} (use write_file or edit_file to change it)")
+        return (True, size)
+
+    def edit(self, p: str, edits: list[Edit]) -> int:
+        path = normalize(p)
+        with self.pool.connection() as c, c.transaction():
+            row = c.execute("SELECT content FROM fileapi_files WHERE path = %s FOR UPDATE", (path,)).fetchone()
+            if row is None:
+                raise NotFound(f"No such file: {p}")
+            content = row[0]
+            for i, e in enumerate(edits, 1):
+                if not e.old_text:
+                    raise StorageError(f"Edit {i}: old_text must not be empty")
+                count = content.count(e.old_text)
+                if count == 0:
+                    raise StorageError(f"Edit {i}: old_text not found in {p}")
+                if count > 1:
+                    raise StorageError(f"Edit {i}: old_text matches {count} times in {p}; include more context")
+                content = content.replace(e.old_text, e.new_text, 1)
+            c.execute(
+                "UPDATE fileapi_files SET content = %s, size = %s, modified = now() WHERE path = %s",
+                (content, len(content.encode("utf-8")), path),
+            )
+        return len(edits)
+
+    def append(self, p: str, content: str) -> int:
+        path = self._require_file_path(p)
+        size = len(content.encode("utf-8"))
+        with self.pool.connection() as c:
+            row = c.execute(
+                """INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s)
+                   ON CONFLICT (path) DO UPDATE SET content = fileapi_files.content || EXCLUDED.content,
+                   size = fileapi_files.size + EXCLUDED.size, modified = now() RETURNING size""",
+                (path, content, size),
+            ).fetchone()
+        return row[0]
+
+    def delete(self, p: str) -> None:
+        path = normalize(p)
+        if not path:
+            raise StorageError("Refusing to delete the storage root")
+        with self.pool.connection() as c:
+            if c.execute("DELETE FROM fileapi_files WHERE path = %s RETURNING 1", (path,)).fetchone():
+                return
+        if self._has_children(path):
+            raise Conflict(f"Directory not empty: {p}")
+        raise NotFound(f"No such file: {p}")
+
+    def move(self, src: str, dst: str, overwrite: bool = False) -> None:
+        a, b = normalize(src), normalize(dst)
+        if not a or not b:
+            raise StorageError("Cannot move the storage root")
+        if b == a or b.startswith(a + "/"):
+            raise StorageError("Cannot move a path into itself")
+        with self.pool.connection() as c, c.transaction():
+            if c.execute("SELECT 1 FROM fileapi_files WHERE path = %s", (a,)).fetchone():
+                if c.execute("SELECT 1 FROM fileapi_files WHERE path = %s", (b,)).fetchone():
+                    if not overwrite:
+                        raise Conflict(f"Destination exists: {dst}")
+                    c.execute("DELETE FROM fileapi_files WHERE path = %s", (b,))
+                elif self._has_children(b):
+                    raise Conflict(f"Destination exists: {dst}")
+                c.execute("UPDATE fileapi_files SET path = %s, modified = now() WHERE path = %s", (b, a))
+                return
+            moved = c.execute(
+                "SELECT path FROM fileapi_files WHERE path LIKE %s", (_like_prefix(a + "/"),)
+            ).fetchall()
+            if not moved:
+                raise NotFound(f"No such file: {src}")
+            targets = [b + p[len(a):] for (p,) in moved]
+            clash = c.execute("SELECT path FROM fileapi_files WHERE path = ANY(%s) LIMIT 1", (targets,)).fetchone()
+            if clash or self._has_children(b) or c.execute(
+                "SELECT 1 FROM fileapi_files WHERE path = %s", (b,)
+            ).fetchone():
+                raise Conflict(f"Destination exists: {dst}")
+            c.execute(
+                "UPDATE fileapi_files SET path = %s || substr(path, %s), modified = now() WHERE path LIKE %s",
+                (b, len(a) + 1, _like_prefix(a + "/")),
+            )
+
+
+class PostgresKV:
+    """Key/value records for the token store."""
+
+    def __init__(self, storage: PostgresStorage):
+        self.pool = storage.pool
+
+    def get(self, key: str) -> dict | None:
+        with self.pool.connection() as c:
+            row = c.execute("SELECT value FROM fileapi_kv WHERE key = %s", (key,)).fetchone()
+        return row[0] if row else None
+
+    def put(self, key: str, value: dict) -> None:
+        with self.pool.connection() as c:
+            c.execute(
+                "INSERT INTO fileapi_kv VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, Jsonb(value)),
+            )
+
+    def create(self, key: str, value: dict) -> bool:
+        with self.pool.connection() as c:
+            row = c.execute(
+                "INSERT INTO fileapi_kv VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING 1", (key, Jsonb(value))
+            ).fetchone()
+        return row is not None
+
+
+__all__ = ["PostgresStorage", "PostgresKV"]

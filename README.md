@@ -1,23 +1,39 @@
 # fileapi
 
-A central file store you can create, read, list, and edit through MCP (for Claude, Claude Code and other MCP clients) or through a plain REST API. Built on FastAPI and the official MCP Python SDK.
+A central file store you can create, read, list, and edit through MCP (Claude, Claude Code, any MCP client) or a plain REST API. Built on FastAPI and the official MCP Python SDK.
 
-- **MCP:** Streamable HTTP at `POST /mcp` (stateless, JSON responses). `fileapi stdio` runs the same tools over stdio for local use.
-- **REST:** `/files/...` endpoints, documented at `/docs`.
-- **Storage:** plain files on disk under `FILEAPI_ROOT`. Paths are sandboxed to that folder (no `..`, no symlink escapes). Writes are atomic.
-- **Auth:** web sign-in with Google, limited to an email allowlist. MCP clients (Claude, Claude Code, ...) discover it automatically through the standard MCP OAuth flow: you click "Continue with Google" once and the client gets a token. Uses Google's drop-in "Sign in with Google" button, so only a Google **client ID** is needed (no client secret). An optional static token is available for scripts.
+- **MCP:** Streamable HTTP at `/mcp` (stateless). `fileapi stdio` runs the same tools over stdio for local use.
+- **REST:** `/files/...`, documented at `/docs`.
+- **Storage:** Postgres when `DATABASE_URL` is set (needed on hosts without a persistent disk, like FastAPI Cloud), otherwise plain files under `FILEAPI_ROOT`.
+- **Auth:** first client claims the server over MCP and gets the token. See below.
+
+## Auth: first client claims the server
+
+1. Deploy. The server starts **unclaimed**.
+2. Connect any MCP client to `https://<host>/mcp` with no credentials and ask it to call **`claim_server`**. It returns the access token (once, so save it) plus exact reconnect instructions.
+3. From then on the file tools and `/files` need the token, either as:
+   - header `Authorization: Bearer <token>`, or
+   - query string `https://<host>/mcp?token=<token>` for clients that can't set headers (e.g. a claude.ai custom connector).
+4. `claim_server` only works once. A request with no token can still connect and list tools, but every tool refuses. A wrong token gets `401`.
+5. `rotate_token` (needs the current token) issues a new one. The old one keeps working for 60 seconds.
+
+Only a SHA-256 hash of the token is stored. To reset ownership, delete the `access_token` record (`fileapi_kv` table in Postgres, or `$FILEAPI_STATE_DIR/access_token.json`). To skip the claim step, set `FILEAPI_TOKEN` to a token of your choice.
+
+Whoever reaches a fresh deployment first owns it, so claim it right after deploying.
 
 ## MCP tools
 
 | Tool | What it does |
 | --- | --- |
+| `claim_server` | First-time setup: returns the access token. Works once |
+| `rotate_token` | Replace the token |
 | `list_files` | List a directory (`path`, optional `recursive`) |
 | `read_file` | Read a text file |
 | `create_file` | Create a new file; fails if it exists |
 | `write_file` | Create or overwrite a file |
 | `edit_file` | Exact find/replace (`edits: [{old_text, new_text}]`); each `old_text` must match once; all-or-nothing |
 | `append_file` | Append to a file |
-| `move_file` | Move or rename (`source`, `destination`, `overwrite`) |
+| `move_file` | Move or rename a file or directory (`source`, `destination`, `overwrite`) |
 | `delete_file` | Delete a file or empty directory |
 
 ## REST API
@@ -32,67 +48,59 @@ A central file store you can create, read, list, and edit through MCP (for Claud
 | `POST /files/{path}:move` | `{"destination": "...", "overwrite": false}` |
 | `DELETE /files/{path}` | Delete |
 
-## Google setup (client ID only)
+## Deploy to FastAPI Cloud
 
-1. Google Cloud Console → APIs & Services → Credentials → **Create credentials → OAuth client ID**.
-2. Application type: **Web application**.
-3. **Authorized JavaScript origins:** your server's public URL, e.g. `https://files.example.com` (add `http://localhost:8000` too for local testing). No redirect URI is needed.
-4. Copy the **Client ID** (`....apps.googleusercontent.com`). You do not need the client secret.
+FastAPI Cloud has no persistent disk, so use Postgres through its Neon or Supabase integration, which sets `DATABASE_URL` for you.
 
-## Run
+```sh
+pip install "fastapi[standard]"
+fastapi login
+fastapi deploy                      # entrypoint comes from [tool.fastapi] in pyproject.toml
+# In the FastAPI Cloud dashboard: add the Neon (or Supabase) Postgres integration -> sets DATABASE_URL
+fastapi deploy                      # redeploy so it picks up DATABASE_URL
+```
+
+Then connect a client to `https://<app>.fastapicloud.dev/mcp` and call `claim_server`. Tables are created automatically on startup.
+
+## Run elsewhere
 
 ```sh
 pip install .
-export FILEAPI_PUBLIC_URL=https://files.example.com
-export GOOGLE_CLIENT_ID=1234-abc.apps.googleusercontent.com
-export FILEAPI_ALLOWED_EMAILS=you@gmail.com,friend@gmail.com
-fileapi
+fileapi                              # files in ./data, token record in ./state
+# or: DATABASE_URL=postgresql://user:pass@host/db fileapi
 ```
 
-Or with Docker:
+Docker:
 
 ```sh
 docker build -t fileapi .
-docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state \
-  -e FILEAPI_PUBLIC_URL=https://files.example.com \
-  -e GOOGLE_CLIENT_ID=1234-abc.apps.googleusercontent.com \
-  -e FILEAPI_ALLOWED_EMAILS=you@gmail.com fileapi
+docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state fileapi
 ```
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `FILEAPI_PUBLIC_URL` | (required) | The https URL clients use; also the OAuth issuer. `http://localhost` works for testing |
-| `GOOGLE_CLIENT_ID` | | Google OAuth client ID (web application) |
-| `FILEAPI_ALLOWED_EMAILS` | | Comma-separated Google accounts allowed to sign in. Removing one revokes its tokens |
-| `FILEAPI_TOKEN` | unset | Optional static bearer token for scripts/headless clients |
-| `FILEAPI_ROOT` | `./data` | Where files live |
-| `FILEAPI_STATE_DIR` | `./state` | OAuth clients and tokens (SQLite, tokens stored hashed). Must be outside `FILEAPI_ROOT` |
-| `HOST` / `PORT` | `0.0.0.0` / `8000` | Run behind an HTTPS reverse proxy in production |
+| `DATABASE_URL` | unset | Postgres connection string. When set, files and the token live in Postgres |
+| `FILEAPI_ROOT` | `./data` | Filesystem backend: where files live |
+| `FILEAPI_STATE_DIR` | `./state` | Filesystem backend: token record. Must be outside `FILEAPI_ROOT` |
+| `FILEAPI_TOKEN` | unset | Pin the token yourself and skip `claim_server` |
+| `FILEAPI_PUBLIC_URL` | from request | Base URL shown in reconnect instructions |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | For `fileapi` CLI |
 | `FILEAPI_MAX_BODY` | `10485760` | Max MCP request size in bytes |
 
-At least one of `GOOGLE_CLIENT_ID` or `FILEAPI_TOKEN` is required. Health check: `GET /health` (no auth).
-
-### How sign-in works
-
-1. The MCP client hits `/mcp`, gets a 401 pointing at the OAuth metadata, registers itself (`/register`) and opens `/authorize` in your browser.
-2. You see which app is asking, then click **Continue with Google**.
-3. Google returns a signed ID token to the page; the server checks Google's signature, audience (your client ID), a per-request nonce, `email_verified`, and the allowlist.
-4. The client receives an access token (1 hour) and refresh token (30 days, rotated on use).
+Health check: `GET /health` returns `{"ok": true, "claimed": ...}`.
 
 ## Connect a client
-
-Claude (claude.ai / desktop): Settings → Connectors → Add custom connector → URL `https://your-host/mcp`. Leave the OAuth client ID/secret fields empty; it registers itself and sends you to the Google sign-in page.
 
 Claude Code:
 
 ```sh
-claude mcp add --transport http fileapi https://your-host/mcp
-# then run /mcp inside Claude Code and choose Authenticate
+claude mcp add --transport http fileapi https://<host>/mcp                    # first time, then ask it to claim_server
+claude mcp add --transport http fileapi https://<host>/mcp --header "Authorization: Bearer <token>"
 ```
 
-Scripts can use the static token instead: header `Authorization: Bearer <FILEAPI_TOKEN>`, on `/mcp` or `/files`.
+claude.ai / Claude desktop: Settings → Connectors → Add custom connector → `https://<host>/mcp?token=<token>`.
 
-Local stdio (no auth, same storage folder):
+Local stdio (no auth, filesystem backend):
 
 ```sh
 claude mcp add fileapi -e FILEAPI_ROOT=/path/to/data -- fileapi stdio
@@ -102,5 +110,6 @@ claude mcp add fileapi -e FILEAPI_ROOT=/path/to/data -- fileapi stdio
 
 ```sh
 pip install -e '.[dev]'
-pytest
+pytest                                                  # filesystem backend
+TEST_DATABASE_URL=postgresql://... pytest               # also runs everything against Postgres
 ```

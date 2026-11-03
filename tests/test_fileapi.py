@@ -3,7 +3,6 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import httpx
 import httpx2
@@ -30,8 +29,24 @@ def app_for(tmp_path, **kw):
     return create_app(str(tmp_path / "data"), **kw)
 
 
+PG_URL = os.environ.get("TEST_DATABASE_URL")
+
+
+@pytest.fixture(params=["filesystem", "postgres"])
+def backend(request):
+    if request.param == "postgres":
+        if not PG_URL:
+            pytest.skip("set TEST_DATABASE_URL to run Postgres tests")
+        import psycopg
+
+        with psycopg.connect(PG_URL, autocommit=True) as c:
+            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv")
+        return {"DATABASE_URL": PG_URL}
+    return {}
+
+
 @pytest.fixture
-def server_url(tmp_path):
+def server_url(tmp_path, backend):
     """A real server process that starts unclaimed."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -39,6 +54,8 @@ def server_url(tmp_path):
     env = {**os.environ, "FILEAPI_ROOT": str(tmp_path / "data"), "FILEAPI_STATE_DIR": str(tmp_path / "state"),
            "HOST": "127.0.0.1", "PORT": str(port), "FILEAPI_PUBLIC_URL": f"http://127.0.0.1:{port}"}
     env.pop("FILEAPI_TOKEN", None)
+    env.pop("DATABASE_URL", None)
+    env.update(backend)
     proc = subprocess.Popen([sys.executable, "-m", "fileapi"], env=env)
     url = f"http://127.0.0.1:{port}"
     for _ in range(100):
@@ -47,17 +64,9 @@ def server_url(tmp_path):
             break
         except httpx.HTTPError:
             time.sleep(0.1)
-    _STATE[url] = str(tmp_path / "state")
     yield url
     proc.terminate()
     proc.wait(5)
-
-
-_STATE: dict[str, str] = {}
-
-
-def server_state(url: str) -> str:
-    return _STATE[url]
 
 
 def connect(url: str, token: str | None = None, via: str = "header") -> Client:
@@ -107,14 +116,9 @@ async def test_first_client_claims_then_token_required(server_url):
     async with connect(server_url, token) as c:
         r = await c.call_tool("rotate_token", {})
         new_token = next(w for w in text(r).split() if w.startswith("fa_"))
-    # old token is in its grace period; expire it
-    import json as _json
-    state = Path(server_state(server_url)) / "token.json"
-    rec = _json.loads(state.read_text())
-    rec["previous"]["until"] = 0
-    state.write_text(_json.dumps(rec))
-    assert httpx.post(f"{server_url}/mcp", headers={"content-type": "application/json",
-                      "Authorization": f"Bearer {token}"}, content="{}").status_code == 401
+    # old token keeps working during the grace period
+    async with connect(server_url, token) as c:
+        assert not (await c.call_tool("list_files", {})).is_error
     async with connect(server_url, new_token) as c:
         assert text(await c.call_tool("list_files", {})) == "(empty)"
 
@@ -149,8 +153,19 @@ def test_rest_api_rejects_everything_while_unclaimed(tmp_path):
         assert c.get("/files").status_code == 401
 
 
-def test_rest_api(tmp_path):
-    with TestClient(app_for(tmp_path)) as c:
+def test_rotated_token_expires_after_grace(tmp_path):
+    from fileapi.tokens import FileKV, TokenStore
+
+    store = TokenStore(FileKV(tmp_path))
+    first = store.claim()
+    assert first and store.claim() is None
+    store.ROTATE_GRACE = 0
+    second = store.rotate()
+    assert store.check(second) and not store.check(first) and not store.check("fa_wrong")
+
+
+def test_rest_api(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as c:
         assert c.get("/files").status_code == 401
         assert c.get("/files", headers={"Authorization": "Bearer nope"}).status_code == 401
 
@@ -179,3 +194,18 @@ def test_rest_api(tmp_path):
 def test_state_dir_must_be_outside_storage(tmp_path):
     with pytest.raises(RuntimeError):
         app_for(tmp_path, state_dir=str(tmp_path / "data" / "state"))
+
+
+def test_directory_semantics(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as c:
+        for p in ["a/b/one.txt", "a/b/two.txt", "a/three.txt", "a_b.txt"]:
+            assert c.put(f"/files/{p}", content=p, headers=AUTH).status_code == 201
+        assert [e["path"] for e in c.get("/files", headers=AUTH).json()] == ["a/", "a_b.txt"]
+        assert [e["path"] for e in c.get("/files/a", headers=AUTH).json()] == ["a/b/", "a/three.txt"]
+        assert c.put("/files/a/three.txt/x", content="x", headers=AUTH).status_code == 400  # parent is a file
+        assert c.put("/files/a", content="x", headers=AUTH).status_code == 400  # is a directory
+        assert c.delete("/files/a", headers=AUTH).status_code == 409  # not empty
+        assert c.post("/files/a:move", json={"destination": "z"}, headers=AUTH).status_code == 200
+        assert c.get("/files/z/b/one.txt", headers=AUTH).text == "a/b/one.txt"
+        assert c.get("/files/a/three.txt", headers=AUTH).status_code == 404
+        assert c.get("/files/a_b.txt", headers=AUTH).text == "a_b.txt"

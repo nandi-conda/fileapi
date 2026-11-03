@@ -18,7 +18,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
-from .tokens import TokenStore
+from .tokens import FileKV, TokenStore
 
 
 class EditBody(BaseModel):
@@ -48,18 +48,28 @@ def create_app(
     state_dir: str | None = None,
     preset_token: str | None = None,
     public_url: str | None = None,
+    database_url: str | None = None,
 ) -> FastAPI:
     root = root or os.environ.get("FILEAPI_ROOT", "./data")
     state_dir = state_dir or os.environ.get("FILEAPI_STATE_DIR", "./state")
     preset_token = preset_token if preset_token is not None else os.environ.get("FILEAPI_TOKEN") or None
     public_url = public_url or os.environ.get("FILEAPI_PUBLIC_URL") or None
 
-    storage = Storage(root)
-    storage.init()
-    state = Path(state_dir).resolve()
-    if state == storage.root or storage.root in state.parents:
-        raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds the token)")
-    tokens = TokenStore(state, preset_token)
+    database_url = database_url if database_url is not None else os.environ.get("DATABASE_URL") or None
+    if database_url:
+        # Hosts without a persistent disk (FastAPI Cloud + Neon/Supabase): files and token live in Postgres.
+        from .storage_pg import PostgresKV, PostgresStorage
+
+        storage = PostgresStorage(database_url)
+        storage.init()
+        tokens = TokenStore(PostgresKV(storage), preset_token)
+    else:
+        storage = Storage(root)
+        storage.init()
+        state = Path(state_dir).resolve()
+        if state == storage.root or storage.root in state.parents:
+            raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds the token)")
+        tokens = TokenStore(FileKV(state), preset_token)
 
     mcp = build_mcp(storage, tokens, public_url)
     mcp_app = mcp.streamable_http_app(
@@ -119,7 +129,7 @@ def create_app(
     @app.get("/files/{path:path}", dependencies=auth)
     def get_file(path: str, recursive: bool = False):
         """Return file contents as text, or a JSON listing if the path is a directory."""
-        if storage.resolve(path).is_dir():
+        if storage.is_dir(path):
             return [e.to_dict() for e in storage.list(path, recursive)]
         return PlainTextResponse(storage.read(path))
 

@@ -27,8 +27,18 @@ def _authed(ctx: Context) -> bool:
     return bool(getattr(request.state, "authed", False))
 
 
-def connect_instructions(token: str, public_url: str | None) -> str:
-    base = (public_url or "https://<your-host>").rstrip("/")
+def _base_url(ctx: Context, public_url: str | None) -> str:
+    if public_url:
+        return public_url.rstrip("/")
+    request = ctx.request_context.request
+    if request is None:
+        return "https://<your-host>"
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc)).split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
+def connect_instructions(token: str, base: str) -> str:
     return (
         f"Access token (shown only once, save it now):\n\n    {token}\n\n"
         "Reconnect with it using either:\n"
@@ -69,7 +79,7 @@ def build_mcp(storage: Storage, tokens: TokenStore | None = None, public_url: st
             token = tokens.claim()
             if token is None:
                 raise ToolError("This server is already claimed. Connect with its access token.")
-            return connect_instructions(token, public_url)
+            return connect_instructions(token, _base_url(ctx, public_url))
 
         @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
         def rotate_token(ctx: Context) -> str:
@@ -78,7 +88,7 @@ def build_mcp(storage: Storage, tokens: TokenStore | None = None, public_url: st
                 raise ToolError("Not authorized.")
             if tokens.preset:
                 raise ToolError("The token is pinned by FILEAPI_TOKEN; change that setting instead.")
-            return connect_instructions(tokens.rotate(), public_url)
+            return connect_instructions(tokens.rotate(), _base_url(ctx, public_url))
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def list_files(ctx: Context, path: str = "", recursive: bool = False) -> str:
