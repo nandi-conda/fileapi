@@ -209,3 +209,9 @@ def test_directory_semantics(tmp_path, backend):
         assert c.get("/files/z/b/one.txt", headers=AUTH).text == "a/b/one.txt"
         assert c.get("/files/a/three.txt", headers=AUTH).status_code == 404
         assert c.get("/files/a_b.txt", headers=AUTH).text == "a_b.txt"
+
+
+def test_index_page(tmp_path):
+    with TestClient(app_for(tmp_path, preset_token="")) as c:
+        r = c.get("/")
+        assert r.status_code == 200 and "Not claimed yet" in r.text and "/mcp" in r.text

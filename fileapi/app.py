@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -114,6 +114,28 @@ def create_app(
     async def storage_error(_req: Request, exc: StorageError):
         status = 404 if isinstance(exc, NotFound) else 409 if isinstance(exc, Conflict) else 400
         return JSONResponse({"detail": str(exc)}, status_code=status)
+
+    @app.get("/", include_in_schema=False)
+    def index(request: Request):
+        base = str(request.base_url).rstrip("/")
+        proto = request.headers.get("x-forwarded-proto")
+        if proto:
+            base = proto.split(",")[0].strip() + base[base.index("://"):]
+        claimed = tokens.claimed()
+        status = (
+            "Claimed. Connect with the access token."
+            if claimed
+            else "Not claimed yet. Connect an MCP client with no credentials and call <code>claim_server</code>."
+        )
+        return HTMLResponse(f"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>fileapi</title>
+<style>body{{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:0 1rem;background:#fafafa;color:#1a1a1a}}
+code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all}}
+@media (prefers-color-scheme:dark){{body{{background:#121212;color:#eee}}code{{background:#2a2a2a}}}}</style></head>
+<body><h1>fileapi</h1><p>A central file store for MCP clients.</p>
+<p><b>Status:</b> {status}</p>
+<p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
+<p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
     @app.get("/health")
     def health():
