@@ -21,9 +21,20 @@ test:
 dev:
     {{fastapi}} dev
 
-# Log in to Neon in the browser (skipped if already logged in)
+# Log in to Neon in the browser, unless NEON_API_KEY is set (use that on remote/headless machines)
 neon-login:
-    @{{neon}} me >/dev/null 2>&1 && echo "Already logged in to Neon." || {{neon}} auth
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${NEON_API_KEY:-}" ]; then
+        {{neon}} me >/dev/null || { echo "NEON_API_KEY was rejected by Neon. Create a new one: Neon Console > Account settings > API keys." >&2; exit 1; }
+        echo "Using NEON_API_KEY."
+    elif {{neon}} me >/dev/null 2>&1; then
+        echo "Already logged in to Neon."
+    else
+        echo "Opening Neon login in your browser. On a remote machine the localhost callback can't be reached;"
+        echo "instead put NEON_API_KEY=<key> in .env (Neon Console > Account settings > API keys)."
+        {{neon}} auth
+    fi
 
 # Log in to Neon, create the "fileapi" project if needed, and write DATABASE_URL to .env
 neon-db: neon-login

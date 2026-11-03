@@ -62,6 +62,14 @@ just launch       # FastAPI Cloud browser login, first deploy (creates the app),
 
 After that, `just deploy` redeploys and `just logs` streams logs. The pieces also run on their own: `just login`, `just deploy`, `just cloud-db`.
 
+**Running on a remote or headless machine?** The Neon browser login needs a callback to `localhost` on the machine running `just`, which fails over SSH. Use an API key instead: Neon Console → Account settings → **API keys** → Create new API key (a personal key; an organization key also works), then put it in `.env`:
+
+```sh
+NEON_API_KEY=napi_...
+```
+
+`neonctl` reads `NEON_API_KEY` automatically, and `just` loads `.env`, so no browser login is needed. (`fastapi login` uses a device code, so it already works remotely.)
+
 `just neon-db` does the same without touching FastAPI Cloud (handy for local runs; `just dev` reads `.env`). Set `NEON_ORG_ID` if your Neon account has several organizations, or `NEON_PROJECT_NAME` to use another project name.
 
 Or by hand, using the Neon/Supabase integration in the FastAPI Cloud dashboard (it sets `DATABASE_URL` for you):
