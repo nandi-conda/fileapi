@@ -31,9 +31,8 @@ neon-login:
     elif {{neon}} me >/dev/null 2>&1; then
         echo "Already logged in to Neon."
     else
-        echo "Opening Neon login in your browser. On a remote machine the localhost callback can't be reached;"
-        echo "instead put NEON_API_KEY=<key> in .env (Neon Console > Account settings > API keys)."
-        {{neon}} auth
+        echo "Opening Neon login in your browser. Finish it promptly: the login times out after a short wait."
+        {{neon}} auth || { echo "Neon login didn't complete (it may have timed out). Run the same just command again to retry." >&2; exit 1; }
     fi
 
 # Log in to Neon, create the "fileapi" project if needed, and write DATABASE_URL to .env
