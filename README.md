@@ -50,7 +50,20 @@ Whoever reaches a fresh deployment first owns it, so claim it right after deploy
 
 ## Deploy to FastAPI Cloud
 
-FastAPI Cloud has no persistent disk, so use Postgres through its Neon or Supabase integration, which sets `DATABASE_URL` for you.
+FastAPI Cloud has no persistent disk, so files and the token go in Postgres.
+
+With [just](https://github.com/casey/just) and Node installed:
+
+```sh
+fastapi login
+just cloud-db     # Neon browser login, creates a "fileapi" Neon project if needed,
+                  # writes DATABASE_URL to .env and sets it on FastAPI Cloud
+just deploy
+```
+
+`just neon-db` does the same without touching FastAPI Cloud (handy for local runs; `just dev` reads `.env`). Set `NEON_ORG_ID` if your Neon account has several organizations, or `NEON_PROJECT_NAME` to use another project name.
+
+Or by hand, using the Neon/Supabase integration in the FastAPI Cloud dashboard (it sets `DATABASE_URL` for you):
 
 ```sh
 pip install "fastapi[standard]"
