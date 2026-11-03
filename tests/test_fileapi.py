@@ -216,3 +216,9 @@ def test_index_page(tmp_path):
     with TestClient(app_for(tmp_path, preset_token="")) as c:
         r = c.get("/")
         assert r.status_code == 200 and "Not claimed yet" in r.text and "/mcp" in r.text
+
+
+def test_cloud_entrypoint_refuses_ephemeral_disk():
+    env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "FILEAPI_ROOT")}
+    r = subprocess.run([sys.executable, "-c", "import fileapi.main"], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "DATABASE_URL is not set" in r.stderr

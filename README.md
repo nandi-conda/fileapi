@@ -50,7 +50,11 @@ Whoever reaches a fresh deployment first owns it, so claim it right after deploy
 
 ## Deploy to FastAPI Cloud
 
-FastAPI Cloud has no persistent disk, so files and the token go in Postgres.
+FastAPI Cloud has no persistent disk (it's replaced on every deploy, restart and scale event), so files and the token go in Postgres. To make it impossible to lose state silently:
+
+- The cloud entrypoint (`fileapi.main:app`) **refuses to start** without `DATABASE_URL`, unless you set `FILEAPI_ROOT` to say a local disk is intended.
+- `just deploy` checks that `DATABASE_URL` is set on FastAPI Cloud and runs `just cloud-db` first if it isn't.
+- Startup only runs `CREATE TABLE IF NOT EXISTS`, so deploys never touch existing data. `just cloud-db` reuses the existing Neon project.
 
 With [just](https://github.com/casey/just), Node (for `npx neonctl`) and either the `fastapi` CLI or `uv` installed:
 

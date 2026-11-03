@@ -19,7 +19,7 @@ test:
 
 # Run locally with auto-reload (uses DATABASE_URL from .env if present)
 dev:
-    {{fastapi}} dev
+    FILEAPI_ROOT="${FILEAPI_ROOT:-./data}" {{fastapi}} dev
 
 # Log in to Neon in the browser, unless NEON_API_KEY is set (use that on remote/headless machines)
 neon-login:
@@ -70,8 +70,18 @@ neon-db: neon-login
 login:
     @{{fastapi}} cloud whoami >/dev/null 2>&1 && echo "Already logged in to FastAPI Cloud." || {{fastapi}} login
 
-# Deploy to FastAPI Cloud (logs in first if needed; the first run creates the app)
+# Deploy to FastAPI Cloud. Makes sure DATABASE_URL is set there first so state survives the deploy.
 deploy: login
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f .fastapicloud/cloud.json ]; then
+        echo "No FastAPI Cloud app linked yet; use 'just launch' for the first deploy." >&2
+        exit 1
+    fi
+    if ! {{fastapi}} cloud env list 2>/dev/null | grep -q 'DATABASE_URL'; then
+        echo "DATABASE_URL is not set on FastAPI Cloud, so a deploy would start on a wiped disk. Setting it up now..."
+        just cloud-db
+    fi
     {{fastapi}} deploy
 
 # Same as neon-db, then store DATABASE_URL on FastAPI Cloud (this redeploys the app)
@@ -82,8 +92,13 @@ cloud-db: neon-db login
     {{fastapi}} cloud env set DATABASE_URL "$url"
     echo "DATABASE_URL set on FastAPI Cloud."
 
-# Neon database + first deploy in one go: login, deploy, set DATABASE_URL
-launch: deploy cloud-db
+# First deploy: creates the app, then sets DATABASE_URL (which redeploys with Postgres)
+launch: login
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The first build refuses to start without DATABASE_URL; that's expected, it just creates the app.
+    {{fastapi}} deploy || echo "(First deploy can't start without DATABASE_URL yet; setting it now.)"
+    just cloud-db
 
 fileapi_url := env("FILEAPI_URL", "https://fileapi.fastapicloud.dev")
 
