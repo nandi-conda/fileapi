@@ -121,6 +121,33 @@ connect-info:
     echo "Claude Desktop / claude.ai (Settings > Connectors > Add custom connector), URL:"
     echo "  $url/mcp?token=$FILEAPI_ACCESS_TOKEN"
 
+# Add fileapi to Claude Code, asking for the token (Enter keeps the one saved in .env). scope: user, project or local
+claude-add url=fileapi_url scope="user":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v claude >/dev/null || { echo "The claude CLI isn't installed: https://docs.claude.com/en/docs/claude-code" >&2; exit 1; }
+    saved="${FILEAPI_ACCESS_TOKEN:-}"
+    if [ -n "$saved" ]; then
+        read -rsp "fileapi access token (Enter to use the one in .env, ...${saved: -4}): " token </dev/tty; echo
+        token="${token:-$saved}"
+    else
+        read -rsp "fileapi access token (fa_...): " token </dev/tty; echo
+    fi
+    token="$(printf '%s' "$token" | tr -d '[:space:]')"
+    [ -n "$token" ] || { echo "No token given. Get one with: just token" >&2; exit 1; }
+    url="{{url}}"; url="${url%/}"; url="${url%/mcp}"
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/mcp" -H "Authorization: Bearer $token" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{}' || true)
+    if [ "$code" = "401" ]; then echo "The server rejected that token (401). Check it, or rotate with: just token" >&2; exit 1; fi
+    claude mcp remove fileapi -s {{scope}} >/dev/null 2>&1 || true
+    claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp" --header "Authorization: Bearer $token"
+    if [ "$token" != "$saved" ]; then
+        touch .env; grep -v -e '^FILEAPI_ACCESS_TOKEN=' -e '^FILEAPI_URL=' .env > .env.tmp || true
+        printf 'FILEAPI_URL=%s\nFILEAPI_ACCESS_TOKEN=%s\n' "$url" "$token" >> .env.tmp; mv .env.tmp .env; chmod 600 .env
+        echo "Saved the token to .env."
+    fi
+    echo "Added fileapi to Claude Code ({{scope}} scope). Check it with: claude mcp list"
+
 # Stream logs from the deployed app
 logs:
     {{fastapi}} cloud logs --follow

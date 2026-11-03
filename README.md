@@ -117,7 +117,7 @@ Health check: `GET /health` returns `{"ok": true, "claimed": ..., "storage": "po
 
 ## Connect a client
 
-Claude Code:
+Claude Code: `just claude-add` asks for the token (hidden; Enter reuses the one in `.env`), checks it against the server, and replaces any existing `fileapi` entry. Options: `just claude-add <url> <scope>` (scope `user`, `project` or `local`). Or by hand:
 
 ```sh
 claude mcp add --transport http fileapi https://<host>/mcp                    # first time, then ask it to claim_server
