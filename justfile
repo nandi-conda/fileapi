@@ -85,6 +85,10 @@ cloud-db: neon-db login
 # Neon database + first deploy in one go: login, deploy, set DATABASE_URL
 launch: deploy cloud-db
 
+# Claim a fresh deployment and print its access token (once!), e.g. just claim https://fileapi.fastapicloud.dev
+claim url:
+    uv run --with 'mcp>=2.3,<3' python scripts/claim.py {{url}}
+
 # Stream logs from the deployed app
 logs:
     {{fastapi}} cloud logs --follow

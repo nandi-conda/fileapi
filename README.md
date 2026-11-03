@@ -82,7 +82,7 @@ fastapi deploy                      # entrypoint comes from [tool.fastapi] in py
 fastapi deploy                      # redeploy so it picks up DATABASE_URL
 ```
 
-Then connect a client to `https://<app>.fastapicloud.dev/mcp` and call `claim_server`. Tables are created automatically on startup.
+Then claim it: `just claim https://<app>.fastapicloud.dev` (or connect any MCP client and call `claim_server`). Tables are created automatically on startup.
 
 ## Run elsewhere
 
