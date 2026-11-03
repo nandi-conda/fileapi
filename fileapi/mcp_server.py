@@ -26,8 +26,10 @@ def _guard(fn):
         raise ToolError(str(e)) from None
 
 
-def build_mcp(storage: Storage) -> MCPServer:
+def build_mcp(storage: Storage, auth_provider=None, auth_settings=None) -> MCPServer:
     mcp = MCPServer(
+        auth_server_provider=auth_provider,
+        auth=auth_settings,
         name="fileapi",
         version="1.0.0",
         instructions="A central file store. Paths are relative to the store root; directories are created automatically.",

@@ -5,3 +5,4 @@ data/
 .env
 .pytest_cache/
 *.fileapi-tmp
+state/
