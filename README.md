@@ -52,14 +52,15 @@ Whoever reaches a fresh deployment first owns it, so claim it right after deploy
 
 FastAPI Cloud has no persistent disk, so files and the token go in Postgres.
 
-With [just](https://github.com/casey/just) and Node installed:
+With [just](https://github.com/casey/just), Node (for `npx neonctl`) and either the `fastapi` CLI or `uv` installed:
 
 ```sh
-fastapi login
-just cloud-db     # Neon browser login, creates a "fileapi" Neon project if needed,
-                  # writes DATABASE_URL to .env and sets it on FastAPI Cloud
-just deploy
+just launch       # FastAPI Cloud browser login, first deploy (creates the app),
+                  # Neon browser login, creates a "fileapi" Neon project if needed,
+                  # writes DATABASE_URL to .env and sets it on FastAPI Cloud (which redeploys)
 ```
+
+After that, `just deploy` redeploys and `just logs` streams logs. The pieces also run on their own: `just login`, `just deploy`, `just cloud-db`.
 
 `just neon-db` does the same without touching FastAPI Cloud (handy for local runs; `just dev` reads `.env`). Set `NEON_ORG_ID` if your Neon account has several organizations, or `NEON_PROJECT_NAME` to use another project name.
 

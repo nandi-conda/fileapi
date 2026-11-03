@@ -2,6 +2,8 @@
 set dotenv-load
 
 neon := "npx -y neonctl@8"
+# FastAPI CLI (includes the FastAPI Cloud commands); falls back to uvx if it isn't installed
+fastapi := if `command -v fastapi >/dev/null 2>&1 && echo yes || echo no` == "yes" { "fastapi" } else { "uvx --from 'fastapi[standard]' fastapi" }
 neon_project := env("NEON_PROJECT_NAME", "fileapi")
 
 default:
@@ -17,7 +19,7 @@ test:
 
 # Run locally with auto-reload (uses DATABASE_URL from .env if present)
 dev:
-    fastapi dev
+    {{fastapi}} dev
 
 # Log in to Neon in the browser (skipped if already logged in)
 neon-login:
@@ -54,14 +56,25 @@ neon-db: neon-login
     chmod 600 .env
     echo "Wrote DATABASE_URL to .env (project $id)."
 
-# Same as neon-db, then store DATABASE_URL on FastAPI Cloud
-cloud-db: neon-db
+# Log in to FastAPI Cloud in the browser (skipped if already logged in)
+login:
+    @{{fastapi}} cloud whoami >/dev/null 2>&1 && echo "Already logged in to FastAPI Cloud." || {{fastapi}} login
+
+# Deploy to FastAPI Cloud (logs in first if needed; the first run creates the app)
+deploy: login
+    {{fastapi}} deploy
+
+# Same as neon-db, then store DATABASE_URL on FastAPI Cloud (this redeploys the app)
+cloud-db: neon-db login
     #!/usr/bin/env bash
     set -euo pipefail
     url=$(grep '^DATABASE_URL=' .env | cut -d= -f2-)
-    fastapi cloud env set DATABASE_URL "$url"
-    echo "DATABASE_URL set on FastAPI Cloud. Run 'just deploy' to pick it up."
+    {{fastapi}} cloud env set DATABASE_URL "$url"
+    echo "DATABASE_URL set on FastAPI Cloud."
 
-# Deploy to FastAPI Cloud
-deploy:
-    fastapi deploy
+# Neon database + first deploy in one go: login, deploy, set DATABASE_URL
+launch: deploy cloud-db
+
+# Stream logs from the deployed app
+logs:
+    {{fastapi}} cloud logs --follow
