@@ -1,17 +1,10 @@
-FROM node:22-alpine AS build
+FROM python:3.13-slim
 WORKDIR /app
-COPY package*.json tsconfig.json ./
-RUN npm ci
-COPY src ./src
-RUN npx tsc && npm prune --omit=dev
-
-FROM node:22-alpine
-WORKDIR /app
-ENV NODE_ENV=production FILEAPI_ROOT=/data PORT=3000
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
+ENV PYTHONUNBUFFERED=1 FILEAPI_ROOT=/data PORT=8000
+COPY pyproject.toml README.md ./
+COPY fileapi ./fileapi
+RUN pip install --no-cache-dir . && useradd -r -u 10001 app && mkdir -p /data && chown app /data
+USER app
 VOLUME /data
-EXPOSE 3000
-USER node
-CMD ["node", "dist/index.js"]
+EXPOSE 8000
+CMD ["fileapi"]

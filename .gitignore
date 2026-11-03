@@ -1,5 +1,7 @@
-node_modules
-dist
-data
-*.tmp
+.venv/
+__pycache__/
+*.pyc
+data/
 .env
+.pytest_cache/
+*.fileapi-tmp
