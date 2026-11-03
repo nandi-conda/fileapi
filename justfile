@@ -85,9 +85,26 @@ cloud-db: neon-db login
 # Neon database + first deploy in one go: login, deploy, set DATABASE_URL
 launch: deploy cloud-db
 
-# Claim a fresh deployment and print its access token (once!), e.g. just claim https://fileapi.fastapicloud.dev
-claim url:
-    uv run --with 'mcp>=2.3,<3' python scripts/claim.py {{url}}
+fileapi_url := env("FILEAPI_URL", "https://fileapi.fastapicloud.dev")
+
+# Get an access token and save it to .env (claims a fresh server, or rotates using FILEAPI_ACCESS_TOKEN)
+token url=fileapi_url:
+    @uv run --with 'mcp>=2.3,<3' python scripts/get_token.py {{url}} "${FILEAPI_ACCESS_TOKEN:-}"
+    @just connect-info
+
+# Print connection settings for Claude Code, Claude Desktop and claude.ai using the token in .env
+connect-info:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set -a; [ -f .env ] && . ./.env; set +a
+    : "${FILEAPI_ACCESS_TOKEN:?no FILEAPI_ACCESS_TOKEN in .env; run just token first}"
+    url="${FILEAPI_URL:-{{fileapi_url}}}"
+    echo
+    echo "Claude Code:"
+    echo "  claude mcp add --transport http fileapi $url/mcp --header \"Authorization: Bearer $FILEAPI_ACCESS_TOKEN\""
+    echo
+    echo "Claude Desktop / claude.ai (Settings > Connectors > Add custom connector), URL:"
+    echo "  $url/mcp?token=$FILEAPI_ACCESS_TOKEN"
 
 # Stream logs from the deployed app
 logs:
