@@ -81,7 +81,8 @@ def text(result) -> str:
 
 @pytest.mark.anyio
 async def test_first_client_claims_then_token_required(server_url):
-    assert httpx.get(f"{server_url}/health").json()["claimed"] is False
+    h = httpx.get(f"{server_url}/health").json()
+    assert h["claimed"] is False and h["storage"] in ("disk", "postgres")
 
     # 1. First client connects with no token: file tools refuse, claim_server hands out the token.
     async with connect(server_url) as c:

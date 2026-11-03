@@ -56,6 +56,7 @@ def create_app(
     public_url = public_url or os.environ.get("FILEAPI_PUBLIC_URL") or None
 
     database_url = database_url if database_url is not None else os.environ.get("DATABASE_URL") or None
+    backend = "postgres" if database_url else "disk"
     if database_url:
         # Hosts without a persistent disk (FastAPI Cloud + Neon/Supabase): files and token live in Postgres.
         from .storage_pg import PostgresKV, PostgresStorage
@@ -127,6 +128,11 @@ def create_app(
             if claimed
             else "Not claimed yet. Connect an MCP client with no credentials and call <code>claim_server</code>."
         )
+        storage_note = (
+            "Postgres (DATABASE_URL)"
+            if backend == "postgres"
+            else "local disk. On hosts without a persistent disk (e.g. FastAPI Cloud) files and the token are lost on restart; set DATABASE_URL."
+        )
         return HTMLResponse(f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>fileapi</title>
 <style>body{{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:0 1rem;background:#fafafa;color:#1a1a1a}}
@@ -134,12 +140,13 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 @media (prefers-color-scheme:dark){{body{{background:#121212;color:#eee}}code{{background:#2a2a2a}}}}</style></head>
 <body><h1>fileapi</h1><p>A central file store for MCP clients.</p>
 <p><b>Status:</b> {status}</p>
+<p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
     @app.get("/health")
     def health():
-        return {"ok": True, "claimed": tokens.claimed()}
+        return {"ok": True, "claimed": tokens.claimed(), "storage": backend}
 
     # ---- REST API ------------------------------------------------------
     auth = [Depends(require_token)]

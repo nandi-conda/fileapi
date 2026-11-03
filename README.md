@@ -109,7 +109,7 @@ docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state fileapi
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | For `fileapi` CLI |
 | `FILEAPI_MAX_BODY` | `10485760` | Max MCP request size in bytes |
 
-Health check: `GET /health` returns `{"ok": true, "claimed": ...}`.
+Health check: `GET /health` returns `{"ok": true, "claimed": ..., "storage": "postgres" | "disk"}`.
 
 ## Connect a client
 
