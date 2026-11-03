@@ -1,7 +1,8 @@
 """FastAPI app: MCP at /mcp plus a REST API at /files.
 
-Auth: MCP clients sign in through OAuth (Google "Sign in with Google" + email allowlist), handled by
-fileapi.auth. REST callers send the same OAuth access token, or the optional static FILEAPI_TOKEN.
+Auth is trust-on-first-use (see fileapi.tokens): the first client calls the claim_server tool and gets
+the token. Tools and /files then need it, sent as `Authorization: Bearer <token>` or `?token=<token>`.
+A /mcp request without a token can connect and list tools, but every tool except claim_server refuses.
 """
 
 from __future__ import annotations
@@ -10,16 +11,14 @@ import contextlib
 import os
 from pathlib import Path
 
-from fastapi import Body, Depends, FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .auth import SCOPE, AuthConfig, GoogleOAuthProvider, IdTokenVerifier
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
+from .tokens import TokenStore
 
 
 class EditBody(BaseModel):
@@ -36,66 +35,39 @@ class MoveBody(BaseModel):
     overwrite: bool = False
 
 
-def _env_emails() -> set[str]:
-    return {e.strip().lower() for e in os.environ.get("FILEAPI_ALLOWED_EMAILS", "").split(",") if e.strip()}
+def _request_token(request: Request) -> str | None:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return request.query_params.get("token") or None
 
 
 def create_app(
     root: str | None = None,
     *,
-    public_url: str | None = None,
-    google_client_id: str | None = None,
-    allowed_emails: set[str] | None = None,
-    static_token: str | None = None,
     state_dir: str | None = None,
-    verify_id_token: IdTokenVerifier | None = None,
+    preset_token: str | None = None,
+    public_url: str | None = None,
 ) -> FastAPI:
     root = root or os.environ.get("FILEAPI_ROOT", "./data")
-    public_url = (public_url or os.environ.get("FILEAPI_PUBLIC_URL", "")).rstrip("/")
-    google_client_id = google_client_id if google_client_id is not None else os.environ.get("GOOGLE_CLIENT_ID", "")
-    allowed_emails = allowed_emails if allowed_emails is not None else _env_emails()
-    static_token = static_token if static_token is not None else os.environ.get("FILEAPI_TOKEN") or None
     state_dir = state_dir or os.environ.get("FILEAPI_STATE_DIR", "./state")
-
-    if not public_url:
-        raise RuntimeError("FILEAPI_PUBLIC_URL is required (the https URL clients use to reach this server)")
-    if not google_client_id and not static_token:
-        raise RuntimeError("Set GOOGLE_CLIENT_ID (for Google sign-in) and/or FILEAPI_TOKEN (static bearer token)")
-    if google_client_id and not allowed_emails:
-        raise RuntimeError("FILEAPI_ALLOWED_EMAILS is empty, so nobody could sign in")
+    preset_token = preset_token if preset_token is not None else os.environ.get("FILEAPI_TOKEN") or None
+    public_url = public_url or os.environ.get("FILEAPI_PUBLIC_URL") or None
 
     storage = Storage(root)
     storage.init()
-    if Path(state_dir).resolve() == storage.root or storage.root in Path(state_dir).resolve().parents:
-        raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds auth tokens)")
+    state = Path(state_dir).resolve()
+    if state == storage.root or storage.root in state.parents:
+        raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds the token)")
+    tokens = TokenStore(state, preset_token)
 
-    provider = GoogleOAuthProvider(
-        AuthConfig(
-            public_url=public_url,
-            google_client_id=google_client_id,
-            allowed_emails=allowed_emails,
-            state_dir=Path(state_dir),
-            static_token=static_token,
-            verify_id_token=verify_id_token,
-        )
-    )
-    auth_settings = AuthSettings(
-        issuer_url=public_url,
-        resource_server_url=f"{public_url}/mcp",
-        validate_token_resource=False,
-        required_scopes=[SCOPE],
-        client_registration_options=ClientRegistrationOptions(
-            enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
-        ),
-        revocation_options=RevocationOptions(enabled=True),
-    )
-    mcp = build_mcp(storage, provider, auth_settings)
+    mcp = build_mcp(storage, tokens, public_url)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
         max_request_body_size=int(os.environ.get("FILEAPI_MAX_BODY", 10 * 1024 * 1024)),
-        # Every request carries a bearer token, so Host-header DNS-rebinding checks are not needed.
+        # Requests carry a token, so Host-header DNS-rebinding checks are not needed.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -104,14 +76,28 @@ def create_app(
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="fileapi", version="1.1.0", lifespan=lifespan)
+    app = FastAPI(title="fileapi", version="1.2.0", lifespan=lifespan)
     app.state.storage = storage
-    app.state.auth = provider
+    app.state.tokens = tokens
 
-    bearer = HTTPBearer(auto_error=False)
+    @app.middleware("http")
+    async def mcp_auth(request: Request, call_next):
+        if request.url.path.rstrip("/") == "/mcp":
+            presented = _request_token(request)
+            authed = tokens.check(presented)
+            if presented and not authed:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "error": {"code": -32001, "message": "Unauthorized"}, "id": None},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            # No token: the connection stays up (so the claiming client doesn't break mid-session),
+            # but every tool except claim_server refuses until the client reconnects with the token.
+            request.scope.setdefault("state", {})["authed"] = authed
+        return await call_next(request)
 
-    async def require_token(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
-        if not creds or not await provider.load_access_token(creds.credentials):
+    def require_token(request: Request) -> None:
+        if not tokens.check(_request_token(request)):
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
 
     @app.exception_handler(StorageError)
@@ -121,29 +107,7 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True}
-
-    # ---- sign-in pages (the OAuth endpoints themselves come from the MCP SDK) ----
-    @app.get("/oauth/login", include_in_schema=False)
-    async def login(state: str):
-        pending = provider.store.get("pending", state)
-        client = await provider.get_client(pending["client_id"]) if pending else None
-        status, body = provider.login_page(state, client)
-        return HTMLResponse(body, status_code=status, headers={"Referrer-Policy": "no-referrer"})
-
-    @app.post("/oauth/google/callback", include_in_schema=False)
-    async def google_callback(state: str = Form(...), credential: str = Form("")):
-        url, page = provider.google_callback(state, credential)
-        if url:
-            return RedirectResponse(url, status_code=303)
-        return HTMLResponse(page[1], status_code=page[0])
-
-    @app.post("/oauth/deny", include_in_schema=False)
-    async def deny(state: str = Form(...)):
-        url, page = provider.deny(state)
-        if url:
-            return RedirectResponse(url, status_code=303)
-        return HTMLResponse(page[1], status_code=page[0])
+        return {"ok": True, "claimed": tokens.claimed()}
 
     # ---- REST API ------------------------------------------------------
     auth = [Depends(require_token)]
@@ -185,7 +149,6 @@ def create_app(
     def delete_file(path: str):
         storage.delete(path)
 
-    # Mount last so the routes above take precedence. It serves /mcp, /authorize, /token,
-    # /register, /revoke and the /.well-known OAuth metadata.
+    # Mount last so the routes above take precedence.
     app.mount("/", mcp_app)
     return app

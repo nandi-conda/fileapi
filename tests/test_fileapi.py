@@ -1,12 +1,9 @@
-import base64
-import hashlib
 import os
-import secrets
 import socket
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
 
 import httpx
 import httpx2
@@ -19,8 +16,7 @@ from fileapi.app import create_app
 
 TOKEN = "test-static-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-ALLOWED = "allowed@gmail.com"
-PUBLIC = "http://127.0.0.1"
+FILE_TOOLS = ["append_file", "create_file", "delete_file", "edit_file", "list_files", "move_file", "read_file", "write_file"]
 
 
 @pytest.fixture
@@ -29,38 +25,20 @@ def anyio_backend():
 
 
 def app_for(tmp_path, **kw):
-    defaults = dict(
-        public_url=PUBLIC,
-        google_client_id="test-client-id.apps.googleusercontent.com",
-        allowed_emails={ALLOWED},
-        static_token=TOKEN,
-        state_dir=str(tmp_path / "state"),
-        # Test double for Google: the "ID token" is "<email>|<nonce>".
-        verify_id_token=lambda tok, nonce: tok.split("|")[0] if tok.endswith("|" + nonce) else None,
-    )
-    defaults.update(kw)
-    return create_app(str(tmp_path / "data"), **defaults)
+    kw.setdefault("state_dir", str(tmp_path / "state"))
+    kw.setdefault("preset_token", TOKEN)
+    return create_app(str(tmp_path / "data"), **kw)
 
 
-# ---------------------------------------------------------------- MCP over real HTTP
-
-@pytest.fixture(scope="module")
-def server_url(tmp_path_factory):
-    tmp = tmp_path_factory.mktemp("srv")
+@pytest.fixture
+def server_url(tmp_path):
+    """A real server process that starts unclaimed."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    env = {
-        **os.environ,
-        "FILEAPI_ROOT": str(tmp / "data"),
-        "FILEAPI_STATE_DIR": str(tmp / "state"),
-        "FILEAPI_PUBLIC_URL": f"http://127.0.0.1:{port}",
-        "FILEAPI_TOKEN": TOKEN,
-        "GOOGLE_CLIENT_ID": "x.apps.googleusercontent.com",
-        "FILEAPI_ALLOWED_EMAILS": ALLOWED,
-        "HOST": "127.0.0.1",
-        "PORT": str(port),
-    }
+    env = {**os.environ, "FILEAPI_ROOT": str(tmp_path / "data"), "FILEAPI_STATE_DIR": str(tmp_path / "state"),
+           "HOST": "127.0.0.1", "PORT": str(port), "FILEAPI_PUBLIC_URL": f"http://127.0.0.1:{port}"}
+    env.pop("FILEAPI_TOKEN", None)
     proc = subprocess.Popen([sys.executable, "-m", "fileapi"], env=env)
     url = f"http://127.0.0.1:{port}"
     for _ in range(100):
@@ -69,34 +47,83 @@ def server_url(tmp_path_factory):
             break
         except httpx.HTTPError:
             time.sleep(0.1)
+    _STATE[url] = str(tmp_path / "state")
     yield url
     proc.terminate()
     proc.wait(5)
+
+
+_STATE: dict[str, str] = {}
+
+
+def server_state(url: str) -> str:
+    return _STATE[url]
+
+
+def connect(url: str, token: str | None = None, via: str = "header") -> Client:
+    headers = {"Authorization": f"Bearer {token}"} if token and via == "header" else {}
+    endpoint = f"{url}/mcp" + (f"?token={token}" if token and via == "query" else "")
+    return Client(streamable_http_client(endpoint, http_client=httpx2.AsyncClient(headers=headers)))
 
 
 def text(result) -> str:
     return result.content[0].text
 
 
-def test_mcp_requires_auth_and_advertises_oauth(server_url):
-    for headers in ({}, {"Authorization": "Bearer nope"}):
-        r = httpx.post(f"{server_url}/mcp", headers={"content-type": "application/json", **headers}, content="{}")
-        assert r.status_code == 401, headers
-        assert "resource_metadata" in r.headers.get("www-authenticate", "")
-    meta = httpx.get(f"{server_url}/.well-known/oauth-authorization-server").json()
-    assert meta["authorization_endpoint"].endswith("/authorize")
-    assert meta["registration_endpoint"].endswith("/register")
-    assert httpx.get(f"{server_url}/.well-known/oauth-protected-resource/mcp").status_code == 200
+@pytest.mark.anyio
+async def test_first_client_claims_then_token_required(server_url):
+    assert httpx.get(f"{server_url}/health").json()["claimed"] is False
+
+    # 1. First client connects with no token: file tools refuse, claim_server hands out the token.
+    async with connect(server_url) as c:
+        names = {t.name for t in (await c.list_tools()).tools}
+        assert {"claim_server", "rotate_token", *FILE_TOOLS} <= names
+        r = await c.call_tool("list_files", {})
+        assert r.is_error and "claim_server" in text(r)
+        r = await c.call_tool("claim_server", {})
+        assert not r.is_error
+        token = next(w for w in text(r).split() if w.startswith("fa_"))
+        assert f"{server_url}/mcp?token={token}" in text(r)
+
+    assert httpx.get(f"{server_url}/health").json()["claimed"] is True
+
+    # 2. Now tokenless clients get refused by every tool, and wrong tokens are rejected outright.
+    async with connect(server_url) as c:
+        r = await c.call_tool("list_files", {})
+        assert r.is_error and "access token" in text(r)
+        assert (await c.call_tool("claim_server", {})).is_error
+    r = httpx.post(f"{server_url}/mcp", headers={"content-type": "application/json", "Authorization": "Bearer nope"},
+                   content="{}")
+    assert r.status_code == 401
+    assert httpx.post(f"{server_url}/mcp?token=nope", headers={"content-type": "application/json"},
+                      content="{}").status_code == 401
+
+    # 3. The token works as a header and as ?token=, and a second claim fails.
+    async with connect(server_url, token, via="query") as c:
+        assert text(await c.call_tool("list_files", {})) == "(empty)"
+        r = await c.call_tool("claim_server", {})
+        assert r.is_error and "already claimed" in text(r)
+
+    async with connect(server_url, token) as c:
+        r = await c.call_tool("rotate_token", {})
+        new_token = next(w for w in text(r).split() if w.startswith("fa_"))
+    # old token is in its grace period; expire it
+    import json as _json
+    state = Path(server_state(server_url)) / "token.json"
+    rec = _json.loads(state.read_text())
+    rec["previous"]["until"] = 0
+    state.write_text(_json.dumps(rec))
+    assert httpx.post(f"{server_url}/mcp", headers={"content-type": "application/json",
+                      "Authorization": f"Bearer {token}"}, content="{}").status_code == 401
+    async with connect(server_url, new_token) as c:
+        assert text(await c.call_tool("list_files", {})) == "(empty)"
 
 
 @pytest.mark.anyio
 async def test_mcp_tools_end_to_end(server_url):
-    http = httpx2.AsyncClient(headers=AUTH)
-    async with Client(streamable_http_client(f"{server_url}/mcp", http_client=http)) as c:
-        tools = sorted(t.name for t in (await c.list_tools()).tools)
-        assert tools == sorted(
-            ["append_file", "create_file", "delete_file", "edit_file", "list_files", "move_file", "read_file", "write_file"]
-        )
+    async with connect(server_url) as c:
+        token = next(w for w in text(await c.call_tool("claim_server", {})).split() if w.startswith("fa_"))
+    async with connect(server_url, token) as c:
         assert "Created" in text(await c.call_tool("create_file", {"path": "notes/a.md", "content": "hello world\n"}))
         assert (await c.call_tool("create_file", {"path": "notes/a.md", "content": "x"})).is_error
         assert text(await c.call_tool("read_file", {"path": "notes/a.md"})) == "hello world\n"
@@ -117,145 +144,10 @@ async def test_mcp_tools_end_to_end(server_url):
             assert (await c.call_tool("read_file", {"path": p})).is_error, p
 
 
-# ---------------------------------------------------------------- OAuth flow
+def test_rest_api_rejects_everything_while_unclaimed(tmp_path):
+    with TestClient(app_for(tmp_path, preset_token="")) as c:
+        assert c.get("/files").status_code == 401
 
-def _pkce():
-    verifier = secrets.token_urlsafe(48)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    return verifier, challenge
-
-
-def _start_login(c: TestClient):
-    reg = c.post("/register", json={"redirect_uris": ["http://localhost:9999/cb"], "client_name": "Test App",
-                                     "token_endpoint_auth_method": "none"})
-    assert reg.status_code == 201, reg.text
-    client_id = reg.json()["client_id"]
-    verifier, challenge = _pkce()
-    r = c.get("/authorize", params={
-        "response_type": "code", "client_id": client_id, "redirect_uri": "http://localhost:9999/cb",
-        "code_challenge": challenge, "code_challenge_method": "S256", "state": "client-state", "scope": "files",
-    }, follow_redirects=False)
-    assert r.status_code == 302, r.text
-    login_url = urlparse(r.headers["location"])
-    assert login_url.path == "/oauth/login"
-    state = parse_qs(login_url.query)["state"][0]
-    page = c.get(f"/oauth/login?state={state}")
-    assert page.status_code == 200 and "Test App" in page.text and "accounts.google.com/gsi/client" in page.text
-    nonce = page.text.split('data-nonce="')[1].split('"')[0]
-    return client_id, verifier, state, nonce
-
-
-def test_oauth_allowlisted_google_account_gets_working_token(tmp_path):
-    with TestClient(app_for(tmp_path)) as c:
-        client_id, verifier, state, nonce = _start_login(c)
-        r = c.post("/oauth/google/callback", data={"state": state, "credential": f"{ALLOWED}|{nonce}"},
-                   follow_redirects=False)
-        assert r.status_code == 303, r.text
-        q = parse_qs(urlparse(r.headers["location"]).query)
-        assert q["state"] == ["client-state"]
-
-        tok = c.post("/token", data={"grant_type": "authorization_code", "code": q["code"][0], "client_id": client_id,
-                                     "redirect_uri": "http://localhost:9999/cb", "code_verifier": verifier})
-        assert tok.status_code == 200, tok.text
-        access, refresh = tok.json()["access_token"], tok.json()["refresh_token"]
-        h = {"Authorization": f"Bearer {access}"}
-
-        # code is single-use
-        again = c.post("/token", data={"grant_type": "authorization_code", "code": q["code"][0], "client_id": client_id,
-                                       "redirect_uri": "http://localhost:9999/cb", "code_verifier": verifier})
-        assert again.status_code == 400
-
-        # token works for REST and MCP
-        assert c.put("/files/hi.txt", content="hi", headers=h).status_code == 201
-        rpc = c.post("/mcp", headers={**h, "Accept": "application/json, text/event-stream"},
-                     json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                                      "clientInfo": {"name": "t", "version": "0"}}})
-        assert rpc.status_code == 200, rpc.text
-
-        # refresh rotates: old access token dies, new one works
-        new = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": refresh, "client_id": client_id})
-        assert new.status_code == 200, new.text
-        assert c.get("/files", headers=h).status_code == 401
-        assert c.get("/files", headers={"Authorization": f"Bearer {new.json()['access_token']}"}).status_code == 200
-
-
-def test_oauth_rejects_account_not_on_allowlist(tmp_path):
-    with TestClient(app_for(tmp_path)) as c:
-        _, _, state, nonce = _start_login(c)
-        r = c.post("/oauth/google/callback", data={"state": state, "credential": f"intruder@gmail.com|{nonce}"},
-                   follow_redirects=False)
-        assert r.status_code == 403 and "not on the allowlist" in r.text
-
-
-def test_oauth_rejects_token_with_wrong_nonce(tmp_path):
-    with TestClient(app_for(tmp_path)) as c:
-        _, _, state, _ = _start_login(c)
-        r = c.post("/oauth/google/callback", data={"state": state, "credential": f"{ALLOWED}|other-nonce"},
-                   follow_redirects=False)
-        assert r.status_code == 401
-        # state is consumed, so it cannot be retried
-        r = c.post("/oauth/google/callback", data={"state": state, "credential": f"{ALLOWED}|x"})
-        assert r.status_code == 400
-
-
-def test_removing_email_from_allowlist_revokes_tokens(tmp_path):
-    app = app_for(tmp_path)
-    with TestClient(app) as c:
-        client_id, verifier, state, nonce = _start_login(c)
-        r = c.post("/oauth/google/callback", data={"state": state, "credential": f"{ALLOWED}|{nonce}"},
-                   follow_redirects=False)
-        code = parse_qs(urlparse(r.headers["location"]).query)["code"][0]
-        access = c.post("/token", data={"grant_type": "authorization_code", "code": code, "client_id": client_id,
-                                        "redirect_uri": "http://localhost:9999/cb", "code_verifier": verifier}
-                        ).json()["access_token"]
-        h = {"Authorization": f"Bearer {access}"}
-        assert c.get("/files", headers=h).status_code == 200
-        app.state.auth.config.allowed_emails.clear()
-        assert c.get("/files", headers=h).status_code == 401
-
-
-def test_cancel_returns_access_denied(tmp_path):
-    with TestClient(app_for(tmp_path)) as c:
-        _, _, state, _ = _start_login(c)
-        r = c.post("/oauth/deny", data={"state": state}, follow_redirects=False)
-        assert r.status_code == 303 and "error=access_denied" in r.headers["location"]
-
-
-def test_google_id_token_verifier(monkeypatch):
-    """The real verifier, against a locally signed token and a fake Google JWKS."""
-    import json
-
-    import jwt
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    from fileapi import auth
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
-    jwk.update(kid="k1", alg="RS256", use="sig")
-    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda self: {"keys": [jwk]})
-    verify = auth.google_id_token_verifier("cid")
-
-    def make(**over):
-        claims = {"iss": "https://accounts.google.com", "aud": "cid", "exp": int(time.time()) + 300,
-                  "email": ALLOWED, "email_verified": True, "nonce": "n1", **over}
-        return jwt.encode(claims, key, algorithm="RS256", headers={"kid": "k1"})
-
-    assert verify(make(), "n1") == ALLOWED
-    assert verify(make(), "n2") is None
-    assert verify(make(aud="other"), "n1") is None
-    assert verify(make(iss="https://evil.example"), "n1") is None
-    assert verify(make(email_verified=False), "n1") is None
-    assert verify(make(exp=int(time.time()) - 10), "n1") is None
-    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    forged = jwt.encode({"iss": "accounts.google.com", "aud": "cid", "exp": int(time.time()) + 300,
-                         "email": ALLOWED, "email_verified": True, "nonce": "n1"}, other, algorithm="RS256",
-                        headers={"kid": "k1"})
-    assert verify(forged, "n1") is None
-
-
-# ---------------------------------------------------------------- REST API
 
 def test_rest_api(tmp_path):
     with TestClient(app_for(tmp_path)) as c:
