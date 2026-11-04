@@ -160,10 +160,7 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
         url = f"{_base_url(ctx, public_url)}/git/{full}.git"
         return (
             f"Clone URL: {url}\n"
-            "Authenticate with the access token as the password (any username), e.g.\n"
-            f"  git clone {url.replace('://', '://x:<token>@', 1)}\n"
-            "or keep it out of the URL with a header:\n"
-            f"  git -c http.extraHeader=\"Authorization: Bearer <token>\" clone {url}"
+            "To clone or push with git, call repo_remote_url for a short-lived authenticated URL."
         )
 
     @mcp.tool(structured_output=False)
@@ -336,8 +333,8 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
         scoped(ctx, project_of(repo), lambda: forge.set_public(repo, public))
         url = f"{_base_url(ctx, public_url)}/git/{'/'.join(split_repo(repo))}.git"
         if public:
-            return f"{repo} is now public. Anyone can run: git clone {url}\nPushing still needs the access token."
-        return f"{repo} is now private. Cloning needs the access token."
+            return f"{repo} is now public. Anyone can run: git clone {url}\nPushing still needs a credential: use repo_remote_url."
+        return f"{repo} is now private. Cloning needs a credential: use repo_remote_url."
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def delete_repo(ctx: Context, repo: RepoArg) -> str:
