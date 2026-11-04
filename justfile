@@ -73,13 +73,18 @@ neon-db: neon-login
 login:
     @{{fastapi}} cloud whoami >/dev/null 2>&1 && echo "Already logged in to FastAPI Cloud." || {{fastapi}} login
 
+# Link this folder to an existing FastAPI Cloud app (writes .fastapicloud/cloud.json, which isn't committed)
+link app_id="": login
+    {{fastapi}} cloud link {{app_id}}
+
 # Deploy to FastAPI Cloud. Makes sure DATABASE_URL is set there first so state survives the deploy.
 deploy: login
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f .fastapicloud/cloud.json ]; then
-        echo "No FastAPI Cloud app linked yet; use 'just launch' for the first deploy." >&2
-        exit 1
+        echo "This folder isn't linked to a FastAPI Cloud app yet. Pick the existing fileapi app below."
+        echo "(Never deployed before? Press Ctrl-C and run 'just launch' instead.)"
+        just link
     fi
     if ! {{fastapi}} cloud env list 2>/dev/null | grep -q 'DATABASE_URL'; then
         echo "DATABASE_URL is not set on FastAPI Cloud, so a deploy would start on a wiped disk. Setting it up now..."
