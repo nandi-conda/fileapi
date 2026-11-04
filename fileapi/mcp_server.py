@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 from mcp.server.mcpserver import Context, MCPServer
@@ -216,7 +216,8 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
             return "(no repos)"
         base = _base_url(ctx, public_url)
         return "\n".join(
-            f"{r.full_name}\t{base}/git/{r.full_name}.git" + (f"\t{r.description}" if r.description else "")
+            f"{r.full_name}\t{'public' if r.public else 'private'}\t{base}/git/{r.full_name}.git"
+            + (f"\t{r.description}" if r.description else "")
             for r in repos
         )
 
@@ -351,6 +352,21 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
             return (f"{url}\n\nWorks for {full} only, until {when}. Examples:\n"
                     f"  git push {url} main\n  git pull {url} main\n  git clone {url}\n"
                     "After a clone, run `git remote set-url origin <plain URL>` so the credential is not kept.")
+
+    @mcp.tool(structured_output=False)
+    def set_repo_visibility(
+        ctx: Context,
+        repo: RepoArg,
+        visibility: Annotated[Literal["public", "private"], Field(description="public: anyone can clone and fetch "
+                                                                           "without a token. private: token needed")],
+    ) -> str:
+        """Make a repo public (anonymous clone and fetch over HTTPS) or private again. Pushing always needs a token."""
+        public = visibility == "public"
+        scoped(ctx, project_of(repo), lambda: forge.set_public(repo, public))
+        url = f"{_base_url(ctx, public_url)}/git/{'/'.join(split_repo(repo))}.git"
+        if public:
+            return f"{repo} is now public. Anyone can run: git clone {url}\nPushing still needs the access token."
+        return f"{repo} is now private. Cloning needs the access token."
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def delete_repo(ctx: Context, repo: RepoArg) -> str:

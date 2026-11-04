@@ -62,6 +62,7 @@ class RepoInfo:
     name: str
     description: str
     created: str
+    public: bool = False
 
     @property
     def full_name(self) -> str:
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS fileapi_git_repos (
     created     timestamptz NOT NULL DEFAULT now(),
     UNIQUE (project, name)
 );
+ALTER TABLE fileapi_git_repos ADD COLUMN IF NOT EXISTS public boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS fileapi_git_objects (
     repo_id bigint NOT NULL REFERENCES fileapi_git_repos(id) ON DELETE CASCADE,
     sha     bytea NOT NULL,
@@ -284,13 +286,13 @@ class PgForgeStore:
 
     @staticmethod
     def _info(row) -> RepoInfo:
-        return RepoInfo(row[0], row[1], row[2], row[3].isoformat())
+        return RepoInfo(row[0], row[1], row[2], row[3].isoformat(), bool(row[4]))
 
     def create(self, project: str, name: str, description: str, default_branch: str) -> RepoInfo:
         with self.pool.connection() as c:
             row = c.execute(
                 "INSERT INTO fileapi_git_repos (project, name, description) VALUES (%s, %s, %s) "
-                "ON CONFLICT DO NOTHING RETURNING id, project, name, description, created",
+                "ON CONFLICT DO NOTHING RETURNING id, project, name, description, created, public",
                 (project, name, description),
             ).fetchone()
         if row is None:
@@ -299,7 +301,7 @@ class PgForgeStore:
         return self._info(row[1:])
 
     def list(self, project: str | None) -> list[RepoInfo]:
-        sql = "SELECT project, name, description, created FROM fileapi_git_repos"
+        sql = "SELECT project, name, description, created, public FROM fileapi_git_repos"
         args: tuple = ()
         if project is not None:
             sql, args = sql + " WHERE project = %s", (project,)
@@ -314,6 +316,19 @@ class PgForgeStore:
         if row is None:
             raise NotFound(f"No such repo: {project}/{name}")
         return PgRepo(self.pool, row[0], row[1])
+
+    def set_public(self, project: str, name: str, public: bool) -> None:
+        with self.pool.connection() as c:
+            cur = c.execute("UPDATE fileapi_git_repos SET public = %s WHERE project = %s AND name = %s",
+                            (public, project, name))
+        if cur.rowcount == 0:
+            raise NotFound(f"No such repo: {project}/{name}")
+
+    def is_public(self, project: str, name: str) -> bool:
+        with self.pool.connection() as c:
+            row = c.execute("SELECT public FROM fileapi_git_repos WHERE project = %s AND name = %s",
+                            (project, name)).fetchone()
+        return bool(row and row[0])
 
     def delete(self, project: str, name: str) -> None:
         with self.pool.connection() as c:
@@ -344,7 +359,7 @@ class DiskForgeStore:
         if desc.startswith("Unnamed repository"):
             desc = ""
         created = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(path.stat().st_ctime))
-        return RepoInfo(project, name, desc, created)
+        return RepoInfo(project, name, desc, created, (path / "git-daemon-export-ok").exists())
 
     def create(self, project: str, name: str, description: str, default_branch: str) -> RepoInfo:
         path = self._path(project, name)
@@ -371,6 +386,17 @@ class DiskForgeStore:
         if not path.is_dir():
             raise NotFound(f"No such repo: {project}/{name}")
         return Repo(str(path))
+
+    # Public repos carry git's own marker file, as with git-daemon / git http-backend.
+    def set_public(self, project: str, name: str, public: bool) -> None:
+        path = self._path(project, name)
+        if not path.is_dir():
+            raise NotFound(f"No such repo: {project}/{name}")
+        marker = path / "git-daemon-export-ok"
+        marker.touch() if public else marker.unlink(missing_ok=True)
+
+    def is_public(self, project: str, name: str) -> bool:
+        return (self._path(project, name) / "git-daemon-export-ok").exists()
 
     def delete(self, project: str, name: str) -> None:
         path = self._path(project, name)
@@ -416,6 +442,12 @@ class Forge:
 
     def delete(self, repo: str) -> None:
         self.store.delete(*split_repo(repo))
+
+    def set_public(self, repo: str, public: bool) -> None:
+        self.store.set_public(*split_repo(repo), public)
+
+    def is_public(self, repo: str) -> bool:
+        return self.store.is_public(*split_repo(repo))
 
     # -- smart HTTP -----------------------------------------------------------
     def advertise(self, repo: str, service: str) -> bytes:

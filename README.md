@@ -58,6 +58,7 @@ git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git
 | `push_bundle` | Push without git credentials: upload a `git bundle create` file (base64). Fast-forward only unless `force` |
 | `fetch_bundle` | Pull or clone without git credentials: returns a base64 bundle. Pass `have` (shas you already have) to get only new history |
 | `repo_remote_url` | A git URL with a short-lived credential for one repo (default 60 min), for plain `git push`/`pull`/`clone` |
+| `set_repo_visibility` | `public`: anyone can clone and fetch without a token. `private` (the default): token needed. Pushing always needs a token |
 | `delete_repo` | Delete a repo and its history |
 
 ### Push and pull with only the MCP connection

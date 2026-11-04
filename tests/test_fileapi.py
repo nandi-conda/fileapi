@@ -283,6 +283,20 @@ async def test_git_forge_end_to_end(server_url, tmp_path):
     r = git("-c", f"http.extraHeader=Authorization: Bearer {token}", "ls-remote", f"{server_url}/git/web/blog.git")
     assert "refs/heads/draft" in r.stdout
 
+    # Public repos clone anonymously; pushing still needs the token.
+    anon = f"{server_url}/git/web/blog.git"
+    assert git("ls-remote", anon, check=False).returncode != 0
+    async with connect(server_url, token) as c:
+        r = await c.call_tool("set_repo_visibility", {"repo": "web/blog", "visibility": "public"})
+        assert not r.is_error, text(r)
+        assert "web/blog\tpublic" in text(await c.call_tool("list_repos", {}))
+    git("clone", anon, str(tmp_path / "anon"))
+    assert (tmp_path / "anon" / "posts" / "two.md").exists()
+    assert git("push", anon, "main:anon", cwd=tmp_path / "anon", check=False).returncode != 0
+    async with connect(server_url, token) as c:
+        assert not (await c.call_tool("set_repo_visibility", {"repo": "web/blog", "visibility": "private"})).is_error
+    assert git("ls-remote", anon, check=False).returncode != 0
+
     async with connect(server_url, token) as c:
         assert not (await c.call_tool("delete_repo", {"repo": "web/blog"})).is_error
     assert git("ls-remote", remote, check=False).returncode != 0
@@ -300,6 +314,16 @@ def test_git_http_auth_and_project_scope(tmp_path, backend):
         assert client.get(refs, headers=AUTH).headers["content-type"] == "application/x-git-upload-pack-advertisement"
         assert client.get("/git/web/nope.git/info/refs?service=git-upload-pack", headers=AUTH).status_code == 404
         assert client.get("/git/web/site.git/info/refs", headers=AUTH).status_code == 403  # dumb protocol
+
+        # Public: anonymous upload-pack (clone/fetch) works, receive-pack (push) does not.
+        forge.set_public("web/site", True)
+        assert client.get(refs).status_code == 200
+        assert client.get("/git/web/site.git/info/refs?service=git-receive-pack").status_code == 401
+        assert client.post("/git/web/site.git/git-receive-pack", content=b"0000",
+                           headers={"content-type": "application/x-git-receive-pack-request"}).status_code == 401
+        assert [r.public for r in forge.list("web")] == [True]
+        forge.set_public("web/site", False)
+        assert client.get(refs).status_code == 401
 
         # Per-project tokens (TokenStore.scope) only reach their own project.
         client.app.state.tokens.scope = lambda t: {"ptok": "web", TOKEN: ""}.get(t)

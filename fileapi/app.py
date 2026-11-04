@@ -216,10 +216,13 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     # Bearer header via `git -c http.extraHeader=...`. A project token only reaches its own project's repos.
     max_push = int(os.environ.get("FILEAPI_GIT_MAX_PUSH", 200 * 1024 * 1024))
 
-    def git_auth(request: Request, project: str, repo: str) -> str:
+    def git_auth(request: Request, project: str, repo: str, service: str) -> str:
         presented = _request_token(request)
         full = "/".join(split_repo(f"{project}/{repo}"))
         if passes.check(presented, full):  # short-lived pass from the repo_remote_url tool
+            return full
+        # Public repos: anyone may clone and fetch without credentials. Pushing always needs a token.
+        if service == "git-upload-pack" and not presented and forge.is_public(full):
             return full
         scope = token_scope(tokens, presented)
         if scope is None:
@@ -230,7 +233,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 
     @app.get("/git/{project}/{repo}/info/refs", include_in_schema=False)
     async def git_info_refs(request: Request, project: str, repo: str, service: str = ""):
-        full = git_auth(request, project, repo)
+        full = git_auth(request, project, repo, service)
         if service not in SERVICES:
             raise HTTPException(403, "Only the smart HTTP protocol is supported (git 1.6.6+)")
         data = await run_in_threadpool(forge.advertise, full, service)
@@ -239,7 +242,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 
     @app.post("/git/{project}/{repo}/{service}", include_in_schema=False)
     async def git_rpc(request: Request, project: str, repo: str, service: str):
-        full = git_auth(request, project, repo)
+        full = git_auth(request, project, repo, service)
         if service not in SERVICES:
             raise HTTPException(404, "Unknown git service")
         if request.headers.get("content-type") != f"application/x-{service}-request":
