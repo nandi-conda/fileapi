@@ -36,6 +36,31 @@ Whoever reaches a fresh deployment first owns it, so claim it right after deploy
 | `move_file` | Move or rename a file or directory (`source`, `destination`, `overwrite`) |
 | `delete_file` | Delete a file or empty directory |
 
+## Git forge
+
+fileapi also hosts git repos, grouped by project and named `<project>/<repo>`. Clone and push them with plain git over HTTPS, and create and browse them over MCP. Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
+
+```sh
+# The access token is the password; the username is ignored.
+git clone https://x:<token>@<host>/git/<project>/<repo>.git
+# Or keep the token out of the URL and out of .git/config:
+git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git/<project>/<repo>.git
+```
+
+| Tool | What it does |
+| --- | --- |
+| `create_repo` | Create an empty repo (`project`, `name`, optional `description`, `default_branch`) and print its clone URL |
+| `list_repos` | List repos, optionally one `project`'s |
+| `list_branches` | Branches and tags of a repo |
+| `browse_repo` | A directory listing or a file's content at a `ref` (branch, tag or sha) |
+| `repo_log` | Recent commits, optionally only those touching a `path` |
+| `commit_files` | Commit `{path: content}` (null deletes) to a branch, for clients without git. `expected_head` guards against races |
+| `delete_repo` | Delete a repo and its history |
+
+Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
+
+Access: any valid token currently reaches every project. When per-project tokens exist (`TokenStore.scope()` returning a project name), a project token only reaches that project's repos, over git and over MCP.
+
 ## REST API
 
 | Method & path | Does |
@@ -108,12 +133,14 @@ docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state fileapi
 | `DATABASE_URL` | unset | Postgres connection string. When set, files and the token live in Postgres |
 | `FILEAPI_ROOT` | `./data` | Filesystem backend: where files live |
 | `FILEAPI_STATE_DIR` | `./state` | Filesystem backend: token record. Must be outside `FILEAPI_ROOT` |
+| `FILEAPI_GIT_ROOT` | `./repos` | Filesystem backend: bare git repos. Must be outside `FILEAPI_ROOT` |
+| `FILEAPI_GIT_MAX_PUSH` | `209715200` | Max git push (request body) in bytes |
 | `FILEAPI_TOKEN` | unset | Pin the token yourself and skip `claim_server` |
 | `FILEAPI_PUBLIC_URL` | from request | Base URL shown in reconnect instructions |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | For `fileapi` CLI |
 | `FILEAPI_MAX_BODY` | `10485760` | Max MCP request size in bytes |
 
-Health check: `GET /health` returns `{"ok": true, "claimed": ..., "storage": "postgres" | "disk"}`.
+Health check: `GET /health` returns `{"ok": true, "claimed": ..., "storage": "postgres" | "disk", "git": "postgres" | "disk"}`.
 
 ## Connect a client
 

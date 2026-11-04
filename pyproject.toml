@@ -1,6 +1,6 @@
 [project]
 name = "fileapi"
-version = "1.2.0"
+version = "1.3.0"
 description = "Central file store exposed over MCP and a REST API, built on FastAPI"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,6 +10,7 @@ dependencies = [
     "mcp>=2.3,<3",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
+    "dulwich>=1.2.20",
 ]
 
 [project.optional-dependencies]

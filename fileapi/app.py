@@ -7,18 +7,21 @@ A /mcp request without a token can connect and list tools, but every tool except
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import os
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, split_repo
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
-from .tokens import FileKV, TokenStore
+from .tokens import FileKV, TokenStore, token_scope
 
 
 class EditBody(BaseModel):
@@ -39,6 +42,14 @@ def _request_token(request: Request) -> str | None:
     scheme, _, value = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() == "bearer" and value.strip():
         return value.strip()
+    if scheme.lower() == "basic":
+        # git sends the token as the Basic-auth password (any username): https://x:<token>@host/git/...
+        try:
+            _, _, password = base64.b64decode(value.strip()).decode().partition(":")
+        except Exception:
+            password = ""
+        if password:
+            return password
     return request.query_params.get("token") or None
 
 
@@ -49,6 +60,7 @@ def create_app(
     preset_token: str | None = None,
     public_url: str | None = None,
     database_url: str | None = None,
+    git_root: str | None = None,
 ) -> FastAPI:
     root = root or os.environ.get("FILEAPI_ROOT", "./data")
     state_dir = state_dir or os.environ.get("FILEAPI_STATE_DIR", "./state")
@@ -64,6 +76,7 @@ def create_app(
         storage = PostgresStorage(database_url)
         storage.init()
         tokens = TokenStore(PostgresKV(storage), preset_token)
+        forge = Forge(PgForgeStore(storage.pool))
     else:
         storage = Storage(root)
         storage.init()
@@ -71,8 +84,13 @@ def create_app(
         if state == storage.root or storage.root in state.parents:
             raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds the token)")
         tokens = TokenStore(FileKV(state), preset_token)
+        git = Path(git_root or os.environ.get("FILEAPI_GIT_ROOT", "./repos")).resolve()
+        if git == storage.root or storage.root in git.parents:
+            raise RuntimeError("FILEAPI_GIT_ROOT must be outside FILEAPI_ROOT")
+        forge = Forge(DiskForgeStore(git))
+    forge.store.init()
 
-    mcp = build_mcp(storage, tokens, public_url)
+    mcp = build_mcp(storage, tokens, public_url, forge)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -87,15 +105,17 @@ def create_app(
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="fileapi", version="1.2.0", lifespan=lifespan)
+    app = FastAPI(title="fileapi", version="1.3.0", lifespan=lifespan)
     app.state.storage = storage
     app.state.tokens = tokens
+    app.state.forge = forge
 
     @app.middleware("http")
     async def mcp_auth(request: Request, call_next):
         if request.url.path.rstrip("/") == "/mcp":
             presented = _request_token(request)
-            authed = tokens.check(presented)
+            scope = token_scope(tokens, presented)
+            authed = scope is not None
             if presented and not authed:
                 return JSONResponse(
                     {"jsonrpc": "2.0", "error": {"code": -32001, "message": "Unauthorized"}, "id": None},
@@ -105,6 +125,7 @@ def create_app(
             # No token: the connection stays up (so the claiming client doesn't break mid-session),
             # but every tool except claim_server refuses until the client reconnects with the token.
             request.scope.setdefault("state", {})["authed"] = authed
+            request.scope["state"]["scope"] = scope
         return await call_next(request)
 
     def require_token(request: Request) -> None:
@@ -142,11 +163,12 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Status:</b> {status}</p>
 <p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
+<p><b>Git repos:</b> <code>git clone {base.replace("://", "://x:&lt;token&gt;@", 1)}/git/&lt;project&gt;/&lt;repo&gt;.git</code></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
     @app.get("/health")
     def health():
-        return {"ok": True, "claimed": tokens.claimed(), "storage": backend}
+        return {"ok": True, "claimed": tokens.claimed(), "storage": backend, "git": forge.store.backend}
 
     # ---- REST API ------------------------------------------------------
     auth = [Depends(require_token)]
@@ -187,6 +209,44 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.delete("/files/{path:path}", dependencies=auth, status_code=204)
     def delete_file(path: str):
         storage.delete(path)
+
+    # ---- Git smart HTTP ---------------------------------------------------
+    # Clone/push with the access token as the Basic-auth password (any username), or an Authorization:
+    # Bearer header via `git -c http.extraHeader=...`. A project token only reaches its own project's repos.
+    max_push = int(os.environ.get("FILEAPI_GIT_MAX_PUSH", 200 * 1024 * 1024))
+
+    def git_auth(request: Request, project: str, repo: str) -> str:
+        scope = token_scope(tokens, _request_token(request))
+        if scope is None:
+            raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": 'Basic realm="fileapi git"'})
+        full = "/".join(split_repo(f"{project}/{repo}"))
+        if scope and scope != full.split("/")[0]:
+            raise HTTPException(403, f"This token cannot access project {project}")
+        return full
+
+    @app.get("/git/{project}/{repo}/info/refs", include_in_schema=False)
+    async def git_info_refs(request: Request, project: str, repo: str, service: str = ""):
+        full = git_auth(request, project, repo)
+        if service not in SERVICES:
+            raise HTTPException(403, "Only the smart HTTP protocol is supported (git 1.6.6+)")
+        data = await run_in_threadpool(forge.advertise, full, service)
+        return Response(data, media_type=f"application/x-{service}-advertisement",
+                        headers={"Cache-Control": "no-cache"})
+
+    @app.post("/git/{project}/{repo}/{service}", include_in_schema=False)
+    async def git_rpc(request: Request, project: str, repo: str, service: str):
+        full = git_auth(request, project, repo)
+        if service not in SERVICES:
+            raise HTTPException(404, "Unknown git service")
+        if request.headers.get("content-type") != f"application/x-{service}-request":
+            raise HTTPException(415, "Invalid Content-Type")
+        body = bytearray()
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > max_push:
+                raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
+        data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
+        return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
 
     # Mount last so the routes above take precedence.
     app.mount("/", mcp_app)

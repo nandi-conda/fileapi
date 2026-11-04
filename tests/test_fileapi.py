@@ -26,6 +26,7 @@ def anyio_backend():
 def app_for(tmp_path, **kw):
     kw.setdefault("state_dir", str(tmp_path / "state"))
     kw.setdefault("preset_token", TOKEN)
+    kw.setdefault("git_root", str(tmp_path / "repos"))
     return create_app(str(tmp_path / "data"), **kw)
 
 
@@ -40,7 +41,7 @@ def backend(request):
         import psycopg
 
         with psycopg.connect(PG_URL, autocommit=True) as c:
-            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv")
+            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_git_repos")
         return {"DATABASE_URL": PG_URL}
     return {}
 
@@ -52,6 +53,7 @@ def server_url(tmp_path, backend):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     env = {**os.environ, "FILEAPI_ROOT": str(tmp_path / "data"), "FILEAPI_STATE_DIR": str(tmp_path / "state"),
+           "FILEAPI_GIT_ROOT": str(tmp_path / "repos"),
            "HOST": "127.0.0.1", "PORT": str(port), "FILEAPI_PUBLIC_URL": f"http://127.0.0.1:{port}"}
     env.pop("FILEAPI_TOKEN", None)
     env.pop("DATABASE_URL", None)
@@ -222,3 +224,84 @@ def test_cloud_entrypoint_refuses_ephemeral_disk():
     env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "FILEAPI_ROOT")}
     r = subprocess.run([sys.executable, "-c", "import fileapi.main"], env=env, capture_output=True, text=True)
     assert r.returncode != 0 and "DATABASE_URL is not set" in r.stderr
+
+
+# ---- git forge ---------------------------------------------------------------
+
+
+def git(*args, cwd=None, check=True):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@x"}
+    return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=check)
+
+
+@pytest.mark.anyio
+async def test_git_forge_end_to_end(server_url, tmp_path):
+    async with connect(server_url) as c:
+        token = next(w for w in text(await c.call_tool("claim_server", {})).split() if w.startswith("fa_"))
+    remote = server_url.replace("://", f"://x:{token}@") + "/git/web/blog.git"
+
+    async with connect(server_url, token) as c:
+        r = await c.call_tool("create_repo", {"project": "web", "name": "blog", "description": "My blog"})
+        assert not r.is_error and f"{server_url}/git/web/blog.git" in text(r)
+        assert (await c.call_tool("create_repo", {"project": "web", "name": "blog"})).is_error
+        assert (await c.call_tool("create_repo", {"project": "../x", "name": "blog"})).is_error
+        assert "empty" in text(await c.call_tool("list_branches", {"repo": "web/blog"}))
+        r = await c.call_tool("commit_files", {"repo": "web/blog", "message": "init",
+                                               "files": {"README.md": "# Blog\n", "posts/one.md": "one\n"}})
+        assert not r.is_error, text(r)
+        assert "web/blog" in text(await c.call_tool("list_repos", {}))
+
+    # Clone, commit and push with the real git CLI.
+    work = tmp_path / "work"
+    git("clone", remote, str(work))
+    assert (work / "posts" / "one.md").read_text() == "one\n"
+    (work / "posts" / "two.md").write_text("two\n")
+    git("add", ".", cwd=work)
+    git("commit", "-m", "second post", cwd=work)
+    git("push", "origin", "main", "main:draft", cwd=work)
+
+    async with connect(server_url, token) as c:
+        listing = text(await c.call_tool("browse_repo", {"repo": "web/blog", "path": "posts"}))
+        assert "one.md" in listing and "two.md" in listing
+        assert text(await c.call_tool("browse_repo", {"repo": "web/blog", "path": "posts/two.md"})) == "two\n"
+        log = text(await c.call_tool("repo_log", {"repo": "web/blog"}))
+        assert log.index("second post") < log.index("init")
+        assert "branch draft" in text(await c.call_tool("list_branches", {"repo": "web/blog"}))
+        r = await c.call_tool("commit_files", {"repo": "web/blog", "message": "drop one",
+                                               "files": {"posts/one.md": None}})
+        assert not r.is_error, text(r)
+
+    git("pull", "origin", "main", cwd=work)
+    assert not (work / "posts" / "one.md").exists()
+    assert git("fsck", cwd=work).returncode == 0
+
+    # Bad token: git gets a Basic-auth challenge and fails; a Bearer header works too.
+    bad = server_url.replace("://", "://x:nope@") + "/git/web/blog.git"
+    assert git("ls-remote", bad, check=False).returncode != 0
+    r = git("-c", f"http.extraHeader=Authorization: Bearer {token}", "ls-remote", f"{server_url}/git/web/blog.git")
+    assert "refs/heads/draft" in r.stdout
+
+    async with connect(server_url, token) as c:
+        assert not (await c.call_tool("delete_repo", {"repo": "web/blog"})).is_error
+    assert git("ls-remote", remote, check=False).returncode != 0
+
+
+def test_git_http_auth_and_project_scope(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("web", "site")
+        forge.create("other", "secret")
+        refs = "/git/web/site.git/info/refs?service=git-upload-pack"
+        r = client.get(refs)
+        assert r.status_code == 401 and r.headers["www-authenticate"].startswith("Basic")
+        assert client.get(refs, auth=("anyone", TOKEN)).status_code == 200
+        assert client.get(refs, headers=AUTH).headers["content-type"] == "application/x-git-upload-pack-advertisement"
+        assert client.get("/git/web/nope.git/info/refs?service=git-upload-pack", headers=AUTH).status_code == 404
+        assert client.get("/git/web/site.git/info/refs", headers=AUTH).status_code == 403  # dumb protocol
+
+        # Per-project tokens (TokenStore.scope) only reach their own project.
+        client.app.state.tokens.scope = lambda t: {"ptok": "web", TOKEN: ""}.get(t)
+        assert client.get(refs, auth=("x", "ptok")).status_code == 200
+        assert client.get("/git/other/secret.git/info/refs?service=git-upload-pack",
+                          auth=("x", "ptok")).status_code == 403

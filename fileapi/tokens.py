@@ -119,3 +119,14 @@ class TokenStore:
                 },
             )
             return token
+
+
+def token_scope(tokens: TokenStore, token: str | None) -> str | None:
+    """What a token may access: None (nothing), "" (everything, the owner token) or a project name.
+
+    Uses TokenStore.scope() when per-project tokens exist; until then any valid token is the owner.
+    """
+    scope = getattr(tokens, "scope", None)
+    if scope is not None:
+        return scope(token)
+    return "" if tokens.check(token) else None
