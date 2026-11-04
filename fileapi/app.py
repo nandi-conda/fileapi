@@ -172,9 +172,15 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Status:</b> {status}</p>
 <p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
-<p><b>Git repos:</b> <code>{base}/git/&lt;project&gt;/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest use the <code>repo_remote_url</code> MCP tool)</p>
+<p><b>Git repos:</b> <code>{base}/git/&lt;project&gt;/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest install the <a href="/git-credential-fileapi">git credential helper</a> and git signs you in in the browser, or use the <code>repo_remote_url</code> MCP tool)</p>
 <p><b>Repo browser:</b> <a href="/forge/">/forge/</a></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
+
+    @app.get("/git-credential-fileapi", include_in_schema=False)
+    def git_credential_helper():
+        # The helper is one stdlib-only file, so it can be installed with curl on any machine with python3.
+        return FileResponse(Path(__file__).with_name("git_credential.py"), media_type="text/x-python; charset=utf-8",
+                            filename="git-credential-fileapi", content_disposition_type="inline")
 
     @app.get("/health")
     def health():

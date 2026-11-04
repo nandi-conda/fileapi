@@ -40,6 +40,22 @@ The atproto client metadata is served at `/oauth/atproto/client-metadata.json` a
 
 fileapi also hosts git repos, grouped by project and named `<project>/<repo>`. Clone and push them with plain git over HTTPS, and create and browse them over MCP. Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
 
+### Sign in from git in the browser
+
+Install the credential helper once and plain `git clone` of a private repo opens the atproto sign-in page:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://<host>/git-credential-fileapi -o ~/.local/bin/git-credential-fileapi
+chmod +x ~/.local/bin/git-credential-fileapi     # needs python3 on PATH; stdlib only
+git-credential-fileapi setup https://<host>      # or `just git-setup` from a checkout
+git clone https://<host>/git/<project>/<repo>.git
+```
+
+When the server answers `401`, git asks the helper. It registers itself as an OAuth client of fileapi, opens `/authorize` in the browser with a one-off redirect to `http://127.0.0.1:<random port>/callback`, swaps the code (PKCE) for tokens and gives git the access token as the password. Tokens live in `~/.config/git-credential-fileapi/tokens.json` (mode 600): the access token (24 h) is reused, then refreshed silently with the refresh token (90 days, rotated), so the browser only opens again after that. `setup` puts an empty `credential.<url>.helper` first, which keeps global helpers (store, cache, libsecret) from shadowing it with a stale token. Other commands: `git-credential-fileapi login|logout [url]`, `status`. On a machine with no browser, open the printed URL on the same machine (the redirect goes to 127.0.0.1).
+
+### Tokens by hand
+
 ```sh
 # The access token is the password; the username is ignored.
 git clone https://x:<token>@<host>/git/<project>/<repo>.git

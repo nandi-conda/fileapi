@@ -123,3 +123,13 @@ claude-add url=fileapi_url scope="user":
     claude mcp remove fileapi -s {{scope}} >/dev/null 2>&1 || true
     claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp"
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
+
+# Install the git credential helper to ~/.local/bin and use it for this server: plain `git clone` then signs in in the browser
+git-setup url=fileapi_url:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v python3 >/dev/null || { echo "git-credential-fileapi needs python3 on PATH." >&2; exit 1; }
+    mkdir -p ~/.local/bin
+    install -m 755 fileapi/git_credential.py ~/.local/bin/git-credential-fileapi
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "Add ~/.local/bin to PATH so git can find git-credential-fileapi." >&2;; esac
+    ~/.local/bin/git-credential-fileapi setup "{{url}}"

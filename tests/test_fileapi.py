@@ -534,3 +534,108 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert wasm.content[:4] == b"\0asm"  # httpx undoes the gzip
         assert int(wasm.headers["x-uncompressed-length"]) == len(wasm.content)
         assert client.get("/forge/qtloader.js").headers["content-type"].startswith("text/javascript")
+
+
+# ---- git credential helper ----------------------------------------------------
+
+FAKE_BROWSER = r'''
+import re, sys, httpx
+url = sys.argv[1]
+with httpx.Client(follow_redirects=True, timeout=10) as c:
+    page = c.get(url)
+    rid = re.search(r'name=rid value="([^"]+)"', page.text).group(1)
+    base = url.split("/authorize")[0]
+    # Follows fileapi -> fake atproto AS -> fileapi callback -> the helper's 127.0.0.1 listener.
+    c.post(base + "/authorize", data={"rid": rid}, headers={"origin": base})
+'''
+
+
+def test_git_credential_helper_signs_in_in_browser(tmp_path):
+    """Plain `git clone` of a private repo: git asks the helper, the helper runs the browser sign-in over a
+    loopback redirect, stores the tokens, and later git commands reuse or refresh them without a browser."""
+    import json
+    import threading
+
+    import uvicorn
+    from fastapi.responses import RedirectResponse
+
+    from fileapi import git_credential
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    fake = FakeAtproto()
+    fake.server.authorization_endpoint = f"{url}/fake-as/authorize"
+    app = app_for(tmp_path, preset_token="", public_url=url, atproto=fake, admin_did=ADMIN)
+
+    def fake_as():  # the admin approves at their atproto authorization server
+        state = fake.pars[-1]["state"]
+        return RedirectResponse(f"{url}/oauth/atproto/callback?code=atcode&state={state}&iss=https://as.example")
+
+    app.add_api_route("/fake-as/authorize", fake_as)
+    app.router.routes.insert(0, app.router.routes.pop())  # ahead of the catch-all MCP mount
+
+    app.state.forge.create("web", "site")
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        try:
+            httpx.get(f"{url}/health", timeout=0.2)
+            break
+        except httpx.HTTPError:
+            time.sleep(0.1)
+    try:
+        # The helper is served as a standalone file; install it from the server like a user would.
+        r = httpx.get(f"{url}/git-credential-fileapi")
+        assert r.status_code == 200 and "def main" in r.text
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        helper = bindir / "git-credential-fileapi"
+        helper.write_text(r.text.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+        helper.chmod(0o755)
+        browser = tmp_path / "browser.py"
+        browser.write_text(FAKE_BROWSER)
+        gitconfig = tmp_path / "gitconfig"
+        gitconfig.write_text("[credential]\n\thelper = store --file /nonexistent/should-not-be-used\n")
+        env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "GIT_TERMINAL_PROMPT": "0",
+               "GIT_CONFIG_GLOBAL": str(gitconfig), "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+               "BROWSER": f"{sys.executable} {browser} %s"}
+
+        def run(*args):
+            return subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+
+        assert run("git-credential-fileapi", "setup", url).returncode == 0
+        helpers = run("git", "config", "--get-all", f"credential.{url}.helper").stdout.splitlines()
+        assert helpers == ["", "fileapi"]
+
+        r = run("git", "clone", f"{url}/git/web/site.git", str(tmp_path / "site"))
+        assert r.returncode == 0, r.stderr
+        assert "Opening your browser" in r.stderr and "signed in" in r.stderr
+        tokens = json.loads((tmp_path / "xdg" / "git-credential-fileapi" / "tokens.json").read_text())
+        entry = tokens[url]
+        assert entry["access_token"].startswith("fa_") and entry["refresh_token"].startswith("fr_")
+        assert app.state.auth.identify(entry["access_token"]) == ADMIN
+
+        # Second command: the stored token is reused, no browser.
+        r = run("git", "ls-remote", f"{url}/git/web/site.git")
+        assert r.returncode == 0 and "Opening" not in r.stderr, r.stderr
+
+        # Expired access token: refreshed silently with the refresh token.
+        entry["expires_at"] = 0
+        (tmp_path / "xdg" / "git-credential-fileapi" / "tokens.json").write_text(json.dumps(tokens))
+        r = run("git", "ls-remote", f"{url}/git/web/site.git")
+        assert r.returncode == 0 and "Opening" not in r.stderr, r.stderr
+        fresh = json.loads((tmp_path / "xdg" / "git-credential-fileapi" / "tokens.json").read_text())[url]
+        assert fresh["access_token"] != entry["access_token"] and fresh["refresh_token"] != entry["refresh_token"]
+
+        # Server forgot the token (revoked): git erases it, and the next command signs in again.
+        app.state.auth.revoke(fresh["refresh_token"])
+        assert run("git", "ls-remote", f"{url}/git/web/site.git").returncode != 0
+        r = run("git", "ls-remote", f"{url}/git/web/site.git")
+        assert r.returncode == 0 and "Opening your browser" in r.stderr, r.stderr
+
+        assert "refresh token present" in run("git-credential-fileapi", "status").stdout
+        assert git_credential._base("fileapi.example/x/y") == "https://fileapi.example"
+    finally:
+        server.should_exit = True
