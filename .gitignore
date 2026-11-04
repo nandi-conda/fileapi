@@ -7,3 +7,4 @@ data/
 *.fileapi-tmp
 state/
 repos/
+.pixi/

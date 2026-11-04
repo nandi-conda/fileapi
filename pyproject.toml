@@ -30,3 +30,23 @@ entrypoint = "fileapi.main:app"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Local tooling is managed with pixi (https://pixi.sh): `pixi install`, then `just <recipe>`.
+# Runtime deps stay in [project] above, which FastAPI Cloud builds from; pixi installs this
+# package editable from PyPI, plus Node (for `npx neonctl`) from conda-forge.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = "3.13.*"
+nodejs = ">=20"
+
+[tool.pixi.pypi-dependencies]
+fileapi = { path = ".", editable = true }
+
+[tool.pixi.feature.dev.pypi-dependencies]
+pytest = ">=8"
+
+[tool.pixi.environments]
+default = { features = ["dev"], solve-group = "default" }

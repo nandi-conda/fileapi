@@ -1,21 +1,24 @@
-# fileapi tasks. Needs: just, Python 3.11+, Node (for npx neonctl).
+# fileapi tasks. Needs: just and pixi (https://pixi.sh). pixi provides Python, the deps,
+# the FastAPI Cloud CLI and Node (for npx neonctl); run `just install` once, or let any recipe do it.
 set dotenv-load
 
-neon := "npx -y neonctl@8"
-# FastAPI CLI (includes the FastAPI Cloud commands); falls back to uvx if it isn't installed
-fastapi := if `command -v fastapi >/dev/null 2>&1 && echo yes || echo no` == "yes" { "fastapi" } else { "uvx --from 'fastapi[standard]' fastapi" }
+pixi := if `command -v pixi >/dev/null 2>&1 && echo yes || echo no` == "yes" { "pixi" } else { error("pixi isn't installed. Install it with: curl -fsSL https://pixi.sh/install.sh | sh  (or: sudo pacman -S pixi), then open a new shell.") }
+run := pixi + " run"
+neon := run + " npx -y neonctl@8"
+fastapi := run + " fastapi"
+python := run + " python"
 neon_project := env("NEON_PROJECT_NAME", "fileapi")
 
 default:
     @just --list
 
-# Install the package with dev dependencies into the current environment
+# Create or update the pixi environment (.pixi/) from pixi.lock
 install:
-    pip install -e '.[dev]'
+    {{pixi}} install
 
 # Run the test suite (set TEST_DATABASE_URL to also test against Postgres)
 test:
-    pytest -q
+    {{run}} pytest -q
 
 # Run locally with auto-reload (uses DATABASE_URL from .env if present)
 dev:
@@ -41,7 +44,7 @@ neon-db: neon-login
     set -euo pipefail
     org_flag=""
     if [ -n "${NEON_ORG_ID:-}" ]; then org_flag="--org-id $NEON_ORG_ID"; fi
-    id=$({{neon}} projects list $org_flag -o json | python3 -c '
+    id=$({{neon}} projects list $org_flag -o json | {{python}} -c '
     import json, sys
     data = json.load(sys.stdin)
     projects = data.get("projects", []) if isinstance(data, dict) else data
@@ -49,7 +52,7 @@ neon-db: neon-login
     ' "{{neon_project}}")
     if [ -z "$id" ]; then
         echo "Creating Neon project '{{neon_project}}'..."
-        id=$({{neon}} projects create --name "{{neon_project}}" $org_flag -o json | python3 -c '
+        id=$({{neon}} projects create --name "{{neon_project}}" $org_flag -o json | {{python}} -c '
     import json, sys
     data = json.load(sys.stdin)
     print(data.get("project", data)["id"])

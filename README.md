@@ -92,9 +92,11 @@ FastAPI Cloud has no persistent disk (it's replaced on every deploy, restart and
 - `just deploy` checks that `DATABASE_URL` is set on FastAPI Cloud and runs `just cloud-db` first if it isn't.
 - Startup only runs `CREATE TABLE IF NOT EXISTS`, so deploys never touch existing data. `just cloud-db` reuses the existing Neon project.
 
-With [just](https://github.com/casey/just), Node (for `npx neonctl`) and either the `fastapi` CLI or `uv` installed:
+Tooling is managed with [pixi](https://pixi.sh): it installs Python, the dependencies, the FastAPI Cloud CLI and Node (for `npx neonctl`) into `.pixi/`, pinned by `pixi.lock`. You only need [just](https://github.com/casey/just) and pixi:
 
 ```sh
+curl -fsSL https://pixi.sh/install.sh | sh   # or: sudo pacman -S pixi
+just install      # pixi install (any recipe also does this on first use)
 just launch       # FastAPI Cloud browser login, first deploy (creates the app),
                   # Neon browser login, creates a "fileapi" Neon project if needed,
                   # writes DATABASE_URL to .env and sets it on FastAPI Cloud (which redeploys)
@@ -115,11 +117,10 @@ NEON_API_KEY=napi_...
 Or by hand, using the Neon/Supabase integration in the FastAPI Cloud dashboard (it sets `DATABASE_URL` for you):
 
 ```sh
-pip install "fastapi[standard]"
-fastapi login
-fastapi deploy                      # entrypoint comes from [tool.fastapi] in pyproject.toml
+pixi run fastapi login
+pixi run fastapi deploy             # entrypoint comes from [tool.fastapi] in pyproject.toml
 # In the FastAPI Cloud dashboard: add the Neon (or Supabase) Postgres integration -> sets DATABASE_URL
-fastapi deploy                      # redeploy so it picks up DATABASE_URL
+pixi run fastapi deploy             # redeploy so it picks up DATABASE_URL
 ```
 
 Then connect a client (below) and sign in as the admin. Tables are created automatically on startup.
@@ -170,7 +171,6 @@ claude mcp add fileapi -e FILEAPI_ROOT=/path/to/data -- fileapi stdio
 ## Test
 
 ```sh
-pip install -e '.[dev]'
-pytest                                                  # filesystem backend
-TEST_DATABASE_URL=postgresql://... pytest               # also runs everything against Postgres
+just test                                               # filesystem backend (pixi run pytest -q)
+TEST_DATABASE_URL=postgresql://... just test            # also runs everything against Postgres
 ```
