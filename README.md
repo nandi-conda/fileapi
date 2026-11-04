@@ -72,6 +72,29 @@ Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgr
 
 Access: the admin reaches every project; public repos clone anonymously. Nobody else has access.
 
+### Web UI
+
+`/forge/` is a small browser UI for the forge: the repo list, files and their contents at any branch, tag or commit, and the commit log. Anyone sees the public repos; **Sign in** (atproto, same admin-only rule as MCP) shows the private ones too. The URL tracks where you are (`/forge/#<project>/<repo>/<path>`), so links can be shared.
+
+It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) that reads a read-only JSON API:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/forge/me` | Whether the request is signed in |
+| `GET /api/forge/repos` | Repos the caller can see (public ones when anonymous) |
+| `GET /api/forge/repos/<project>/<repo>` | Description, visibility, default branch, branches, tags, clone URL |
+| `GET /api/forge/repos/<project>/<repo>/tree?ref=&path=` | A directory listing or a file's content |
+| `GET /api/forge/repos/<project>/<repo>/log?ref=&path=&limit=` | Recent commits |
+
+Send `Authorization: Bearer <access token>` for private repos; to anonymous callers a private repo is a 404.
+The page signs in as a public OAuth client of fileapi itself (PKCE, redirect back to `/forge/`) and keeps the token in the browser's localStorage.
+
+The built app is committed in `fileapi/static/forge/` (the wasm gzipped, about 5 MB), so `just deploy` needs no build step. After changing `ui/`, rebuild with:
+
+```sh
+just ui   # downloads Qt 6.8 (host + wasm), emsdk 3.1.56, cmake and ninja into ui/.toolchain/ on first run (~2 GB)
+```
+
 ## REST API
 
 | Method & path | Does |

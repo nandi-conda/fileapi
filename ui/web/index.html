@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, height=device-height, initial-scale=1, user-scalable=0">
+<title>fileapi forge</title>
+<style>
+  :root { --bg: #fafafa; --fg: #1a1a1a; --muted: #666; --bar: #e3e3e3; --accent: #3b6fd8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #121212; --fg: #eee; --muted: #999; --bar: #333; --accent: #7aa2f7; } }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+               font: 16px/1.5 system-ui, sans-serif; }
+  #screen { width: 100%; height: 100%; display: none; }
+  #loading { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: .75rem; padding: 0 16px; text-align: center; }
+  #loading h1 { margin: 0; font-size: 1.4rem; }
+  #status { color: var(--muted); }
+  #progress { width: min(20rem, 80vw); height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; }
+  #progress div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .error { color: #d33; }
+</style>
+</head>
+<body>
+<div id="loading">
+  <h1>fileapi forge</h1>
+  <div id="progress"><div></div></div>
+  <div id="status">Loading…</div>
+  <noscript>This page needs JavaScript (it runs a Qt for WebAssembly app).</noscript>
+</div>
+<div id="screen"></div>
+
+<script>
+// ---- Sign-in: a public OAuth client of this same server (PKCE), so the admin can see private repos.
+// The access token lives in localStorage and is read by the Qt app through fileapiToken().
+const KEY = "fileapi_forge_auth";
+const redirectUri = location.origin + "/forge/";
+const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; } };
+const save = (v) => { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch {} };
+const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const random = (n = 32) => b64url(crypto.getRandomValues(new Uint8Array(n)));
+
+async function tokenRequest(params) {
+  const r = await fetch("/token", { method: "POST", body: new URLSearchParams(params) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error_description || body.error || `HTTP ${r.status}`);
+  return body;
+}
+
+function storeTokens(state, t) {
+  save({ ...state, access: t.access_token, refresh: t.refresh_token, exp: Date.now() + (t.expires_in - 60) * 1000 });
+}
+
+async function clientId() {
+  const s = load();
+  if (s.client_id) return s.client_id;
+  const r = await fetch("/register", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_name: "fileapi forge (web)", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }) });
+  if (!r.ok) throw new Error("Could not register the web app with fileapi");
+  const id = (await r.json()).client_id;
+  save({ ...s, client_id: id });
+  return id;
+}
+
+window.fileapiToken = () => { const s = load(); return s.access && s.exp > Date.now() ? s.access : ""; };
+
+window.fileapiSignIn = async () => {
+  const id = await clientId();
+  const verifier = random(), state = random(16);
+  const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  sessionStorage.setItem("fileapi_forge_pkce", JSON.stringify({ verifier, state, hash: location.hash }));
+  location.href = "/authorize?" + new URLSearchParams({ response_type: "code", client_id: id, redirect_uri: redirectUri,
+    state, code_challenge: challenge, code_challenge_method: "S256", scope: "fileapi" });
+};
+
+window.fileapiSignOut = async () => {
+  const s = load();
+  if (s.refresh) await fetch("/revoke", { method: "POST", body: new URLSearchParams({ token: s.refresh, client_id: s.client_id }) }).catch(() => {});
+  save({ client_id: s.client_id });
+  location.reload();
+};
+
+async function finishAuth() {
+  const q = new URLSearchParams(location.search);
+  if (q.has("code") || q.has("error")) {
+    const pending = JSON.parse(sessionStorage.getItem("fileapi_forge_pkce") || "{}");
+    sessionStorage.removeItem("fileapi_forge_pkce");
+    history.replaceState(null, "", "/forge/" + (pending.hash || ""));
+    if (q.has("error")) throw new Error(q.get("error_description") || q.get("error"));
+    if (!pending.state || q.get("state") !== pending.state) throw new Error("Sign-in state mismatch; try again");
+    const s = load();
+    storeTokens(s, await tokenRequest({ grant_type: "authorization_code", code: q.get("code"), client_id: s.client_id,
+      redirect_uri: redirectUri, code_verifier: pending.verifier }));
+    return;
+  }
+  const s = load();
+  if (s.refresh && !(s.exp > Date.now())) {
+    try { storeTokens(s, await tokenRequest({ grant_type: "refresh_token", refresh_token: s.refresh, client_id: s.client_id })); }
+    catch { save({ client_id: s.client_id }); }
+  }
+}
+
+// ---- Start the Qt app.
+const statusEl = document.getElementById("status");
+const bar = document.querySelector("#progress div");
+function fail(msg) { statusEl.textContent = msg; statusEl.className = "error"; }
+
+async function start() {
+  try { await finishAuth(); } catch (e) { console.error(e); alert("Sign-in failed: " + e.message); }
+  statusEl.textContent = "Downloading the app…";
+  // Fetch the wasm ourselves to show progress; it is ~5 MB compressed.
+  let wasm;
+  try {
+    const r = await fetch("/forge/forgeui.wasm");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const total = +(r.headers.get("x-uncompressed-length") || 0);
+    const reader = r.body.getReader(); const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      if (total) bar.style.width = Math.min(100, 100 * got / total) + "%";
+    }
+    wasm = await new Blob(chunks).arrayBuffer();
+  } catch (e) { return fail("Could not download the app: " + e.message); }
+  bar.style.width = "100%";
+  statusEl.textContent = "Starting…";
+  const screen = document.getElementById("screen");
+  try {
+    await qtLoad({
+      qt: {
+        onLoaded: () => { document.getElementById("loading").style.display = "none"; screen.style.display = "block"; },
+        onExit: (x) => { document.getElementById("loading").style.display = "flex"; screen.style.display = "none"; fail("The app stopped" + (x.text ? ": " + x.text : "")); },
+        entryFunction: window.forgeui_entry,
+        containerElements: [screen],
+        module: WebAssembly.compile(wasm),
+      },
+    });
+  } catch (e) { console.error(e); fail("Could not start the app: " + e.message); }
+}
+</script>
+<script src="/forge/forgeui.js"></script>
+<script src="/forge/qtloader.js"></script>
+<script>start();</script>
+</body>
+</html>

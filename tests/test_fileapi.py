@@ -485,3 +485,52 @@ def test_git_bundles_and_repo_passes(tmp_path, backend):
         expired = passes._sig("b/r|1")
         import base64 as b64
         assert not passes.check("fg_" + b64.urlsafe_b64encode(b"b/r|1").decode().rstrip("=") + "." + expired, "b/r")
+
+
+def test_forge_json_api_and_web_ui(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("web", "site", "The site")
+        forge.commit_files("web/site", "main", {"README.md": "hi\n", "src/a.py": "x = 1\n"}, "first")
+        forge.commit_files("web/site", "main", {"src/a.py": "x = 2\n"}, "second")
+        forge.create("web", "secret")
+
+        # Anonymous: only public repos exist.
+        assert client.get("/api/forge/me").json()["signed_in"] is False
+        assert client.get("/api/forge/repos").json() == {"repos": []}
+        assert client.get("/api/forge/repos/web/site").status_code == 404
+        assert client.get("/api/forge/repos/web/site/tree").status_code == 404
+        forge.set_public("web/site", True)
+        assert [r["repo"] for r in client.get("/api/forge/repos").json()["repos"]] == ["web/site"]
+        info = client.get("/api/forge/repos/web/site").json()
+        assert info["default"] == "main" and set(info["branches"]) == {"main"} and info["public"] is True
+        assert info["clone_url"].endswith("/git/web/site.git") and info["description"] == "The site"
+        tree = client.get("/api/forge/repos/web/site/tree").json()
+        assert tree["type"] == "dir" and [e["name"] for e in tree["entries"]] == ["src/", "README.md"]
+        f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py"}).json()
+        assert f["type"] == "file" and f["content"] == "x = 2\n"
+        old = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": "main~1"})
+        assert old.status_code == 404  # only branch, tag or sha refs
+        log = client.get("/api/forge/repos/web/site/log").json()["commits"]
+        assert [c["message"] for c in log] == ["second", "first"]
+        f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": log[1]["sha"]}).json()
+        assert f["content"] == "x = 1\n"
+        assert client.get("/api/forge/repos/web/secret").status_code == 404
+
+        # Signed in: private repos too.
+        assert client.get("/api/forge/me", headers=AUTH).json()["signed_in"] is True
+        assert len(client.get("/api/forge/repos", headers=AUTH).json()["repos"]) == 2
+        assert client.get("/api/forge/repos/web/secret", headers=AUTH).json()["branches"] == {}
+        assert client.get("/api/forge/repos/web/secret/tree", headers=AUTH).status_code == 404  # empty repo
+
+        # The committed Qt for WebAssembly build is served from /forge/.
+        r = client.get("/forge", follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == "/forge/"
+        page = client.get("/forge/")
+        assert page.status_code == 200 and "qtLoad" in page.text and "fileapiToken" in page.text
+        assert client.get("/forge/nope/deep").text == page.text
+        wasm = client.get("/forge/forgeui.wasm", headers={"Accept-Encoding": "gzip"})
+        assert wasm.status_code == 200 and wasm.headers["content-type"] == "application/wasm"
+        assert wasm.content[:4] == b"\0asm"  # httpx undoes the gzip
+        assert int(wasm.headers["x-uncompressed-length"]) == len(wasm.content)
+        assert client.get("/forge/qtloader.js").headers["content-type"].startswith("text/javascript")

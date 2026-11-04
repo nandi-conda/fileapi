@@ -20,6 +20,10 @@ install:
 test:
     {{run}} pytest -q
 
+# Rebuild the forge web UI (Qt for WebAssembly) into fileapi/static/forge/; commit the result
+ui:
+    {{run}} ui/build.sh
+
 # Run locally with auto-reload (uses DATABASE_URL from .env if present)
 dev:
     FILEAPI_ROOT="${FILEAPI_ROOT:-./data}" {{fastapi}} dev

@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import gzip
 import os
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -172,6 +173,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
 <p><b>Git repos:</b> <code>{base}/git/&lt;project&gt;/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest use the <code>repo_remote_url</code> MCP tool)</p>
+<p><b>Repo browser:</b> <a href="/forge/">/forge/</a></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
     @app.get("/health")
@@ -261,6 +263,82 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
                 raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
         data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
         return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
+
+    # ---- Forge JSON API (read-only, used by the web UI at /forge/) ---------
+    # Public repos are readable by anyone; everything else needs a signed-in token. A private repo looks
+    # exactly like a missing one to anonymous callers.
+    def forge_viewer(request: Request) -> bool:
+        return auth.identify(_request_token(request)) is not None
+
+    def forge_repo(request: Request, project: str, repo: str) -> str:
+        full = "/".join(split_repo(f"{project}/{repo}"))
+        if not forge_viewer(request) and not forge.is_public(full):
+            raise NotFound(f"No such repo: {full}")
+        return full
+
+    def repo_json(info) -> dict:
+        return {"repo": info.full_name, "project": info.project, "name": info.name,
+                "description": info.description, "created": str(info.created), "public": info.public}
+
+    @app.get("/api/forge/me", tags=["forge"])
+    def forge_me(request: Request):
+        did = auth.identify(_request_token(request))
+        return {"signed_in": did is not None, "did": did, "admin": auth.admin_handle or auth.admin_did}
+
+    @app.get("/api/forge/repos", tags=["forge"])
+    def forge_repos(request: Request, project: str | None = None):
+        signed_in = forge_viewer(request)
+        repos = forge.list(project)
+        return {"repos": [repo_json(i) for i in repos if signed_in or i.public]}
+
+    @app.get("/api/forge/repos/{project}/{repo}", tags=["forge"])
+    def forge_repo_info(request: Request, project: str, repo: str):
+        full = forge_repo(request, project, repo)
+        info = next((i for i in forge.list(full.split("/")[0]) if i.full_name == full), None)
+        if info is None:
+            raise NotFound(f"No such repo: {full}")
+        base = oauth.base_url(request, public_url)
+        return {**repo_json(info), **forge.branches(full), "clone_url": f"{base}/git/{full}.git"}
+
+    @app.get("/api/forge/repos/{project}/{repo}/tree", tags=["forge"])
+    def forge_tree(request: Request, project: str, repo: str, ref: str = "HEAD", path: str = ""):
+        return forge.browse(forge_repo(request, project, repo), path, ref)
+
+    @app.get("/api/forge/repos/{project}/{repo}/log", tags=["forge"])
+    def forge_log(request: Request, project: str, repo: str, ref: str = "HEAD", path: str | None = None,
+                  limit: int = Query(50, ge=1, le=200)):
+        return {"commits": forge.log(forge_repo(request, project, repo), ref, path, limit)}
+
+    # ---- Web UI (Qt for WebAssembly build in fileapi/static/forge) --------
+    ui_dir = Path(__file__).parent / "static" / "forge"
+    ui_types = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".wasm": "application/wasm",
+                ".svg": "image/svg+xml", ".css": "text/css"}
+
+    @app.get("/forge", include_in_schema=False)
+    def forge_ui_root():
+        return RedirectResponse("/forge/")
+
+    @app.get("/forge/{name:path}", include_in_schema=False)
+    def forge_ui(request: Request, name: str = ""):
+        name = name or "index.html"
+        if "/" in name or name.startswith(".") or Path(name).suffix not in ui_types:
+            name = "index.html"  # deep links like /forge/<project>/<repo> load the app, which routes itself
+        path = ui_dir / name
+        headers = {"Cache-Control": "no-cache"}
+        # Large assets are committed gzipped only; serve them as-is to browsers that accept gzip.
+        gz = path.with_name(path.name + ".gz")
+        if gz.is_file() and "gzip" in request.headers.get("accept-encoding", ""):
+            with gz.open("rb") as f:  # gzip's trailer holds the uncompressed size, for the page's progress bar
+                f.seek(-4, 2)
+                size = int.from_bytes(f.read(4), "little")
+            return FileResponse(gz, media_type=ui_types[path.suffix],
+                                headers={**headers, "Content-Encoding": "gzip", "Vary": "Accept-Encoding",
+                                         "X-Uncompressed-Length": str(size)})
+        if path.is_file():
+            return FileResponse(path, media_type=ui_types[path.suffix], headers=headers)
+        if gz.is_file():
+            return Response(gzip.decompress(gz.read_bytes()), media_type=ui_types[path.suffix], headers=headers)
+        raise HTTPException(404, "Web UI not built: run `just ui`")
 
     oauth.install(app, auth, public_url)
 
