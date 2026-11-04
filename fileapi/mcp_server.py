@@ -1,4 +1,4 @@
-"""MCP tools over the shared storage, including the first-connect token flow."""
+"""MCP tools over the shared storage. Sign-in happens before a request gets here (fileapi.auth)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from mcp.types import ToolAnnotations
 
 from .forge import Forge, RepoPasses, fetch_bundle as forge_fetch_bundle, push_bundle as forge_push_bundle, split_repo
 from .storage import Edit, Storage, StorageError
-from .tokens import TokenStore
 
 PathArg = Annotated[str, Field(description="Path relative to the storage root, e.g. 'notes/todo.md'")]
 
@@ -47,65 +46,37 @@ def _base_url(ctx: Context, public_url: str | None) -> str:
     return f"{proto}://{host}"
 
 
-def connect_instructions(token: str, base: str) -> str:
-    return (
-        f"Access token (shown only once, save it now):\n\n    {token}\n\n"
-        "Reconnect with it using either:\n"
-        f"  - header   Authorization: Bearer {token}\n"
-        f"      e.g. claude mcp add --transport http fileapi {base}/mcp --header \"Authorization: Bearer {token}\"\n"
-        f"  - URL      {base}/mcp?token={token}\n"
-        "      (for clients that cannot set headers, e.g. a claude.ai custom connector)\n\n"
-        "Until you reconnect with the token, this connection can no longer use the file tools."
-    )
-
-
 def build_mcp(
     storage: Storage,
-    tokens: TokenStore | None = None,
     public_url: str | None = None,
     forge: Forge | None = None,
     passes: RepoPasses | None = None,
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
-        version="1.3.0",
+        version="1.4.0",
         instructions=(
             "A central file store. Paths are relative to the store root; directories are created automatically. "
             "It also hosts git repos, named '<project>/<repo>': manage and browse them with the *_repo tools, "
-            "or clone/push them with git over HTTPS. "
-            "If tools say the server is unclaimed, call claim_server once to get an access token."
+            "or clone/push them with git over HTTPS (repo_remote_url gives a short-lived authenticated URL)."
         ),
     )
 
     def guard(ctx: Context, fn):
         if not _authed(ctx):
-            if tokens is not None and not tokens.claimed():
-                raise ToolError("This server is not claimed yet. Call claim_server to create its access token.")
-            raise ToolError("Not authorized: reconnect with this server's access token.")
+            raise ToolError("Not authorized: sign in again from your MCP client.")
         try:
             return fn()
         except StorageError as e:
             raise ToolError(str(e)) from None
 
-    if tokens is not None:
-
-        @mcp.tool(structured_output=False)
-        def claim_server(ctx: Context) -> str:
-            """First-time setup: create this server's access token. Only works once, for the first client.
-            Show the returned token to the user so they can save it and reconnect with it."""
-            token = tokens.claim()
-            if token is None:
-                raise ToolError("This server is already claimed. Connect with its access token.")
-            return connect_instructions(token, _base_url(ctx, public_url))
-
-        @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
-        def rotate_token(ctx: Context) -> str:
-            """Replace the access token with a new one. The old token stops working after 60 seconds, so every client must reconnect with the new token."""
-            if not _authed(ctx):
-                raise ToolError("Not authorized.")
-            if tokens.preset:
-                raise ToolError("The token is pinned by FILEAPI_TOKEN; change that setting instead.")
-            return connect_instructions(tokens.rotate(), _base_url(ctx, public_url))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def whoami(ctx: Context) -> str:
+        """Show which atproto account this connection is signed in as."""
+        request = ctx.request_context.request
+        if request is None:
+            return "local stdio process (no sign-in needed)"
+        return guard(ctx, lambda: f"signed in as {getattr(request.state, 'did', '?')} (admin)")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def list_files(ctx: Context, path: str = "", recursive: bool = False) -> str:

@@ -5,28 +5,28 @@ A central file store you can create, read, list, and edit through MCP (Claude, C
 - **MCP:** Streamable HTTP at `/mcp` (stateless). `fileapi stdio` runs the same tools over stdio for local use.
 - **REST:** `/files/...`, documented at `/docs`.
 - **Storage:** Postgres when `DATABASE_URL` is set (needed on hosts without a persistent disk, like FastAPI Cloud), otherwise plain files under `FILEAPI_ROOT`.
-- **Auth:** first client claims the server over MCP and gets the token. See below.
+- **Auth:** sign in with atproto (Bluesky) OAuth. Only the admin account (`nandi.uk`) gets in. See below.
 
-## Auth: first client claims the server
+## Auth: atproto sign-in, admin only
 
-1. Deploy. The server starts **unclaimed**.
-2. Connect any MCP client to `https://<host>/mcp` with no credentials and ask it to call **`claim_server`**. It returns the access token (once, so save it) plus exact reconnect instructions.
-3. From then on the file tools and `/files` need the token, either as:
-   - header `Authorization: Bearer <token>`, or
-   - query string `https://<host>/mcp?token=<token>` for clients that can't set headers (e.g. a claude.ai custom connector).
-4. `claim_server` only works once. A request with no token can still connect and list tools, but every tool refuses. A wrong token gets `401`.
-5. `rotate_token` (needs the current token) issues a new one. The old one keeps working for 60 seconds.
+fileapi is an OAuth 2.1 authorization server for its MCP clients, the way the MCP spec expects, and signs people in through atproto:
 
-Only a SHA-256 hash of the token is stored. To reset ownership, delete the `access_token` record (`fileapi_kv` table in Postgres, or `$FILEAPI_STATE_DIR/access_token.json`). To skip the claim step, set `FILEAPI_TOKEN` to a token of your choice.
+1. Add `https://<host>/mcp` to an MCP client (Claude Code, claude.ai, Claude desktop) with no credentials. The server answers `401` with `WWW-Authenticate: Bearer resource_metadata=...`, so the client discovers `/.well-known/oauth-authorization-server`, registers itself (`/register`, dynamic client registration) and opens `/authorize` in the browser, which shows which app is asking and where it will return.
+2. fileapi sends the browser to the admin's own atproto authorization server (PAR + PKCE + DPoP; for `nandi.uk` that's bsky.social), with the handle prefilled.
+3. On the way back fileapi checks the signed-in account's **DID**, not its handle: only `did:plc:ngokl2gnmpbvuvrfckja3g7p` (`nandi.uk`) is accepted. Anyone else gets "Not allowed" and no token. Pinning the DID means a handle change neither locks the admin out nor lets a new owner of the handle in.
+4. The client gets a fileapi access token (24 h) and refresh token (90 days, rotated on use). The access token also works for `/files` (`Authorization: Bearer <token>` or `?token=`) and as a git Basic-auth password.
 
-Whoever reaches a fresh deployment first owns it, so claim it right after deploying.
+Only SHA-256 hashes of tokens are stored, in the KV store (`fileapi_kv` in Postgres, or `$FILEAPI_STATE_DIR`). Delete the `oauth_at_*` / `oauth_rt_*` records to sign everything out.
+
+To change the admin set `FILEAPI_ADMIN_DID` (and `FILEAPI_ADMIN_HANDLE` for the login hint). `FILEAPI_TOKEN` optionally sets a static admin token for scripts and CI; it is unset by default.
+
+The atproto client metadata is served at `/oauth/atproto/client-metadata.json` and the authorization server fetches it, so the host must be reachable over HTTPS (set `FILEAPI_PUBLIC_URL` if it sits behind a proxy that rewrites the host). On `http://127.0.0.1` / `localhost` fileapi uses atproto's loopback client instead, so local development works without a public URL.
 
 ## MCP tools
 
 | Tool | What it does |
 | --- | --- |
-| `claim_server` | First-time setup: returns the access token. Works once |
-| `rotate_token` | Replace the token |
+| `whoami` | Which atproto account this connection is signed in as |
 | `list_files` | List a directory (`path`, optional `recursive`) |
 | `read_file` | Read a text file |
 | `create_file` | Create a new file; fails if it exists |
@@ -63,14 +63,14 @@ git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git
 
 ### Push and pull with only the MCP connection
 
-An MCP client that holds the token can move commits without anyone typing it into git:
+An MCP client that is signed in can move commits without anyone typing a token into git:
 
-- **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<project>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret stored next to the token (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
+- **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<project>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret in the KV store (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
 - **Bundles (small changes):** `git bundle create /tmp/p.bundle main ^origin/main`, base64 it, call `push_bundle`. For pulls, `fetch_bundle` with `have: [<sha of origin/main>]`, decode, `git fetch /tmp/f.bundle 'refs/heads/*:refs/remotes/origin/*'`. The bundle travels inside the tool call, so it costs model tokens; keep it to small pushes.
 
 Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
 
-Access: any valid token currently reaches every project. When per-project tokens exist (`TokenStore.scope()` returning a project name), a project token only reaches that project's repos, over git and over MCP.
+Access: the admin reaches every project; public repos clone anonymously. Nobody else has access.
 
 ## REST API
 
@@ -122,13 +122,13 @@ fastapi deploy                      # entrypoint comes from [tool.fastapi] in py
 fastapi deploy                      # redeploy so it picks up DATABASE_URL
 ```
 
-Then get a token: `just token https://<app>.fastapicloud.dev` (or connect any MCP client and call `claim_server`). It claims a fresh server and saves `FILEAPI_URL` and `FILEAPI_ACCESS_TOKEN` to `.env`; run it again later to rotate the token (it uses the one in `.env`). `just connect-info` prints the client settings. Tables are created automatically on startup.
+Then connect a client (below) and sign in as the admin. Tables are created automatically on startup.
 
 ## Run elsewhere
 
 ```sh
 pip install .
-fileapi                              # files in ./data, token record in ./state
+fileapi                              # files in ./data, sign-in records in ./state
 # or: DATABASE_URL=postgresql://user:pass@host/db fileapi
 ```
 
@@ -141,28 +141,25 @@ docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state fileapi
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `DATABASE_URL` | unset | Postgres connection string. When set, files and the token live in Postgres |
+| `DATABASE_URL` | unset | Postgres connection string. When set, files, repos and sign-ins live in Postgres |
 | `FILEAPI_ROOT` | `./data` | Filesystem backend: where files live |
-| `FILEAPI_STATE_DIR` | `./state` | Filesystem backend: token record. Must be outside `FILEAPI_ROOT` |
+| `FILEAPI_STATE_DIR` | `./state` | Filesystem backend: OAuth clients and tokens. Must be outside `FILEAPI_ROOT` |
 | `FILEAPI_GIT_ROOT` | `./repos` | Filesystem backend: bare git repos. Must be outside `FILEAPI_ROOT` |
 | `FILEAPI_GIT_MAX_PUSH` | `209715200` | Max git push (request body) in bytes |
-| `FILEAPI_TOKEN` | unset | Pin the token yourself and skip `claim_server` |
-| `FILEAPI_PUBLIC_URL` | from request | Base URL shown in reconnect instructions |
+| `FILEAPI_ADMIN_DID` | `did:plc:ngokl2gnmpbvuvrfckja3g7p` | The only atproto account allowed in (`nandi.uk`) |
+| `FILEAPI_ADMIN_HANDLE` | `nandi.uk` | Login hint shown at the authorization server |
+| `FILEAPI_TOKEN` | unset | Optional static admin token for scripts/CI |
+| `FILEAPI_PUBLIC_URL` | from request | Public base URL (OAuth issuer, atproto client_id, git URLs) |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | For `fileapi` CLI |
 | `FILEAPI_MAX_BODY` | `10485760` | Max MCP request size in bytes |
 
-Health check: `GET /health` returns `{"ok": true, "claimed": ..., "storage": "postgres" | "disk", "git": "postgres" | "disk"}`.
+Health check: `GET /health` returns `{"ok": true, "auth": "atproto", "admin": "<did>", "storage": "postgres" | "disk", "git": "postgres" | "disk"}`.
 
 ## Connect a client
 
-Claude Code: `just claude-add` asks for the token (hidden; Enter reuses the one in `.env`), checks it against the server, and replaces any existing `fileapi` entry. Options: `just claude-add <url> <scope>` (scope `user`, `project` or `local`). Or by hand:
+Claude Code: `just claude-add` (or `claude mcp add --transport http fileapi https://<host>/mcp`), then run `/mcp` in Claude Code and pick fileapi to sign in in the browser.
 
-```sh
-claude mcp add --transport http fileapi https://<host>/mcp                    # first time, then ask it to claim_server
-claude mcp add --transport http fileapi https://<host>/mcp --header "Authorization: Bearer <token>"
-```
-
-claude.ai / Claude desktop: Settings → Connectors → Add custom connector → `https://<host>/mcp?token=<token>`.
+claude.ai / Claude desktop: Settings → Connectors → Add custom connector → `https://<host>/mcp`, then Connect and sign in as the admin.
 
 Local stdio (no auth, filesystem backend):
 

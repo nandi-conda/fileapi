@@ -1,8 +1,9 @@
 """FastAPI app: MCP at /mcp plus a REST API at /files.
 
-Auth is trust-on-first-use (see fileapi.tokens): the first client calls the claim_server tool and gets
-the token. Tools and /files then need it, sent as `Authorization: Bearer <token>` or `?token=<token>`.
-A /mcp request without a token can connect and list tools, but every tool except claim_server refuses.
+Auth is atproto OAuth limited to one admin account (see fileapi.auth). MCP clients discover it from the
+401 on /mcp and sign in in the browser; the access token they get also works for /files
+(`Authorization: Bearer <token>` or `?token=`) and as the git Basic-auth password. Public repos clone
+anonymously.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, split_repo
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
-from .tokens import FileKV, TokenStore, token_scope
+from . import auth as oauth
+from .auth import Auth
+from .tokens import FileKV
 
 
 class EditBody(BaseModel):
@@ -61,6 +64,8 @@ def create_app(
     public_url: str | None = None,
     database_url: str | None = None,
     git_root: str | None = None,
+    admin_did: str | None = None,
+    atproto=None,
 ) -> FastAPI:
     root = root or os.environ.get("FILEAPI_ROOT", "./data")
     state_dir = state_dir or os.environ.get("FILEAPI_STATE_DIR", "./state")
@@ -75,23 +80,27 @@ def create_app(
 
         storage = PostgresStorage(database_url)
         storage.init()
-        tokens = TokenStore(PostgresKV(storage), preset_token)
+        kv = PostgresKV(storage)
         forge = Forge(PgForgeStore(storage.pool))
     else:
         storage = Storage(root)
         storage.init()
         state = Path(state_dir).resolve()
         if state == storage.root or storage.root in state.parents:
-            raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds the token)")
-        tokens = TokenStore(FileKV(state), preset_token)
+            raise RuntimeError("FILEAPI_STATE_DIR must be outside FILEAPI_ROOT (it holds sign-in state)")
+        kv = FileKV(state)
         git = Path(git_root or os.environ.get("FILEAPI_GIT_ROOT", "./repos")).resolve()
         if git == storage.root or storage.root in git.parents:
             raise RuntimeError("FILEAPI_GIT_ROOT must be outside FILEAPI_ROOT")
         forge = Forge(DiskForgeStore(git))
     forge.store.init()
-    passes = RepoPasses(tokens.kv)
+    passes = RepoPasses(kv)
+    # The admin is pinned by DID; the handle is only a login hint and display name.
+    admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
+    admin_handle = os.environ.get("FILEAPI_ADMIN_HANDLE") or (oauth.ADMIN_HANDLE if admin_did == oauth.ADMIN_DID else "")
+    auth = Auth(kv, admin_did=admin_did, admin_handle=admin_handle, preset_token=preset_token, atproto=atproto)
 
-    mcp = build_mcp(storage, tokens, public_url, forge, passes)
+    mcp = build_mcp(storage, public_url, forge, passes)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -106,31 +115,30 @@ def create_app(
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="fileapi", version="1.3.0", lifespan=lifespan)
+    app = FastAPI(title="fileapi", version="1.4.0", lifespan=lifespan)
     app.state.storage = storage
-    app.state.tokens = tokens
+    app.state.auth = auth
     app.state.forge = forge
 
     @app.middleware("http")
     async def mcp_auth(request: Request, call_next):
         if request.url.path.rstrip("/") == "/mcp":
-            presented = _request_token(request)
-            scope = token_scope(tokens, presented)
-            authed = scope is not None
-            if presented and not authed:
+            did = auth.identify(_request_token(request))
+            if did is None:
+                # MCP clients follow resource_metadata to our OAuth server and sign the user in.
+                meta = oauth.resource_metadata_url(oauth.base_url(request, public_url))
                 return JSONResponse(
                     {"jsonrpc": "2.0", "error": {"code": -32001, "message": "Unauthorized"}, "id": None},
                     status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
+                    headers={"WWW-Authenticate": f'Bearer resource_metadata="{meta}", scope="{oauth.SCOPE}"'},
                 )
-            # No token: the connection stays up (so the claiming client doesn't break mid-session),
-            # but every tool except claim_server refuses until the client reconnects with the token.
-            request.scope.setdefault("state", {})["authed"] = authed
-            request.scope["state"]["scope"] = scope
+            request.scope.setdefault("state", {})["authed"] = True
+            request.scope["state"]["scope"] = ""
+            request.scope["state"]["did"] = did
         return await call_next(request)
 
     def require_token(request: Request) -> None:
-        if not tokens.check(_request_token(request)):
+        if auth.identify(_request_token(request)) is None:
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
 
     @app.exception_handler(StorageError)
@@ -144,16 +152,15 @@ def create_app(
         proto = request.headers.get("x-forwarded-proto")
         if proto:
             base = proto.split(",")[0].strip() + base[base.index("://"):]
-        claimed = tokens.claimed()
+        who = auth.admin_handle or auth.admin_did
         status = (
-            "Claimed. Connect with the access token."
-            if claimed
-            else "Not claimed yet. Connect an MCP client with no credentials and call <code>claim_server</code>."
+            f"Sign in with atproto (Bluesky). Only <code>{who}</code> has access. Add the MCP endpoint below to "
+            "your MCP client and it will open the sign-in page."
         )
         storage_note = (
             "Postgres (DATABASE_URL)"
             if backend == "postgres"
-            else "local disk. On hosts without a persistent disk (e.g. FastAPI Cloud) files and the token are lost on restart; set DATABASE_URL."
+            else "local disk. On hosts without a persistent disk (e.g. FastAPI Cloud) files and sign-ins are lost on restart; set DATABASE_URL."
         )
         return HTMLResponse(f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>fileapi</title>
@@ -164,56 +171,56 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Status:</b> {status}</p>
 <p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
-<p><b>Git repos:</b> <code>git clone {base.replace("://", "://x:&lt;token&gt;@", 1)}/git/&lt;project&gt;/&lt;repo&gt;.git</code></p>
+<p><b>Git repos:</b> <code>{base}/git/&lt;project&gt;/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest use the <code>repo_remote_url</code> MCP tool)</p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
     @app.get("/health")
     def health():
-        return {"ok": True, "claimed": tokens.claimed(), "storage": backend, "git": forge.store.backend}
+        return {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend}
 
     # ---- REST API ------------------------------------------------------
-    auth = [Depends(require_token)]
+    authed = [Depends(require_token)]
 
-    @app.get("/files", dependencies=auth)
+    @app.get("/files", dependencies=authed)
     def list_root(recursive: bool = False):
         return [e.to_dict() for e in storage.list("", recursive)]
 
-    @app.get("/files/{path:path}", dependencies=auth)
+    @app.get("/files/{path:path}", dependencies=authed)
     def get_file(path: str, recursive: bool = False):
         """Return file contents as text, or a JSON listing if the path is a directory."""
         if storage.is_dir(path):
             return [e.to_dict() for e in storage.list(path, recursive)]
         return PlainTextResponse(storage.read(path))
 
-    @app.put("/files/{path:path}", dependencies=auth)
+    @app.put("/files/{path:path}", dependencies=authed)
     def put_file(path: str, content: str = Body(..., media_type="text/plain"), overwrite: bool = Query(True)):
         """Create (or overwrite) a file with the raw request body. ?overwrite=false to fail if it exists."""
         created, n = storage.write(path, content, overwrite=overwrite)
         return JSONResponse({"path": path, "created": created, "bytes": n}, status_code=201 if created else 200)
 
-    @app.patch("/files/{path:path}", dependencies=auth)
+    @app.patch("/files/{path:path}", dependencies=authed)
     def patch_file(path: str, body: EditsBody):
         if not body.edits:
             raise StorageError("At least one edit is required")
         n = storage.edit(path, [Edit(e.old_text, e.new_text) for e in body.edits])
         return {"path": path, "edits": n}
 
-    @app.post("/files/{path:path}:append", dependencies=auth)
+    @app.post("/files/{path:path}:append", dependencies=authed)
     def append_file(path: str, content: str = Body(..., media_type="text/plain")):
         return {"path": path, "bytes": storage.append(path, content)}
 
-    @app.post("/files/{path:path}:move", dependencies=auth)
+    @app.post("/files/{path:path}:move", dependencies=authed)
     def move_file(path: str, body: MoveBody):
         storage.move(path, body.destination, body.overwrite)
         return {"path": body.destination}
 
-    @app.delete("/files/{path:path}", dependencies=auth, status_code=204)
+    @app.delete("/files/{path:path}", dependencies=authed, status_code=204)
     def delete_file(path: str):
         storage.delete(path)
 
     # ---- Git smart HTTP ---------------------------------------------------
-    # Clone/push with the access token as the Basic-auth password (any username), or an Authorization:
-    # Bearer header via `git -c http.extraHeader=...`. A project token only reaches its own project's repos.
+    # Clone/push with an OAuth access token (or a repo_remote_url pass) as the Basic-auth password (any
+    # username), or an Authorization: Bearer header via `git -c http.extraHeader=...`.
     max_push = int(os.environ.get("FILEAPI_GIT_MAX_PUSH", 200 * 1024 * 1024))
 
     def git_auth(request: Request, project: str, repo: str, service: str) -> str:
@@ -224,7 +231,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         # Public repos: anyone may clone and fetch without credentials. Pushing always needs a token.
         if service == "git-upload-pack" and not presented and forge.is_public(full):
             return full
-        scope = token_scope(tokens, presented)
+        scope = auth.scope(presented)
         if scope is None:
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": 'Basic realm="fileapi git"'})
         if scope and scope != full.split("/")[0]:
@@ -254,6 +261,8 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
                 raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
         data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
         return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
+
+    oauth.install(app, auth, public_url)
 
     # Mount last so the routes above take precedence.
     app.mount("/", mcp_app)

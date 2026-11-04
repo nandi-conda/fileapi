@@ -226,7 +226,7 @@ class PostgresStorage:
 
 
 class PostgresKV:
-    """Key/value records for the token store."""
+    """Key/value records for server state (OAuth records, forge secret)."""
 
     def __init__(self, storage: PostgresStorage):
         self.pool = storage.pool
@@ -249,6 +249,11 @@ class PostgresKV:
                 "INSERT INTO fileapi_kv VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING 1", (key, Jsonb(value))
             ).fetchone()
         return row is not None
+
+    def pop(self, key: str) -> dict | None:
+        with self.pool.connection() as c:
+            row = c.execute("DELETE FROM fileapi_kv WHERE key = %s RETURNING value", (key,)).fetchone()
+        return row[0] if row else None
 
 
 __all__ = ["PostgresStorage", "PostgresKV"]

@@ -49,14 +49,14 @@ def backend(request):
 
 @pytest.fixture
 def server_url(tmp_path, backend):
-    """A real server process that starts unclaimed."""
+    """A real server process; FILEAPI_TOKEN stands in for an OAuth sign-in."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     env = {**os.environ, "FILEAPI_ROOT": str(tmp_path / "data"), "FILEAPI_STATE_DIR": str(tmp_path / "state"),
            "FILEAPI_GIT_ROOT": str(tmp_path / "repos"),
            "HOST": "127.0.0.1", "PORT": str(port), "FILEAPI_PUBLIC_URL": f"http://127.0.0.1:{port}"}
-    env.pop("FILEAPI_TOKEN", None)
+    env["FILEAPI_TOKEN"] = TOKEN
     env.pop("DATABASE_URL", None)
     env.update(backend)
     proc = subprocess.Popen([sys.executable, "-m", "fileapi"], env=env)
@@ -83,55 +83,31 @@ def text(result) -> str:
 
 
 @pytest.mark.anyio
-async def test_first_client_claims_then_token_required(server_url):
+async def test_mcp_requires_sign_in(server_url):
     h = httpx.get(f"{server_url}/health").json()
-    assert h["claimed"] is False and h["storage"] in ("disk", "postgres")
+    assert h["auth"] == "atproto" and h["admin"].startswith("did:") and h["storage"] in ("disk", "postgres")
 
-    # 1. First client connects with no token: file tools refuse, claim_server hands out the token.
-    async with connect(server_url) as c:
-        names = {t.name for t in (await c.list_tools()).tools}
-        assert {"claim_server", "rotate_token", *FILE_TOOLS} <= names
-        r = await c.call_tool("list_files", {})
-        assert r.is_error and "claim_server" in text(r)
-        r = await c.call_tool("claim_server", {})
-        assert not r.is_error
-        token = next(w for w in text(r).split() if w.startswith("fa_"))
-        assert f"{server_url}/mcp?token={token}" in text(r)
+    # No token or a wrong one: 401 that points MCP clients at the OAuth metadata.
+    for headers, url in [({}, f"{server_url}/mcp"), ({"Authorization": "Bearer nope"}, f"{server_url}/mcp"),
+                         ({}, f"{server_url}/mcp?token=nope")]:
+        r = httpx.post(url, headers={"content-type": "application/json", **headers}, content="{}")
+        assert r.status_code == 401
+        assert f'resource_metadata="{server_url}/.well-known/oauth-protected-resource/mcp"' in r.headers["www-authenticate"]
+    meta = httpx.get(f"{server_url}/.well-known/oauth-protected-resource/mcp").json()
+    assert meta["resource"] == f"{server_url}/mcp" and meta["authorization_servers"] == [server_url]
+    asm = httpx.get(f"{server_url}/.well-known/oauth-authorization-server").json()
+    assert asm["issuer"] == server_url and asm["registration_endpoint"] == f"{server_url}/register"
 
-    assert httpx.get(f"{server_url}/health").json()["claimed"] is True
-
-    # 2. Now tokenless clients get refused by every tool, and wrong tokens are rejected outright.
-    async with connect(server_url) as c:
-        r = await c.call_tool("list_files", {})
-        assert r.is_error and "access token" in text(r)
-        assert (await c.call_tool("claim_server", {})).is_error
-    r = httpx.post(f"{server_url}/mcp", headers={"content-type": "application/json", "Authorization": "Bearer nope"},
-                   content="{}")
-    assert r.status_code == 401
-    assert httpx.post(f"{server_url}/mcp?token=nope", headers={"content-type": "application/json"},
-                      content="{}").status_code == 401
-
-    # 3. The token works as a header and as ?token=, and a second claim fails.
-    async with connect(server_url, token, via="query") as c:
-        assert text(await c.call_tool("list_files", {})) == "(empty)"
-        r = await c.call_tool("claim_server", {})
-        assert r.is_error and "already claimed" in text(r)
-
-    async with connect(server_url, token) as c:
-        r = await c.call_tool("rotate_token", {})
-        new_token = next(w for w in text(r).split() if w.startswith("fa_"))
-    # old token keeps working during the grace period
-    async with connect(server_url, token) as c:
-        assert not (await c.call_tool("list_files", {})).is_error
-    async with connect(server_url, new_token) as c:
-        assert text(await c.call_tool("list_files", {})) == "(empty)"
+    for via in ("header", "query"):
+        async with connect(server_url, TOKEN, via=via) as c:
+            names = {t.name for t in (await c.list_tools()).tools}
+            assert {"whoami", *FILE_TOOLS} <= names and "claim_server" not in names
+            assert text(await c.call_tool("list_files", {})) == "(empty)"
 
 
 @pytest.mark.anyio
 async def test_mcp_tools_end_to_end(server_url):
-    async with connect(server_url) as c:
-        token = next(w for w in text(await c.call_tool("claim_server", {})).split() if w.startswith("fa_"))
-    async with connect(server_url, token) as c:
+    async with connect(server_url, TOKEN) as c:
         assert "Created" in text(await c.call_tool("create_file", {"path": "notes/a.md", "content": "hello world\n"}))
         assert (await c.call_tool("create_file", {"path": "notes/a.md", "content": "x"})).is_error
         assert text(await c.call_tool("read_file", {"path": "notes/a.md"})) == "hello world\n"
@@ -152,20 +128,156 @@ async def test_mcp_tools_end_to_end(server_url):
             assert (await c.call_tool("read_file", {"path": p})).is_error, p
 
 
-def test_rest_api_rejects_everything_while_unclaimed(tmp_path):
+def test_rest_api_rejects_everything_without_sign_in(tmp_path):
     with TestClient(app_for(tmp_path, preset_token="")) as c:
         assert c.get("/files").status_code == 401
+        assert c.get("/files", headers=AUTH).status_code == 401
 
 
-def test_rotated_token_expires_after_grace(tmp_path):
-    from fileapi.tokens import FileKV, TokenStore
+def test_file_kv_pop_is_single_use(tmp_path):
+    from fileapi.tokens import FileKV
 
-    store = TokenStore(FileKV(tmp_path))
-    first = store.claim()
-    assert first and store.claim() is None
-    store.ROTATE_GRACE = 0
-    second = store.rotate()
-    assert store.check(second) and not store.check(first) and not store.check("fa_wrong")
+    kv = FileKV(tmp_path)
+    kv.put("k", {"v": 1})
+    assert kv.pop("k") == {"v": 1} and kv.pop("k") is None and kv.get("k") is None
+
+
+# ---- atproto OAuth ------------------------------------------------------------
+
+ADMIN = "did:plc:admin"
+
+
+class FakeAtproto:
+    """Stands in for the admin's atproto authorization server."""
+
+    def __init__(self):
+        from fileapi.auth import AuthServer
+
+        self.server = AuthServer("https://as.example", "https://as.example/par", "https://as.example/authorize",
+                                 "https://as.example/token")
+        self.pars, self.sub = [], ADMIN
+
+    async def auth_server_for(self, did):
+        assert did == ADMIN
+        return self.server
+
+    async def par(self, server, params, key):
+        self.pars.append(params)
+        return "urn:req:1", "nonce1"
+
+    async def redeem(self, server, params, key, nonce):
+        assert params["code"] == "atcode" and nonce == "nonce1"
+        return {"sub": self.sub, "scope": "atproto", "access_token": "x", "token_type": "DPoP"}
+
+
+def _sign_in(c, fake, client, redirect="http://127.0.0.1:9/cb"):
+    import base64 as b64
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    verifier = "v" * 50
+    challenge = b64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    r = c.get("/authorize", params={"response_type": "code", "client_id": client["client_id"], "redirect_uri": redirect,
+                                    "code_challenge": challenge, "code_challenge_method": "S256", "state": "s1"},
+              follow_redirects=False)
+    assert r.status_code == 200 and "Continue with" in r.text and "http://127.0.0.1:9" in r.text
+    assert r.headers["x-frame-options"] == "DENY"
+    rid = r.text.split('name=rid value="')[1].split('"')[0]
+    assert c.post("/authorize", data={"rid": rid}, headers={"origin": "https://evil.example"}).status_code == 403
+    r = c.post("/authorize", data={"rid": rid}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith("https://as.example/authorize?")
+    assert c.post("/authorize", data={"rid": rid}).status_code == 400  # single use
+    par = fake.pars[-1]
+    assert par["login_hint"] and par["scope"] == "atproto" and par["code_challenge_method"] == "S256"
+    r = c.get("/oauth/atproto/callback", params={"code": "atcode", "state": par["state"], "iss": "https://as.example"},
+              follow_redirects=False)
+    return r, verifier
+
+
+def test_atproto_oauth_flow(tmp_path, backend):
+    from urllib.parse import parse_qs, urlparse
+
+    fake = FakeAtproto()
+    app = app_for(tmp_path, preset_token="", admin_did=ADMIN, atproto=fake, public_url="http://127.0.0.1:8000",
+                  database_url=backend.get("DATABASE_URL", ""))
+    with TestClient(app) as c:
+        meta = c.get("/oauth/atproto/client-metadata.json").json()
+        assert meta["client_id"].startswith("http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%3A8000")
+        assert meta["dpop_bound_access_tokens"] is True
+
+        assert c.post("/register", json={"redirect_uris": ["http://evil.example/cb"]}).status_code == 400
+        client = c.post("/register", json={"redirect_uris": ["http://127.0.0.1:9/cb"], "client_name": "t",
+                                           "token_endpoint_auth_method": "none"}).json()
+        assert "client_secret" not in client
+        assert c.get("/authorize", params={"client_id": client["client_id"], "redirect_uri": "http://127.0.0.1:9/x",
+                                           "response_type": "code", "code_challenge": "c"}).status_code == 400
+
+        r, verifier = _sign_in(c, fake, client)
+        assert r.status_code == 302
+        q = parse_qs(urlparse(r.headers["location"]).query)
+        assert q["state"] == ["s1"] and q["iss"] == ["http://127.0.0.1:8000"]
+        code = q["code"][0]
+
+        form = {"grant_type": "authorization_code", "code": code, "client_id": client["client_id"],
+                "redirect_uri": "http://127.0.0.1:9/cb"}
+        assert c.post("/token", data={**form, "code_verifier": "wrong"}).json()["error"] == "invalid_grant"
+        # A failed attempt burns the code; sign in again.
+        r, verifier = _sign_in(c, fake, client)
+        form["code"] = parse_qs(urlparse(r.headers["location"]).query)["code"][0]
+        tok = c.post("/token", data={**form, "code_verifier": verifier}).json()
+        assert tok["token_type"] == "Bearer" and tok["access_token"].startswith("fa_")
+        assert c.post("/token", data={**form, "code_verifier": verifier}).status_code == 400  # code is single-use
+
+        bearer = {"Authorization": f"Bearer {tok['access_token']}"}
+        assert c.put("/files/a.txt", content="hi", headers=bearer).status_code == 201
+        app.state.forge.create("p", "r")
+        assert c.get("/git/p/r.git/info/refs?service=git-upload-pack",
+                     auth=("x", tok["access_token"])).status_code == 200
+
+        # Refresh rotates both tokens; the old ones stop working.
+        new = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"],
+                                     "client_id": client["client_id"]}).json()
+        assert c.get("/files/a.txt", headers=bearer).status_code == 401
+        assert c.post("/token", data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"],
+                                      "client_id": client["client_id"]}).status_code == 400
+        bearer = {"Authorization": f"Bearer {new['access_token']}"}
+        assert c.get("/files/a.txt", headers=bearer).text == "hi"
+        assert c.post("/revoke", data={"token": new["refresh_token"], "client_id": client["client_id"]}).status_code == 200
+        assert c.get("/files/a.txt", headers=bearer).status_code == 401
+
+        # Anyone else who signs in at the authorization server is refused, and gets no code.
+        fake.sub = "did:plc:someone-else"
+        r, _ = _sign_in(c, fake, client)
+        assert r.status_code == 403 and "location" not in r.headers
+        # A replayed or unknown state is refused too.
+        assert c.get("/oauth/atproto/callback", params={"code": "atcode", "state": fake.pars[-1]["state"],
+                                                        "iss": "https://as.example"}).status_code == 400
+
+
+def test_confidential_client_needs_its_secret(tmp_path):
+    fake = FakeAtproto()
+    with TestClient(app_for(tmp_path, preset_token="", admin_did=ADMIN, atproto=fake)) as c:
+        client = c.post("/register", json={"redirect_uris": ["https://app.example/cb"],
+                                           "token_endpoint_auth_method": "client_secret_post"}).json()
+        assert client["client_secret"].startswith("fs_")
+        r = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": client["client_id"]})
+        assert r.status_code == 401
+        r = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x"},
+                   auth=(client["client_id"], client["client_secret"]))
+        assert r.json()["error"] == "invalid_grant"
+
+
+def test_dpop_proof_is_valid_jwt():
+    import jwt
+    from fileapi.auth import Atproto
+
+    key = Atproto.new_dpop_key()
+    proof = Atproto.dpop_proof(key, "POST", "https://as.example/par", "n1")
+    header = jwt.get_unverified_header(proof)
+    assert header["typ"] == "dpop+jwt" and header["alg"] == "ES256" and header["jwk"]["kty"] == "EC"
+    pub = jwt.algorithms.ECAlgorithm.from_jwk(header["jwk"])
+    claims = jwt.decode(proof, pub, algorithms=["ES256"])
+    assert claims["htm"] == "POST" and claims["htu"] == "https://as.example/par" and claims["nonce"] == "n1"
 
 
 def test_rest_api(tmp_path, backend):
@@ -218,7 +330,7 @@ def test_directory_semantics(tmp_path, backend):
 def test_index_page(tmp_path):
     with TestClient(app_for(tmp_path, preset_token="")) as c:
         r = c.get("/")
-        assert r.status_code == 200 and "Not claimed yet" in r.text and "/mcp" in r.text
+        assert r.status_code == 200 and "nandi.uk" in r.text and "/mcp" in r.text
 
 
 def test_cloud_entrypoint_refuses_ephemeral_disk():
@@ -238,8 +350,7 @@ def git(*args, cwd=None, check=True):
 
 @pytest.mark.anyio
 async def test_git_forge_end_to_end(server_url, tmp_path):
-    async with connect(server_url) as c:
-        token = next(w for w in text(await c.call_tool("claim_server", {})).split() if w.startswith("fa_"))
+    token = TOKEN
     remote = server_url.replace("://", f"://x:{token}@") + "/git/web/blog.git"
 
     async with connect(server_url, token) as c:
@@ -302,7 +413,7 @@ async def test_git_forge_end_to_end(server_url, tmp_path):
     assert git("ls-remote", remote, check=False).returncode != 0
 
 
-def test_git_http_auth_and_project_scope(tmp_path, backend):
+def test_git_http_auth(tmp_path, backend):
     with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
         forge = client.app.state.forge
         forge.create("web", "site")
@@ -324,12 +435,7 @@ def test_git_http_auth_and_project_scope(tmp_path, backend):
         assert [r.public for r in forge.list("web")] == [True]
         forge.set_public("web/site", False)
         assert client.get(refs).status_code == 401
-
-        # Per-project tokens (TokenStore.scope) only reach their own project.
-        client.app.state.tokens.scope = lambda t: {"ptok": "web", TOKEN: ""}.get(t)
-        assert client.get(refs, auth=("x", "ptok")).status_code == 200
-        assert client.get("/git/other/secret.git/info/refs?service=git-upload-pack",
-                          auth=("x", "ptok")).status_code == 403
+        assert client.get(refs, auth=("x", "nope")).status_code == 401
 
 
 def test_git_bundles_and_repo_passes(tmp_path, backend):
@@ -369,7 +475,7 @@ def test_git_bundles_and_repo_passes(tmp_path, backend):
         assert fetch_bundle(forge, "b/r", have=[tips["refs/heads/main"]])[0] == b""
 
         # Short-lived passes work for one repo only, and expire.
-        passes = RepoPasses(client.app.state.tokens.kv)
+        passes = RepoPasses(client.app.state.auth.kv)
         p, _ = passes.issue("b/r", 5)
         refs = "/git/b/r.git/info/refs?service=git-upload-pack"
         assert client.get(refs, auth=("x", p)).status_code == 200

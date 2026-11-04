@@ -1,32 +1,13 @@
-"""Trust-on-first-use access token.
-
-The server starts unclaimed. The first MCP client calls the `claim_server` tool, which mints a random
-token, stores only its SHA-256 hash, and returns the token once. From then on every request must
-present that token. To reset, delete the stored record (or set FILEAPI_TOKEN to pin a token yourself).
-"""
+"""Small key/value store for server state: OAuth clients, codes and tokens (fileapi.auth) and the forge
+secret. FileKV keeps one JSON file per key on disk; storage_pg.PostgresKV keeps them in Postgres."""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import secrets
-import threading
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
-
-KEY = "access_token"
-
-
-def _hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class KV(Protocol):
@@ -34,6 +15,9 @@ class KV(Protocol):
     def put(self, key: str, value: dict) -> None: ...
     def create(self, key: str, value: dict) -> bool:
         """Insert only if absent; True if this call created it."""
+        ...
+    def pop(self, key: str) -> dict | None:
+        """Delete and return the record, atomically: of two racing callers only one gets it."""
         ...
 
 
@@ -54,7 +38,7 @@ class FileKV:
 
     def put(self, key: str, value: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path(key).with_suffix(".tmp")
+        tmp = self.dir / f"{key}.{secrets.token_hex(4)}.tmp"
         tmp.write_text(json.dumps(value))
         os.chmod(tmp, 0o600)
         os.replace(tmp, self._path(key))
@@ -69,64 +53,13 @@ class FileKV:
             json.dump(value, f)
         return True
 
-
-class TokenStore:
-    ROTATE_GRACE = 60  # seconds the old token keeps working after rotate_token
-
-    def __init__(self, kv: KV, preset: str | None = None):
-        self.kv = kv
-        self.preset = preset or None
-        self._lock = threading.Lock()
-
-    def claimed(self) -> bool:
-        return bool(self.preset) or self.kv.get(KEY) is not None
-
-    def check(self, token: str | None) -> bool:
-        if not token:
-            return False
-        if self.preset and hmac.compare_digest(token.encode(), self.preset.encode()):
-            return True
-        record = self.kv.get(KEY)
-        if record is None:
-            return False
-        h = _hash(token)
-        if hmac.compare_digest(h, record["sha256"]):
-            return True
-        prev = record.get("previous")
-        return bool(prev) and prev["until"] > time.time() and hmac.compare_digest(h, prev["sha256"])
-
-    def claim(self) -> str | None:
-        """Mint and persist the token if unclaimed. Returns it, or None if already claimed."""
-        if self.preset:
+    def pop(self, key: str) -> dict | None:
+        claimed = self.dir / f"{key}.{secrets.token_hex(4)}.popped"
+        try:
+            os.rename(self._path(key), claimed)  # atomic: only one caller wins the rename
+        except FileNotFoundError:
             return None
-        token = "fa_" + secrets.token_urlsafe(32)
-        # Atomic insert-if-absent, so two racing clients (or replicas) cannot both claim.
-        if not self.kv.create(KEY, {"sha256": _hash(token), "claimed_at": _now()}):
-            return None
-        return token
-
-    def rotate(self) -> str:
-        """Replace the token; the old one keeps working for ROTATE_GRACE seconds so in-flight clients finish."""
-        with self._lock:
-            token = "fa_" + secrets.token_urlsafe(32)
-            old = self.kv.get(KEY) or {}
-            self.kv.put(
-                KEY,
-                {
-                    "sha256": _hash(token),
-                    "claimed_at": old.get("claimed_at", _now()),
-                    "previous": {"sha256": old["sha256"], "until": time.time() + self.ROTATE_GRACE} if old else None,
-                },
-            )
-            return token
-
-
-def token_scope(tokens: TokenStore, token: str | None) -> str | None:
-    """What a token may access: None (nothing), "" (everything, the owner token) or a project name.
-
-    Uses TokenStore.scope() when per-project tokens exist; until then any valid token is the owner.
-    """
-    scope = getattr(tokens, "scope", None)
-    if scope is not None:
-        return scope(token)
-    return "" if tokens.check(token) else None
+        try:
+            return json.loads(claimed.read_text())
+        finally:
+            claimed.unlink(missing_ok=True)
