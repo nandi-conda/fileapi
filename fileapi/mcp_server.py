@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Annotated
 
 from pydantic import BaseModel, Field
@@ -9,7 +10,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from .forge import Forge, split_repo
+from .forge import Forge, RepoPasses, fetch_bundle as forge_fetch_bundle, push_bundle as forge_push_bundle, split_repo
 from .storage import Edit, Storage, StorageError
 from .tokens import TokenStore
 
@@ -59,7 +60,11 @@ def connect_instructions(token: str, base: str) -> str:
 
 
 def build_mcp(
-    storage: Storage, tokens: TokenStore | None = None, public_url: str | None = None, forge: Forge | None = None
+    storage: Storage,
+    tokens: TokenStore | None = None,
+    public_url: str | None = None,
+    forge: Forge | None = None,
+    passes: RepoPasses | None = None,
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
@@ -153,7 +158,7 @@ def build_mcp(
         return f"Deleted {path}"
 
     if forge is not None:
-        _register_forge_tools(mcp, forge, guard, public_url)
+        _register_forge_tools(mcp, forge, guard, public_url, passes)
 
     return mcp
 
@@ -162,7 +167,7 @@ RepoArg = Annotated[str, Field(description="Repo as '<project>/<name>', e.g. 'we
 RefArg = Annotated[str, Field(description="Branch, tag or commit sha; HEAD is the default branch")]
 
 
-def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str | None) -> None:
+def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str | None, passes) -> None:
     def scoped(ctx: Context, project: str, fn):
         """guard() plus the per-project check: a project token only reaches its own project."""
 
@@ -270,6 +275,82 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
                                        expected_head or None),
         )
         return f"Committed {res['commit'][:12]} to {repo}@{res['branch']}"
+
+    @mcp.tool(structured_output=False)
+    def push_bundle(
+        ctx: Context,
+        repo: RepoArg,
+        bundle_base64: Annotated[str, Field(description="Base64 of a file made by `git bundle create`")],
+        force: bool = False,
+    ) -> str:
+        """Push local commits without git credentials: run `git bundle create /tmp/p.bundle <branch>` (add
+        `^origin/<branch>` or `^<sha the server has>` to send only new commits), base64 it, and pass it here.
+        Branches move fast-forward only unless force. Best for small pushes: the bundle travels inside the
+        tool call. For large pushes use repo_remote_url and plain `git push`."""
+        import base64
+        import binascii
+
+        try:
+            data = base64.b64decode("".join(bundle_base64.split()), validate=True)
+        except (binascii.Error, ValueError):
+            raise ToolError("bundle_base64 is not valid base64") from None
+        results = scoped(ctx, project_of(repo), lambda: forge_push_bundle(forge, repo, data, force))
+        lines = []
+        for r in results:
+            if r["status"] == "rejected":
+                lines.append(f"! {r['ref']}: rejected ({r['reason']})")
+            elif r["status"] == "up to date":
+                lines.append(f"= {r['ref']}: up to date")
+            else:
+                old = (r["old"] or "")[:12]
+                lines.append(f"{'+' if r['status'] == 'forced' else '*'} {r['ref']}: {r['status']} "
+                             f"{old + '..' if old else ''}{r['sha'][:12]}")
+        return "\n".join(lines)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def fetch_bundle(
+        ctx: Context,
+        repo: RepoArg,
+        refs: Annotated[list[str], Field(description="Branches/tags to include; empty means all")] = [],
+        have: Annotated[
+            list[str], Field(description="Commit shas you already have (e.g. `git rev-parse origin/main`), "
+                                         "so only newer history is sent")
+        ] = [],
+    ) -> str:
+        """Pull or clone without git credentials. Returns a base64 git bundle: decode it to a file, then
+        `git clone f.bundle dir` or `git fetch f.bundle 'refs/heads/*:refs/remotes/fileapi/*'`.
+        Best for small repos: the bundle travels inside the tool result. For large ones use repo_remote_url."""
+        import base64
+
+        data, tips = scoped(ctx, project_of(repo), lambda: forge_fetch_bundle(forge, repo, refs or None, have or None))
+        tip_lines = "\n".join(f"{k}\t{v}" for k, v in tips.items())
+        if not data:
+            return f"Already up to date.\n{tip_lines}"
+        limit = 8 * 1024 * 1024
+        if len(data) > limit:
+            raise ToolError(f"Bundle is {len(data)} bytes, over {limit}; pass `have`, or use repo_remote_url and git")
+        return (f"{tip_lines}\n\nBundle ({len(data)} bytes), base64 between the markers:\n"
+                f"-----BEGIN BUNDLE-----\n{base64.b64encode(data).decode()}\n-----END BUNDLE-----")
+
+    if passes is not None:
+
+        @mcp.tool(structured_output=False)
+        def repo_remote_url(
+            ctx: Context,
+            repo: RepoArg,
+            minutes: Annotated[int, Field(description="How long the URL works (1 to 1440)")] = 60,
+        ) -> str:
+            """Get a git remote URL with a short-lived credential for this one repo, so you can run plain
+            `git push` / `git pull` / `git clone` without the user typing the access token. Use it as a
+            one-off URL (`git push <url> main`) rather than saving it as a remote: it expires."""
+            full = scoped(ctx, project_of(repo), lambda: "/".join(split_repo(repo)))
+            scoped(ctx, project_of(repo), lambda: forge.open(full).close())
+            cred, expires = passes.issue(full, minutes)
+            url = f"{_base_url(ctx, public_url)}/git/{full}.git".replace("://", f"://x:{cred}@", 1)
+            when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))
+            return (f"{url}\n\nWorks for {full} only, until {when}. Examples:\n"
+                    f"  git push {url} main\n  git pull {url} main\n  git clone {url}\n"
+                    "After a clone, run `git remote set-url origin <plain URL>` so the credential is not kept.")
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def delete_repo(ctx: Context, repo: RepoArg) -> str:

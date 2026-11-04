@@ -55,7 +55,17 @@ git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git
 | `browse_repo` | A directory listing or a file's content at a `ref` (branch, tag or sha) |
 | `repo_log` | Recent commits, optionally only those touching a `path` |
 | `commit_files` | Commit `{path: content}` (null deletes) to a branch, for clients without git. `expected_head` guards against races |
+| `push_bundle` | Push without git credentials: upload a `git bundle create` file (base64). Fast-forward only unless `force` |
+| `fetch_bundle` | Pull or clone without git credentials: returns a base64 bundle. Pass `have` (shas you already have) to get only new history |
+| `repo_remote_url` | A git URL with a short-lived credential for one repo (default 60 min), for plain `git push`/`pull`/`clone` |
 | `delete_repo` | Delete a repo and its history |
+
+### Push and pull with only the MCP connection
+
+An MCP client that holds the token can move commits without anyone typing it into git:
+
+- **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<project>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret stored next to the token (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
+- **Bundles (small changes):** `git bundle create /tmp/p.bundle main ^origin/main`, base64 it, call `push_bundle`. For pulls, `fetch_bundle` with `have: [<sha of origin/main>]`, decode, `git fetch /tmp/f.bundle 'refs/heads/*:refs/remotes/origin/*'`. The bundle travels inside the tool call, so it costs model tokens; keep it to small pushes.
 
 Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
 

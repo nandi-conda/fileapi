@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Res
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, split_repo
+from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, split_repo
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
 from .tokens import FileKV, TokenStore, token_scope
@@ -89,8 +89,9 @@ def create_app(
             raise RuntimeError("FILEAPI_GIT_ROOT must be outside FILEAPI_ROOT")
         forge = Forge(DiskForgeStore(git))
     forge.store.init()
+    passes = RepoPasses(tokens.kv)
 
-    mcp = build_mcp(storage, tokens, public_url, forge)
+    mcp = build_mcp(storage, tokens, public_url, forge, passes)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -216,10 +217,13 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     max_push = int(os.environ.get("FILEAPI_GIT_MAX_PUSH", 200 * 1024 * 1024))
 
     def git_auth(request: Request, project: str, repo: str) -> str:
-        scope = token_scope(tokens, _request_token(request))
+        presented = _request_token(request)
+        full = "/".join(split_repo(f"{project}/{repo}"))
+        if passes.check(presented, full):  # short-lived pass from the repo_remote_url tool
+            return full
+        scope = token_scope(tokens, presented)
         if scope is None:
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": 'Basic realm="fileapi git"'})
-        full = "/".join(split_repo(f"{project}/{repo}"))
         if scope and scope != full.split("/")[0]:
             raise HTTPException(403, f"This token cannot access project {project}")
         return full

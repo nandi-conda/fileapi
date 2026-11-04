@@ -614,3 +614,181 @@ def _apply_tree(r: BaseRepo, tree_id: bytes | None, changes: dict, new_objects: 
         return None
     new_objects.append(tree)
     return tree.id
+
+
+# --------------------------------------------------------------------------- bundles (push/pull over MCP)
+
+
+def _bundle_pack_offset(data: bytes) -> int:
+    """Byte offset where a bundle's pack starts: right after the blank line that ends the header."""
+    end = data.find(b"\n\n")
+    if end < 0 or data[end + 2:end + 6] != b"PACK":
+        raise StorageError("Not a git bundle (expected a header, a blank line, then a pack)")
+    return end + 2
+
+
+def push_bundle(forge: Forge, repo: str, data: bytes, force: bool = False) -> list[dict]:
+    """Apply a `git bundle create` file: store its objects, then move each branch/tag it carries.
+
+    Each ref update is fast-forward-only unless force, and compare-and-swap so a concurrent push wins cleanly.
+    """
+    from dulwich.bundle import read_bundle
+    from dulwich.graph import can_fast_forward
+
+    try:
+        with read_bundle(io.BytesIO(data)) as b:
+            refs = {k: v for k, v in b.references.items() if k.startswith((b"refs/heads/", b"refs/tags/"))}
+            prereqs = [sha for sha, _ in b.prerequisites]
+    except StorageError:
+        raise
+    except Exception as e:
+        raise StorageError(f"Not a valid git bundle: {e}") from None
+    if not refs:
+        raise StorageError("The bundle has no branches or tags. Create it with e.g. `git bundle create f.bundle main`")
+    r = forge.open(repo)
+    try:
+        missing = [p.decode() for p in prereqs if p not in r.object_store]
+        if missing:
+            raise Conflict(
+                f"The server does not have commit(s) {', '.join(m[:12] for m in missing)} that this bundle builds on. "
+                "Fetch first (fetch_bundle), or bundle the full history."
+            )
+        pack = io.BytesIO(data[_bundle_pack_offset(data):])
+        r.object_store.add_thin_pack(pack.read, None)
+        results = []
+        for ref, new in sorted(refs.items()):
+            name = ref.decode()
+            if new not in r.object_store:
+                results.append({"ref": name, "status": "rejected", "reason": "object missing from bundle"})
+                continue
+            try:
+                old = r.refs[ref]
+            except KeyError:
+                old = None
+            if old == new:
+                results.append({"ref": name, "status": "up to date", "sha": new.decode()})
+                continue
+            forced = False
+            if old is not None:
+                if ref.startswith(b"refs/tags/") and not force:
+                    results.append({"ref": name, "status": "rejected", "reason": "tag exists (use force)"})
+                    continue
+                if not force:
+                    try:
+                        ff = can_fast_forward(r, old, new)
+                    except KeyError:
+                        ff = False
+                    if not ff:
+                        results.append({"ref": name, "status": "rejected",
+                                        "reason": "non-fast-forward: fetch and merge/rebase first, or use force"})
+                        continue
+                else:
+                    forced = True
+            ok = r.refs.set_if_equals(ref, old, new) if old is not None else r.refs.add_if_new(ref, new)
+            if not ok:
+                results.append({"ref": name, "status": "rejected", "reason": "changed during the push; retry"})
+                continue
+            results.append({"ref": name, "status": "forced" if forced else ("created" if old is None else "updated"),
+                            "old": old.decode() if old else None, "sha": new.decode()})
+        return results
+    finally:
+        r.close()
+
+
+def fetch_bundle(forge: Forge, repo: str, refs: list[str] | None = None, have: list[str] | None = None) -> tuple[bytes, dict]:
+    """A bundle with the given branches/tags (default: all), leaving out history the client already has."""
+    from dulwich.bundle import create_bundle_from_repo, write_bundle
+
+    r = forge.open(repo)
+    try:
+        all_refs = {k: v for k, v in r.refs.as_dict().items() if k.startswith((b"refs/heads/", b"refs/tags/"))}
+        if refs:
+            wanted = []
+            for name in refs:
+                full = next((c for c in (name.encode(), b"refs/heads/" + name.encode(), b"refs/tags/" + name.encode())
+                             if c in all_refs), None)
+                if full is None:
+                    raise NotFound(f"Unknown branch or tag: {name}")
+                wanted.append(full)
+        else:
+            wanted = sorted(all_refs)
+        if not wanted:
+            raise NotFound("Repo is empty: nothing has been pushed yet")
+        # Only commits the server knows can be prerequisites; skip ones that are already the tips (nothing to send).
+        prereqs = []
+        for sha in have or []:
+            s = sha.strip().lower().encode()
+            if len(s) == 40 and s in r.object_store and isinstance(r[s], Commit):
+                prereqs.append(s)
+        tips = {all_refs[w] for w in wanted}
+        if prereqs and tips <= set(prereqs):
+            return b"", {w.decode(): all_refs[w].decode() for w in wanted}
+        head = r.refs.read_ref(b"HEAD") or b""
+        # Carry HEAD when the default branch is included, so `git clone f.bundle` checks it out.
+        extra = [b"HEAD"] if head.startswith(SYMREF) and head[len(SYMREF):] in wanted else []
+        bundle = create_bundle_from_repo(r, refs=extra + wanted, prerequisites=prereqs, version=2)
+        out = io.BytesIO()
+        try:
+            write_bundle(out, bundle)
+        finally:
+            bundle.close()
+        return out.getvalue(), {w.decode(): all_refs[w].decode() for w in wanted}
+    finally:
+        r.close()
+
+
+# --------------------------------------------------------------------------- short-lived repo credentials
+
+
+class RepoPasses:
+    """Short-lived git credentials for one repo, so an MCP client can run git without anyone typing the token.
+
+    Stateless and replica-safe: a pass is "<repo>|<expiry>" signed with HMAC under a random server secret
+    kept in the token KV. They cannot be revoked individually; rotating the secret (deleting the
+    `forge_secret` record) kills them all.
+    """
+
+    PREFIX = "fg_"
+    MAX_MINUTES = 24 * 60
+
+    def __init__(self, kv):
+        self.kv = kv
+        self._secret: bytes | None = None
+
+    def _key(self) -> bytes:
+        if self._secret is None:
+            import secrets
+
+            self.kv.create("forge_secret", {"secret": secrets.token_hex(32)})
+            self._secret = bytes.fromhex(self.kv.get("forge_secret")["secret"])
+        return self._secret
+
+    def _sig(self, payload: str) -> str:
+        import hashlib
+        import hmac
+
+        return hmac.new(self._key(), payload.encode(), hashlib.sha256).hexdigest()[:40]
+
+    def issue(self, repo: str, minutes: int) -> tuple[str, int]:
+        import base64
+
+        minutes = max(1, min(int(minutes), self.MAX_MINUTES))
+        expires = int(time.time()) + minutes * 60
+        payload = f"{repo}|{expires}"
+        body = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+        return f"{self.PREFIX}{body}.{self._sig(payload)}", expires
+
+    def check(self, token: str | None, repo: str) -> bool:
+        import base64
+        import hmac
+
+        if not token or not token.startswith(self.PREFIX) or "." not in token:
+            return False
+        body, _, sig = token[len(self.PREFIX):].rpartition(".")
+        try:
+            payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode()
+            pass_repo, expires = payload.rsplit("|", 1)
+        except Exception:
+            return False
+        return (hmac.compare_digest(sig, self._sig(payload)) and pass_repo == repo
+                and int(expires) > time.time())

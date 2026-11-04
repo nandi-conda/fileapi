@@ -12,6 +12,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
 from fileapi.app import create_app
+from fileapi.storage import StorageError
 
 TOKEN = "test-static-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -305,3 +306,52 @@ def test_git_http_auth_and_project_scope(tmp_path, backend):
         assert client.get(refs, auth=("x", "ptok")).status_code == 200
         assert client.get("/git/other/secret.git/info/refs?service=git-upload-pack",
                           auth=("x", "ptok")).status_code == 403
+
+
+def test_git_bundles_and_repo_passes(tmp_path, backend):
+    from fileapi.forge import RepoPasses, fetch_bundle, push_bundle
+
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("b", "r")
+        w = tmp_path / "w"
+        git("init", "-q", "-b", "main", str(w))
+        (w / "a").write_text("1\n")
+        git("add", ".", cwd=w)
+        git("commit", "-qm", "one", cwd=w)
+        base = git("rev-parse", "main", cwd=w).stdout.strip()
+        git("bundle", "create", str(tmp_path / "1.bundle"), "main", cwd=w)
+        assert push_bundle(forge, "b/r", (tmp_path / "1.bundle").read_bytes())[0]["status"] == "created"
+
+        # Incremental bundle (thin pack against what the server has), then a rejected non-fast-forward.
+        (w / "a").write_text("2\n")
+        git("commit", "-qam", "two", cwd=w)
+        git("bundle", "create", str(tmp_path / "2.bundle"), "main", f"^{base}", cwd=w)
+        assert push_bundle(forge, "b/r", (tmp_path / "2.bundle").read_bytes())[0]["status"] == "updated"
+        git("reset", "-q", "--hard", base, cwd=w)
+        git("commit", "-q", "--allow-empty", "-m", "diverge", cwd=w)
+        git("bundle", "create", str(tmp_path / "3.bundle"), "main", cwd=w)
+        three = (tmp_path / "3.bundle").read_bytes()
+        assert push_bundle(forge, "b/r", three)[0]["status"] == "rejected"
+        assert push_bundle(forge, "b/r", three, force=True)[0]["status"] == "forced"
+        with pytest.raises(StorageError):
+            push_bundle(forge, "b/r", b"not a bundle")
+
+        # Fetch: a full bundle clones (HEAD included); with `have` at the tip there is nothing to send.
+        data, tips = fetch_bundle(forge, "b/r")
+        (tmp_path / "f.bundle").write_bytes(data)
+        git("clone", "-q", str(tmp_path / "f.bundle"), str(tmp_path / "c"))
+        assert "diverge" in git("log", "--oneline", cwd=tmp_path / "c").stdout
+        assert fetch_bundle(forge, "b/r", have=[tips["refs/heads/main"]])[0] == b""
+
+        # Short-lived passes work for one repo only, and expire.
+        passes = RepoPasses(client.app.state.tokens.kv)
+        p, _ = passes.issue("b/r", 5)
+        refs = "/git/b/r.git/info/refs?service=git-upload-pack"
+        assert client.get(refs, auth=("x", p)).status_code == 200
+        forge.create("b", "other")
+        assert client.get("/git/b/other.git/info/refs?service=git-upload-pack", auth=("x", p)).status_code == 401
+        assert not passes.check(p.replace(".", ".0", 1), "b/r")
+        expired = passes._sig("b/r|1")
+        import base64 as b64
+        assert not passes.check("fg_" + b64.urlsafe_b64encode(b"b/r|1").decode().rstrip("=") + "." + expired, "b/r")
