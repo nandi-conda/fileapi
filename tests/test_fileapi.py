@@ -42,7 +42,7 @@ def backend(request):
         import psycopg
 
         with psycopg.connect(PG_URL, autocommit=True) as c:
-            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_git_repos")
+            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_git_repos, fileapi_git_aliases")
         return {"DATABASE_URL": PG_URL}
     return {}
 
@@ -351,18 +351,21 @@ def git(*args, cwd=None, check=True):
 @pytest.mark.anyio
 async def test_git_forge_end_to_end(server_url, tmp_path):
     token = TOKEN
-    remote = server_url.replace("://", f"://x:{token}@") + "/git/web/blog.git"
+    remote = server_url.replace("://", f"://x:{token}@") + "/git/nandi.uk/blog.git"
 
     async with connect(server_url, token) as c:
-        r = await c.call_tool("create_repo", {"project": "web", "name": "blog", "description": "My blog"})
-        assert not r.is_error and f"{server_url}/git/web/blog.git" in text(r)
-        assert (await c.call_tool("create_repo", {"project": "web", "name": "blog"})).is_error
-        assert (await c.call_tool("create_repo", {"project": "../x", "name": "blog"})).is_error
-        assert "empty" in text(await c.call_tool("list_branches", {"repo": "web/blog"}))
-        r = await c.call_tool("commit_files", {"repo": "web/blog", "message": "init",
+        r = await c.call_tool("create_repo", {"name": "blog", "description": "My blog"})
+        assert not r.is_error and f"{server_url}/git/nandi.uk/blog.git" in text(r)
+        assert (await c.call_tool("create_repo", {"name": "blog"})).is_error
+        assert (await c.call_tool("create_repo", {"name": "../x"})).is_error
+        assert "nandi.uk" in text(await c.call_tool("whoami", {}))
+        assert "empty" in text(await c.call_tool("list_branches", {"repo": "blog"}))
+        r = await c.call_tool("commit_files", {"repo": "blog", "message": "init",
                                                "files": {"README.md": "# Blog\n", "posts/one.md": "one\n"}})
         assert not r.is_error, text(r)
-        assert "web/blog" in text(await c.call_tool("list_repos", {}))
+        assert text(await c.call_tool("list_repos", {})).startswith("blog\tprivate")
+        # The full '<owner>/<name>' still works as a repo argument.
+        assert "empty" not in text(await c.call_tool("list_branches", {"repo": "nandi.uk/blog"}))
 
     # Clone, commit and push with the real git CLI.
     work = tmp_path / "work"
@@ -374,13 +377,13 @@ async def test_git_forge_end_to_end(server_url, tmp_path):
     git("push", "origin", "main", "main:draft", cwd=work)
 
     async with connect(server_url, token) as c:
-        listing = text(await c.call_tool("browse_repo", {"repo": "web/blog", "path": "posts"}))
+        listing = text(await c.call_tool("browse_repo", {"repo": "blog", "path": "posts"}))
         assert "one.md" in listing and "two.md" in listing
-        assert text(await c.call_tool("browse_repo", {"repo": "web/blog", "path": "posts/two.md"})) == "two\n"
-        log = text(await c.call_tool("repo_log", {"repo": "web/blog"}))
+        assert text(await c.call_tool("browse_repo", {"repo": "blog", "path": "posts/two.md"})) == "two\n"
+        log = text(await c.call_tool("repo_log", {"repo": "blog"}))
         assert log.index("second post") < log.index("init")
-        assert "branch draft" in text(await c.call_tool("list_branches", {"repo": "web/blog"}))
-        r = await c.call_tool("commit_files", {"repo": "web/blog", "message": "drop one",
+        assert "branch draft" in text(await c.call_tool("list_branches", {"repo": "blog"}))
+        r = await c.call_tool("commit_files", {"repo": "blog", "message": "drop one",
                                                "files": {"posts/one.md": None}})
         assert not r.is_error, text(r)
 
@@ -389,27 +392,27 @@ async def test_git_forge_end_to_end(server_url, tmp_path):
     assert git("fsck", cwd=work).returncode == 0
 
     # Bad token: git gets a Basic-auth challenge and fails; a Bearer header works too.
-    bad = server_url.replace("://", "://x:nope@") + "/git/web/blog.git"
+    bad = server_url.replace("://", "://x:nope@") + "/git/nandi.uk/blog.git"
     assert git("ls-remote", bad, check=False).returncode != 0
-    r = git("-c", f"http.extraHeader=Authorization: Bearer {token}", "ls-remote", f"{server_url}/git/web/blog.git")
+    r = git("-c", f"http.extraHeader=Authorization: Bearer {token}", "ls-remote", f"{server_url}/git/nandi.uk/blog.git")
     assert "refs/heads/draft" in r.stdout
 
     # Public repos clone anonymously; pushing still needs the token.
-    anon = f"{server_url}/git/web/blog.git"
+    anon = f"{server_url}/git/nandi.uk/blog.git"
     assert git("ls-remote", anon, check=False).returncode != 0
     async with connect(server_url, token) as c:
-        r = await c.call_tool("set_repo_visibility", {"repo": "web/blog", "visibility": "public"})
+        r = await c.call_tool("set_repo_visibility", {"repo": "blog", "visibility": "public"})
         assert not r.is_error, text(r)
-        assert "web/blog\tpublic" in text(await c.call_tool("list_repos", {}))
+        assert "blog\tpublic" in text(await c.call_tool("list_repos", {}))
     git("clone", anon, str(tmp_path / "anon"))
     assert (tmp_path / "anon" / "posts" / "two.md").exists()
     assert git("push", anon, "main:anon", cwd=tmp_path / "anon", check=False).returncode != 0
     async with connect(server_url, token) as c:
-        assert not (await c.call_tool("set_repo_visibility", {"repo": "web/blog", "visibility": "private"})).is_error
+        assert not (await c.call_tool("set_repo_visibility", {"repo": "blog", "visibility": "private"})).is_error
     assert git("ls-remote", anon, check=False).returncode != 0
 
     async with connect(server_url, token) as c:
-        assert not (await c.call_tool("delete_repo", {"repo": "web/blog"})).is_error
+        assert not (await c.call_tool("delete_repo", {"repo": "blog"})).is_error
     assert git("ls-remote", remote, check=False).returncode != 0
 
 
@@ -536,13 +539,28 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert client.patch(url, headers=AUTH, json={"name": "secret"}).status_code == 409
         r = client.patch(url, headers=AUTH, json={"name": "blog"})
         assert r.json()["repo"] == "web/blog" and r.json()["default"] == "dev" and r.json()["description"] == "New"
-        assert client.get(url, headers=AUTH).status_code == 404
-        r = client.patch("/api/forge/repos/web/blog", headers=AUTH, json={"name": "docs/site", "default_branch": "main"})
-        assert r.json()["repo"] == "docs/site" and r.json()["default"] == "main"
-        assert len(client.get("/api/forge/repos/docs/site/commits", headers=AUTH).json()["commits"]) == 2
+        # The old name is now an alias: it still answers, as the renamed repo.
+        assert client.get(url, headers=AUTH).json()["repo"] == "web/blog"
+        assert client.get("/git/web/site.git/info/refs?service=git-upload-pack", headers=AUTH).status_code == 200
+        # Repos can't move to another owner.
+        assert client.patch("/api/forge/repos/web/blog", headers=AUTH, json={"name": "docs/site"}).status_code == 400
+        r = client.patch("/api/forge/repos/web/blog", headers=AUTH, json={"name": "web/site2", "default_branch": "main"})
+        assert r.json()["repo"] == "web/site2" and r.json()["default"] == "main"
+        assert client.get(url, headers=AUTH).json()["repo"] == "web/site2"  # aliases follow later renames
+        assert len(client.get("/api/forge/repos/web/site2/commits", headers=AUTH).json()["commits"]) == 2
         assert client.patch("/api/forge/repos/web/secret", headers=AUTH, json={"default_branch": "trunk"}).json()["default"] == "trunk"
-        assert client.delete("/api/forge/repos/docs/site", headers=AUTH).status_code == 204
-        assert client.get("/api/forge/repos/docs/site", headers=AUTH).status_code == 404
+        assert client.delete("/api/forge/repos/web/blog", headers=AUTH).status_code == 204  # via the alias
+        assert client.get("/api/forge/repos/web/site2", headers=AUTH).status_code == 404
+        assert client.get(url, headers=AUTH).status_code == 404  # its aliases went with it
+
+        # Creating needs only a name: the repo lands under the signed-in handle.
+        assert client.get("/api/forge/me", headers=AUTH).json()["owner"] == "nandi.uk"
+        assert client.post("/api/forge/repos", json={"name": "new"}).status_code == 401
+        r = client.post("/api/forge/repos", headers=AUTH, json={"name": "new", "public": True})
+        assert r.status_code == 201 and r.json()["repo"] == "nandi.uk/new" and r.json()["public"] is True
+        assert r.json()["clone_url"].endswith("/git/nandi.uk/new.git")
+        assert client.post("/api/forge/repos", headers=AUTH, json={"name": "new"}).status_code == 409
+        assert client.post("/api/forge/repos", headers=AUTH, json={"name": "web/x"}).status_code == 400
 
         # The committed Qt for WebAssembly build is served from /forge/.
         r = client.get("/forge", follow_redirects=False)
@@ -555,6 +573,42 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert wasm.content[:4] == b"\0asm"  # httpx undoes the gzip
         assert int(wasm.headers["x-uncompressed-length"]) == len(wasm.content)
         assert client.get("/forge/qtloader.js").headers["content-type"].startswith("text/javascript")
+
+
+def test_repos_move_under_the_owner_and_keep_old_urls(tmp_path, backend):
+    from fileapi.forge import RepoPasses
+
+    db = backend.get("DATABASE_URL", "")
+    with TestClient(app_for(tmp_path, database_url=db)) as client:
+        forge = client.app.state.forge
+        for owner, name in [("smelly", "shelly-qt"), ("web", "site"), ("other", "site"), ("nandi.uk", "mine")]:
+            forge.create(owner, name)
+        forge.commit_files("smelly/shelly-qt", "main", {"a": "1\n"}, "one")
+        forge.set_public("web/site", True)
+    # Next start: everything moves under the admin's handle; a clash gets the old owner as a prefix
+    # (owners are taken in alphabetical order, so other/site keeps "site").
+    with TestClient(app_for(tmp_path, database_url=db)) as client:
+        forge = client.app.state.forge
+        assert {r.full_name for r in forge.list()} == {
+            "nandi.uk/shelly-qt", "nandi.uk/site", "nandi.uk/web-site", "nandi.uk/mine"}
+        assert forge.canonical("smelly/shelly-qt") == "nandi.uk/shelly-qt"
+        assert forge.canonical("web/site") == "nandi.uk/web-site"
+        assert forge.info("web/site").public is True
+        # Old clone URLs and UI links keep working.
+        r = client.get("/git/smelly/shelly-qt.git/info/refs?service=git-upload-pack", headers=AUTH)
+        assert r.status_code == 200 and b"refs/heads/main" in r.content
+        assert client.get("/git/web/site.git/info/refs?service=git-upload-pack").status_code == 200  # public, anon
+        assert client.get("/api/forge/repos/smelly/shelly-qt", headers=AUTH).json()["repo"] == "nandi.uk/shelly-qt"
+        # Short-lived passes are issued for the current name and accepted on the old URL too.
+        p, _ = RepoPasses(client.app.state.auth.kv).issue("nandi.uk/shelly-qt", 5)
+        assert client.get("/git/smelly/shelly-qt.git/info/refs?service=git-upload-pack", auth=("x", p)).status_code == 200
+        # A new repo with an alias's name takes the name over.
+        forge.create("smelly", "shelly-qt")
+        assert forge.canonical("smelly/shelly-qt") == "smelly/shelly-qt"
+    # Idempotent: a third start moves only what is new.
+    with TestClient(app_for(tmp_path, database_url=db)) as client:
+        names = {r.full_name for r in client.app.state.forge.list()}
+        assert "nandi.uk/smelly-shelly-qt" in names and len(names) == 5
 
 
 # ---- git credential helper ----------------------------------------------------

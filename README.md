@@ -38,7 +38,9 @@ The atproto client metadata is served at `/oauth/atproto/client-metadata.json` a
 
 ## Git forge
 
-fileapi also hosts git repos, grouped by project and named `<project>/<repo>`. Clone and push them with plain git over HTTPS, and create and browse them over MCP. Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
+fileapi also hosts git repos. Each repo belongs to the signed-in account and lives under its atproto handle: `<handle>/<repo>`, e.g. `nandi.uk/blog`, cloned from `https://<host>/git/nandi.uk/blog.git`. MCP tools and the web UI only need the repo name. Clone and push them with plain git over HTTPS, and create and browse them over MCP.
+
+Repos from before owners existed (`<project>/<repo>`) move under the admin's handle the next time the server starts; a name that is already taken becomes `<old project>-<repo>`. The old name stays as an alias, so old clone URLs, remotes and `/forge/#…` links keep working. Renames leave an alias the same way; creating a repo with an alias's name takes the name over. `FILEAPI_FORGE_OWNER` overrides the namespace (default: the admin handle). Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
 
 ### Sign in from git in the browser
 
@@ -49,7 +51,7 @@ mkdir -p ~/.local/bin
 curl -fsSL https://<host>/git-credential-fileapi -o ~/.local/bin/git-credential-fileapi
 chmod +x ~/.local/bin/git-credential-fileapi     # needs python3 on PATH; stdlib only
 git-credential-fileapi setup https://<host>      # or `just git-setup` from a checkout
-git clone https://<host>/git/<project>/<repo>.git
+git clone https://<host>/git/<handle>/<repo>.git
 ```
 
 When the server answers `401`, git asks the helper. It registers itself as an OAuth client of fileapi, opens `/authorize` in the browser with a one-off redirect to `http://127.0.0.1:<random port>/callback`, swaps the code (PKCE) for tokens and gives git the access token as the password. Tokens live in `~/.config/git-credential-fileapi/tokens.json` (mode 600): the access token (24 h) is reused, then refreshed silently with the refresh token (90 days, rotated), so the browser only opens again after that. `setup` puts an empty `credential.<url>.helper` first, which keeps global helpers (store, cache, libsecret) from shadowing it with a stale token. Other commands: `git-credential-fileapi login|logout [url]`, `status`. On a machine with no browser, open the printed URL on the same machine (the redirect goes to 127.0.0.1).
@@ -58,15 +60,15 @@ When the server answers `401`, git asks the helper. It registers itself as an OA
 
 ```sh
 # The access token is the password; the username is ignored.
-git clone https://x:<token>@<host>/git/<project>/<repo>.git
+git clone https://x:<token>@<host>/git/<handle>/<repo>.git
 # Or keep the token out of the URL and out of .git/config:
-git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git/<project>/<repo>.git
+git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git/<handle>/<repo>.git
 ```
 
 | Tool | What it does |
 | --- | --- |
-| `create_repo` | Create an empty repo (`project`, `name`, optional `description`, `default_branch`) and print its clone URL |
-| `list_repos` | List repos, optionally one `project`'s |
+| `create_repo` | Create an empty repo under your handle (`name`, optional `description`, `default_branch`) and print its clone URL |
+| `list_repos` | List your repos |
 | `list_branches` | Branches and tags of a repo |
 | `browse_repo` | A directory listing or a file's content at a `ref` (branch, tag or sha) |
 | `repo_log` | Recent commits, optionally only those touching a `path` |
@@ -77,30 +79,34 @@ git -c http.extraHeader="Authorization: Bearer <token>" clone https://<host>/git
 | `set_repo_visibility` | `public`: anyone can clone and fetch without a token. `private` (the default): token needed. Pushing always needs a token |
 | `delete_repo` | Delete a repo and its history |
 
+Every `repo` argument takes the bare name (`blog`); `<owner>/<name>` and old aliases work too.
+
 ### Push and pull with only the MCP connection
 
 An MCP client that is signed in can move commits without anyone typing a token into git:
 
-- **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<project>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret in the KV store (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
+- **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<handle>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret in the KV store (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
 - **Bundles (small changes):** `git bundle create /tmp/p.bundle main ^origin/main`, base64 it, call `push_bundle`. For pulls, `fetch_bundle` with `have: [<sha of origin/main>]`, decode, `git fetch /tmp/f.bundle 'refs/heads/*:refs/remotes/origin/*'`. The bundle travels inside the tool call, so it costs model tokens; keep it to small pushes.
 
 Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
 
-Access: the admin reaches every project; public repos clone anonymously. Nobody else has access.
+Access: the admin reaches every repo; public repos clone anonymously. Nobody else has access.
 
 ### Web UI
 
-`/forge/` is a small browser UI for the forge: the repo list, files and their contents at any branch, tag or commit, and the commit log. Anyone sees the public repos; **Sign in** (atproto, same admin-only rule as MCP) shows the private ones too. The URL tracks where you are (`/forge/#<project>/<repo>/<path>`), so links can be shared.
+`/forge/` is a small browser UI for the forge: the repo list, files and their contents at any branch, tag or commit, and the commit log. Anyone sees the public repos; **Sign in** (atproto, same admin-only rule as MCP) shows the private ones too, and lets you create repos (just a name) and change their settings (rename keeps the owner). The URL tracks where you are (`/forge/#<handle>/<repo>/<path>`), so links can be shared.
 
-It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) that reads a read-only JSON API:
+It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) on a small JSON API:
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /api/forge/me` | Whether the request is signed in |
+| `GET /api/forge/me` | Whether the request is signed in, and `owner` (the handle repos live under) |
 | `GET /api/forge/repos` | Repos the caller can see (public ones when anonymous) |
-| `GET /api/forge/repos/<project>/<repo>` | Description, visibility, default branch, branches, tags, clone URL |
-| `GET /api/forge/repos/<project>/<repo>/tree?ref=&path=` | A directory listing or a file's content |
-| `GET /api/forge/repos/<project>/<repo>/commits?ref=&path=&limit=` | Recent commits (also at `/log`, but ad blockers block that path) |
+| `POST /api/forge/repos` | Signed in: create `{name, description?, default_branch?, public?}` under your handle |
+| `PATCH`/`DELETE /api/forge/repos/<owner>/<repo>` | Signed in: change `description`, `default_branch`, `public`, `name` (same owner), or delete |
+| `GET /api/forge/repos/<owner>/<repo>` | Description, visibility, default branch, branches, tags, clone URL |
+| `GET /api/forge/repos/<owner>/<repo>/tree?ref=&path=` | A directory listing or a file's content |
+| `GET /api/forge/repos/<owner>/<repo>/commits?ref=&path=&limit=` | Recent commits (also at `/log`, but ad blockers block that path) |
 
 Send `Authorization: Bearer <access token>` for private repos; to anonymous callers a private repo is a 404.
 The page signs in as a public OAuth client of fileapi itself (PKCE, redirect back to `/forge/`) and keeps the token in the browser's localStorage.

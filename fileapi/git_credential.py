@@ -7,7 +7,7 @@ Install it once and point git at it for the fileapi host:
     chmod +x ~/.local/bin/git-credential-fileapi
     git-credential-fileapi setup https://<host>
 
-After that a plain `git clone https://<host>/git/<project>/<repo>.git` works: when the server answers
+After that a plain `git clone https://<host>/git/<handle>/<repo>.git` works: when the server answers
 401, git asks this helper, which opens fileapi's sign-in page (atproto / Bluesky) in the browser, catches
 the result on a one-off listener on 127.0.0.1, and hands git the access token as the password.
 
@@ -271,7 +271,7 @@ def setup(base: str) -> int:
     subprocess.run(["git", "config", "--global", "--add", key, ""], check=True)
     subprocess.run(["git", "config", "--global", "--add", key, "fileapi"], check=True)
     subprocess.run(["git", "config", "--global", f"credential.{base}.username", "fileapi"], check=True)
-    _log(f"git now asks {NAME} for {base}. Try: git clone {base}/git/<project>/<repo>.git")
+    _log(f"git now asks {NAME} for {base}. Try: git clone {base}/git/<handle>/<repo>.git")
     return 0
 
 

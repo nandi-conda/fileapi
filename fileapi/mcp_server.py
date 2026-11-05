@@ -10,7 +10,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from .forge import Forge, RepoPasses, fetch_bundle as forge_fetch_bundle, push_bundle as forge_push_bundle, split_repo
+from .forge import Forge, RepoPasses, fetch_bundle as forge_fetch_bundle, push_bundle as forge_push_bundle, qualify
 from .storage import Edit, Storage, StorageError
 
 PathArg = Annotated[str, Field(description="Path relative to the storage root, e.g. 'notes/todo.md'")]
@@ -28,11 +28,12 @@ def _authed(ctx: Context) -> bool:
     return bool(getattr(request.state, "authed", False))
 
 
-def _scope(ctx: Context) -> str | None:
+def _owner(ctx: Context, default: str) -> str:
+    """The signed-in account's repo namespace (its handle); stdio runs as the server's admin."""
     request = ctx.request_context.request
-    if request is None:  # stdio: local process, owner
-        return ""
-    return getattr(request.state, "scope", None)
+    if request is None:
+        return default
+    return getattr(request.state, "owner", None) or default
 
 
 def _base_url(ctx: Context, public_url: str | None) -> str:
@@ -51,14 +52,16 @@ def build_mcp(
     public_url: str | None = None,
     forge: Forge | None = None,
     passes: RepoPasses | None = None,
+    owner: str = "admin",
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
-        version="1.4.0",
+        version="1.5.0",
         instructions=(
             "A central file store. Paths are relative to the store root; directories are created automatically. "
-            "It also hosts git repos, named '<project>/<repo>': manage and browse them with the *_repo tools, "
-            "or clone/push them with git over HTTPS (repo_remote_url gives a short-lived authenticated URL)."
+            "It also hosts git repos owned by the signed-in account: refer to one by its name alone (e.g. 'blog'); "
+            "they live at '<your handle>/<name>'. Manage and browse them with the *_repo tools, or clone/push "
+            "them with git over HTTPS (repo_remote_url gives a short-lived authenticated URL)."
         ),
     )
 
@@ -76,7 +79,8 @@ def build_mcp(
         request = ctx.request_context.request
         if request is None:
             return "local stdio process (no sign-in needed)"
-        return guard(ctx, lambda: f"signed in as {getattr(request.state, 'did', '?')} (admin)")
+        return guard(ctx, lambda: f"signed in as {_owner(ctx, owner)} ({getattr(request.state, 'did', '?')}, admin); "
+                                  f"your repos live at {_owner(ctx, owner)}/<name>")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def list_files(ctx: Context, path: str = "", recursive: bool = False) -> str:
@@ -129,32 +133,24 @@ def build_mcp(
         return f"Deleted {path}"
 
     if forge is not None:
-        _register_forge_tools(mcp, forge, guard, public_url, passes)
+        _register_forge_tools(mcp, forge, guard, public_url, passes, owner)
 
     return mcp
 
 
-RepoArg = Annotated[str, Field(description="Repo as '<project>/<name>', e.g. 'website/blog'")]
+RepoArg = Annotated[str, Field(description="Repo name, e.g. 'blog' (it is yours: '<your handle>/blog'). "
+                                         "'<owner>/<name>' also works")]
 RefArg = Annotated[str, Field(description="Branch, tag or commit sha; HEAD is the default branch")]
 
 
-def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str | None, passes) -> None:
-    def scoped(ctx: Context, project: str, fn):
-        """guard() plus the per-project check: a project token only reaches its own project."""
+def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str | None, passes, default_owner: str) -> None:
+    def full_name(ctx: Context, repo: str) -> str:
+        """'<name>' (or an old alias) -> the repo's current '<owner>/<name>'."""
+        return forge.canonical(qualify(repo, _owner(ctx, default_owner)))
 
-        def run():
-            scope = _scope(ctx)
-            if scope and project != scope:
-                raise StorageError(f"This token can only access project {scope!r}")
-            return fn()
-
-        return guard(ctx, run)
-
-    def project_of(repo: str) -> str:
-        try:
-            return split_repo(repo)[0]
-        except StorageError:
-            return ""
+    def scoped(ctx: Context, repo: str, fn):
+        """guard() plus name resolution: fn gets the repo's full '<owner>/<name>'."""
+        return guard(ctx, lambda: fn(full_name(ctx, repo)))
 
     def clone_help(ctx: Context, full: str) -> str:
         url = f"{_base_url(ctx, public_url)}/git/{full}.git"
@@ -166,25 +162,25 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     @mcp.tool(structured_output=False)
     def create_repo(
         ctx: Context,
-        project: Annotated[str, Field(description="Project the repo belongs to, e.g. 'website'")],
-        name: Annotated[str, Field(description="Repo name, e.g. 'blog'")],
+        name: Annotated[str, Field(description="Repo name, e.g. 'blog'. It is created under your handle")],
         description: str = "",
         default_branch: str = "main",
     ) -> str:
-        """Create an empty git repo. Push to it with git, or add files with commit_files."""
-        info = scoped(ctx, project, lambda: forge.create(project, name, description, default_branch))
+        """Create an empty git repo owned by you. Push to it with git, or add files with commit_files."""
+        info = guard(ctx, lambda: forge.create(_owner(ctx, default_owner), name.strip().strip("/"), description,
+                                               default_branch))
         return f"Created {info.full_name}\n" + clone_help(ctx, info.full_name)
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
-    def list_repos(ctx: Context, project: str = "") -> str:
-        """List git repos, optionally only one project's. Shows each repo's clone URL."""
-        scope = _scope(ctx)
-        repos = scoped(ctx, project or scope or "", lambda: forge.list(project or scope or None))
+    def list_repos(ctx: Context) -> str:
+        """List your git repos with each one's visibility and clone URL."""
+        me = _owner(ctx, default_owner)
+        repos = guard(ctx, lambda: forge.list(me))
         if not repos:
-            return "(no repos)"
+            return f"(no repos yet: create one with create_repo; it will live at {me}/<name>)"
         base = _base_url(ctx, public_url)
         return "\n".join(
-            f"{r.full_name}\t{'public' if r.public else 'private'}\t{base}/git/{r.full_name}.git"
+            f"{r.name}\t{'public' if r.public else 'private'}\t{base}/git/{r.full_name}.git"
             + (f"\t{r.description}" if r.description else "")
             for r in repos
         )
@@ -192,7 +188,7 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def list_branches(ctx: Context, repo: RepoArg) -> str:
         """List a repo's branches and tags with the commit each points at."""
-        info = scoped(ctx, project_of(repo), lambda: forge.branches(repo))
+        info = scoped(ctx, repo, forge.branches)
         lines = [f"default branch: {info['default']}"]
         lines += [f"branch {k}\t{v}" for k, v in sorted(info["branches"].items())]
         lines += [f"tag {k}\t{v}" for k, v in sorted(info["tags"].items())]
@@ -201,8 +197,9 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def browse_repo(ctx: Context, repo: RepoArg, path: str = "", ref: RefArg = "HEAD") -> str:
         """Show a directory listing, or a file's content, at a branch, tag or commit."""
-        res = scoped(ctx, project_of(repo), lambda: forge.browse(repo, path, ref))
-        head = f"{repo}:{res['path'] or '/'} @ {res['commit'][:12]}"
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        res = guard(ctx, lambda: forge.browse(full, path, ref))
+        head = f"{full}:{res['path'] or '/'} @ {res['commit'][:12]}"
         if res["type"] == "dir":
             rows = [e["name"] if e["size"] is None else f"{e['name']}\t{e['size']}B" for e in res["entries"]]
             return head + "\n" + ("\n".join(rows) or "(empty)")
@@ -213,7 +210,7 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def repo_log(ctx: Context, repo: RepoArg, ref: RefArg = "HEAD", path: str = "", limit: int = 20) -> str:
         """Show recent commits on a branch (newest first), optionally only those touching a path."""
-        commits = scoped(ctx, project_of(repo), lambda: forge.log(repo, ref, path or None, limit))
+        commits = scoped(ctx, repo, lambda full: forge.log(full, ref, path or None, limit))
         return "\n\n".join(
             f"{c['sha'][:12]}  {c['date']}  {c['author']}\n    " + c["message"].replace("\n", "\n    ")
             for c in commits
@@ -237,13 +234,10 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     ) -> str:
         """Commit file changes to a branch in one commit (creates the branch if it does not exist).
         Lets clients without git write to a repo."""
-        res = scoped(
-            ctx,
-            project_of(repo),
-            lambda: forge.commit_files(repo, branch, files, message, author_name or None, author_email or None,
-                                       expected_head or None),
-        )
-        return f"Committed {res['commit'][:12]} to {repo}@{res['branch']}"
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        res = guard(ctx, lambda: forge.commit_files(full, branch, files, message, author_name or None,
+                                                    author_email or None, expected_head or None))
+        return f"Committed {res['commit'][:12]} to {full}@{res['branch']}"
 
     @mcp.tool(structured_output=False)
     def push_bundle(
@@ -263,7 +257,7 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
             data = base64.b64decode("".join(bundle_base64.split()), validate=True)
         except (binascii.Error, ValueError):
             raise ToolError("bundle_base64 is not valid base64") from None
-        results = scoped(ctx, project_of(repo), lambda: forge_push_bundle(forge, repo, data, force))
+        results = scoped(ctx, repo, lambda full: forge_push_bundle(forge, full, data, force))
         lines = []
         for r in results:
             if r["status"] == "rejected":
@@ -291,7 +285,7 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
         Best for small repos: the bundle travels inside the tool result. For large ones use repo_remote_url."""
         import base64
 
-        data, tips = scoped(ctx, project_of(repo), lambda: forge_fetch_bundle(forge, repo, refs or None, have or None))
+        data, tips = scoped(ctx, repo, lambda full: forge_fetch_bundle(forge, full, refs or None, have or None))
         tip_lines = "\n".join(f"{k}\t{v}" for k, v in tips.items())
         if not data:
             return f"Already up to date.\n{tip_lines}"
@@ -312,8 +306,8 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
             """Get a git remote URL with a short-lived credential for this one repo, so you can run plain
             `git push` / `git pull` / `git clone` without the user typing the access token. Use it as a
             one-off URL (`git push <url> main`) rather than saving it as a remote: it expires."""
-            full = scoped(ctx, project_of(repo), lambda: "/".join(split_repo(repo)))
-            scoped(ctx, project_of(repo), lambda: forge.open(full).close())
+            full = guard(ctx, lambda: full_name(ctx, repo))
+            guard(ctx, lambda: forge.open(full).close())
             cred, expires = passes.issue(full, minutes)
             url = f"{_base_url(ctx, public_url)}/git/{full}.git".replace("://", f"://x:{cred}@", 1)
             when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))
@@ -330,14 +324,16 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
     ) -> str:
         """Make a repo public (anonymous clone and fetch over HTTPS) or private again. Pushing always needs a token."""
         public = visibility == "public"
-        scoped(ctx, project_of(repo), lambda: forge.set_public(repo, public))
-        url = f"{_base_url(ctx, public_url)}/git/{'/'.join(split_repo(repo))}.git"
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        guard(ctx, lambda: forge.set_public(full, public))
+        url = f"{_base_url(ctx, public_url)}/git/{full}.git"
         if public:
-            return f"{repo} is now public. Anyone can run: git clone {url}\nPushing still needs a credential: use repo_remote_url."
-        return f"{repo} is now private. Cloning needs a credential: use repo_remote_url."
+            return f"{full} is now public. Anyone can run: git clone {url}\nPushing still needs a credential: use repo_remote_url."
+        return f"{full} is now private. Cloning needs a credential: use repo_remote_url."
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def delete_repo(ctx: Context, repo: RepoArg) -> str:
         """Permanently delete a repo and all its history."""
-        scoped(ctx, project_of(repo), lambda: forge.delete(repo))
-        return f"Deleted {repo}"
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        guard(ctx, lambda: forge.delete(full))
+        return f"Deleted {full}"

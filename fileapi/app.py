@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, split_repo
+from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
 from . import auth as oauth
@@ -46,7 +46,14 @@ class RepoSettingsBody(BaseModel):
     description: str | None = None
     default_branch: str | None = None
     public: bool | None = None
-    name: str | None = None  # new "<project>/<repo>" (or just "<repo>" to keep the project)
+    name: str | None = None  # new repo name (it stays under the same owner)
+
+
+class NewRepoBody(BaseModel):
+    name: str
+    description: str = ""
+    default_branch: str = "main"
+    public: bool = False
 
 
 def _request_token(request: Request) -> str | None:
@@ -107,8 +114,16 @@ def create_app(
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
     admin_handle = os.environ.get("FILEAPI_ADMIN_HANDLE") or (oauth.ADMIN_HANDLE if admin_did == oauth.ADMIN_DID else "")
     auth = Auth(kv, admin_did=admin_did, admin_handle=admin_handle, preset_token=preset_token, atproto=atproto)
+    # Repos are owned by the signed-in account and live under its handle: /git/<handle>/<repo>.git.
+    # Only the admin can sign in, so that is one namespace. Repos from before owners (or from an older
+    # handle) move into it at startup and keep their old names as aliases, so old clone URLs still work.
+    owner = owner_name(os.environ.get("FILEAPI_FORGE_OWNER") or admin_handle, admin_did)
+    forge.migrate_to_owner(owner)
 
-    mcp = build_mcp(storage, public_url, forge, passes)
+    def owner_of(did: str | None) -> str | None:
+        return owner if did and did == auth.admin_did else None
+
+    mcp = build_mcp(storage, public_url, forge, passes, owner)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -123,7 +138,7 @@ def create_app(
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="fileapi", version="1.4.0", lifespan=lifespan)
+    app = FastAPI(title="fileapi", version="1.5.0", lifespan=lifespan)
     app.state.storage = storage
     app.state.auth = auth
     app.state.forge = forge
@@ -141,8 +156,8 @@ def create_app(
                     headers={"WWW-Authenticate": f'Bearer resource_metadata="{meta}", scope="{oauth.SCOPE}"'},
                 )
             request.scope.setdefault("state", {})["authed"] = True
-            request.scope["state"]["scope"] = ""
             request.scope["state"]["did"] = did
+            request.scope["state"]["owner"] = owner_of(did)
         return await call_next(request)
 
     def require_token(request: Request) -> None:
@@ -179,7 +194,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Status:</b> {status}</p>
 <p><b>Storage:</b> {storage_note}</p>
 <p><b>MCP endpoint:</b> <code>{base}/mcp</code></p>
-<p><b>Git repos:</b> <code>{base}/git/&lt;project&gt;/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest install the <a href="/git-credential-fileapi">git credential helper</a> and git signs you in in the browser, or use the <code>repo_remote_url</code> MCP tool)</p>
+<p><b>Git repos:</b> <code>{base}/git/{owner}/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest install the <a href="/git-credential-fileapi">git credential helper</a> and git signs you in in the browser, or use the <code>repo_remote_url</code> MCP tool)</p>
 <p><b>Repo browser:</b> <a href="/forge/">/forge/</a></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
 
@@ -240,17 +255,14 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 
     def git_auth(request: Request, project: str, repo: str, service: str) -> str:
         presented = _request_token(request)
-        full = "/".join(split_repo(f"{project}/{repo}"))
+        full = forge.canonical(f"{project}/{repo}")  # old names (aliases) are served as the repo they became
         if passes.check(presented, full):  # short-lived pass from the repo_remote_url tool
             return full
         # Public repos: anyone may clone and fetch without credentials. Pushing always needs a token.
         if service == "git-upload-pack" and not presented and forge.is_public(full):
             return full
-        scope = auth.scope(presented)
-        if scope is None:
+        if auth.identify(presented) is None:
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": 'Basic realm="fileapi git"'})
-        if scope and scope != full.split("/")[0]:
-            raise HTTPException(403, f"This token cannot access project {project}")
         return full
 
     @app.get("/git/{project}/{repo}/info/refs", include_in_schema=False)
@@ -277,14 +289,14 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
         return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
 
-    # ---- Forge JSON API (read-only, used by the web UI at /forge/) ---------
+    # ---- Forge JSON API (used by the web UI at /forge/) ---------
     # Public repos are readable by anyone; everything else needs a signed-in token. A private repo looks
     # exactly like a missing one to anonymous callers.
     def forge_viewer(request: Request) -> bool:
         return auth.identify(_request_token(request)) is not None
 
     def forge_repo(request: Request, project: str, repo: str) -> str:
-        full = "/".join(split_repo(f"{project}/{repo}"))
+        full = forge.canonical(f"{project}/{repo}")
         if not forge_viewer(request) and not forge.is_public(full):
             raise NotFound(f"No such repo: {full}")
         return full
@@ -296,7 +308,8 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.get("/api/forge/me", tags=["forge"])
     def forge_me(request: Request):
         did = auth.identify(_request_token(request))
-        return {"signed_in": did is not None, "did": did, "admin": auth.admin_handle or auth.admin_did}
+        return {"signed_in": did is not None, "did": did, "admin": auth.admin_handle or auth.admin_did,
+                "owner": owner_of(did) if did else owner}
 
     @app.get("/api/forge/repos", tags=["forge"])
     def forge_repos(request: Request, project: str | None = None):
@@ -307,9 +320,7 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.get("/api/forge/repos/{project}/{repo}", tags=["forge"])
     def forge_repo_info(request: Request, project: str, repo: str):
         full = forge_repo(request, project, repo)
-        info = next((i for i in forge.list(full.split("/")[0]) if i.full_name == full), None)
-        if info is None:
-            raise NotFound(f"No such repo: {full}")
+        info = forge.info(full)
         base = oauth.base_url(request, public_url)
         return {**repo_json(info), **forge.branches(full), "clone_url": f"{base}/git/{full}.git"}
 
@@ -325,14 +336,28 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         return {"commits": forge.log(forge_repo(request, project, repo), ref, path, limit)}
 
     # Repo settings (signed-in admin only; the only identity that can sign in is the admin).
-    def forge_admin(request: Request) -> None:
-        if not forge_viewer(request):
-            raise HTTPException(401, "Sign in to change repo settings", headers={"WWW-Authenticate": "Bearer"})
+    def forge_admin(request: Request) -> str:
+        me = owner_of(auth.identify(_request_token(request)))
+        if me is None:
+            raise HTTPException(401, "Sign in to change repos", headers={"WWW-Authenticate": "Bearer"})
+        return me
+
+    @app.post("/api/forge/repos", tags=["forge"], status_code=201)
+    def forge_create_repo(request: Request, body: NewRepoBody):
+        """Create a repo owned by the signed-in account: only the name is needed."""
+        me = forge_admin(request)
+        name = body.name.strip().strip("/")
+        if "/" in name and name.split("/")[0] != me:
+            raise StorageError(f"Repos are created under your handle ({me}); give just the repo name")
+        info = forge.create(me, name.split("/")[-1], body.description, body.default_branch.strip() or "main")
+        if body.public:
+            forge.set_public(info.full_name, True)
+        return forge_repo_info(request, info.project, info.name)
 
     @app.patch("/api/forge/repos/{project}/{repo}", tags=["forge"])
     def forge_update_repo(request: Request, project: str, repo: str, body: RepoSettingsBody):
         forge_admin(request)
-        full = "/".join(split_repo(f"{project}/{repo}"))
+        full = forge.canonical(f"{project}/{repo}")
         forge.open(full).close()  # 404 before changing anything
         if body.default_branch is not None:
             forge.set_default_branch(full, body.default_branch.strip())
@@ -341,8 +366,10 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         if body.public is not None:
             forge.set_public(full, body.public)
         if body.name:
-            new = body.name.strip().strip("/")
-            full = forge.rename(full, new if "/" in new else f"{full.split('/')[0]}/{new}")
+            new, owner_part = body.name.strip().strip("/"), full.split("/")[0]
+            if "/" in new and new.split("/")[0] != owner_part:
+                raise StorageError(f"Repos stay under {owner_part}; give just the new repo name")
+            full = forge.rename(full, f"{owner_part}/{new.split('/')[-1]}")  # the old name becomes an alias
         return forge_repo_info(request, *full.split("/"))
 
     @app.delete("/api/forge/repos/{project}/{repo}", tags=["forge"], status_code=204)

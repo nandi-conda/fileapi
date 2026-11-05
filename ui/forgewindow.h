@@ -32,13 +32,16 @@ private:
     void fillSettings(const QJsonObject &info);
     void saveSettings();
     void deleteRepo();
+    void createRepo();
+    QString shortName(const QString &repo) const;
     void setBreadcrumb(const QString &path, bool isFile);
     void updateHash();
     void status(const QString &text, bool error = false);
     QString ref() const;
 
     Api *m_api;
-    QString m_repo;       // "<project>/<repo>"
+    QString m_repo;       // "<owner>/<repo>"
+    QString m_owner;      // signed-in account's handle: the namespace new repos go into
     QString m_path;       // current path inside the repo
     QString m_pendingPath;
     bool m_signedIn = false;
@@ -62,6 +65,10 @@ private:
     QLineEdit *m_editDesc;
     QComboBox *m_defaultBranch;
     QLineEdit *m_editName;
+    QLabel *m_ownerPrefix = nullptr;
+    QWidget *m_newRow;
+    QLineEdit *m_newName;
+    QPushButton *m_create;
     QPushButton *m_save;
     QLineEdit *m_confirmDelete;
     QPushButton *m_delete;

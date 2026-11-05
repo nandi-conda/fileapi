@@ -1,7 +1,9 @@
-"""A minimal git forge: bare repos grouped by project, served over git smart HTTP and browsable over MCP.
+"""A minimal git forge: bare repos grouped by owner, served over git smart HTTP and browsable over MCP.
 
-Repos are addressed as "<project>/<name>" and cloned from /git/<project>/<name>.git. Two backends, chosen
-the same way as file storage:
+Repos are addressed as "<owner>/<name>" and cloned from /git/<owner>/<name>.git. The owner is the signed-in
+account's atproto handle (e.g. "nandi.uk"), so callers normally give only the repo name. Older names
+(repos from before owners, or renamed ones) are kept as aliases that resolve to the current name, so old
+clone URLs keep working. Two backends, chosen the same way as file storage:
 
 - Postgres (DATABASE_URL set): objects and refs are rows, so repos survive deploys on hosts without a
   persistent disk (FastAPI Cloud). Objects are content-addressed and immutable, so a process-wide cache is
@@ -52,8 +54,20 @@ def check_name(kind: str, value: str) -> str:
 def split_repo(repo: str) -> tuple[str, str]:
     project, sep, name = (repo or "").strip("/").partition("/")
     if not sep:
-        raise StorageError(f"Repo must be '<project>/<name>', got {repo!r}")
-    return check_name("project", project), check_name("repo", name)
+        raise StorageError(f"Repo must be '<owner>/<name>', got {repo!r}")
+    return check_name("owner", project), check_name("repo", name)
+
+
+def owner_name(handle: str | None, did: str | None = None) -> str:
+    """The repo namespace for an account: its handle, or (no handle) its DID made URL-safe."""
+    raw = (handle or "").strip().lower().lstrip("@") or re.sub(r"[^A-Za-z0-9._-]+", "-", did or "").strip("-.")
+    return check_name("owner", raw[:64] or "admin")
+
+
+def qualify(repo: str, owner: str) -> str:
+    """'<name>' -> '<owner>/<name>'; an explicit '<owner>/<name>' is kept as given."""
+    repo = (repo or "").strip().strip("/")
+    return repo if "/" in repo else f"{owner}/{repo}"
 
 
 @dataclass
@@ -87,6 +101,10 @@ CREATE TABLE IF NOT EXISTS fileapi_git_objects (
     type    smallint NOT NULL,
     data    bytea NOT NULL,
     PRIMARY KEY (repo_id, sha)
+);
+CREATE TABLE IF NOT EXISTS fileapi_git_aliases (
+    old text PRIMARY KEY,
+    new text NOT NULL
 );
 CREATE TABLE IF NOT EXISTS fileapi_git_refs (
     repo_id bigint NOT NULL REFERENCES fileapi_git_repos(id) ON DELETE CASCADE,
@@ -347,6 +365,28 @@ class PgForgeStore:
                             (project, name)).fetchone()
         return bool(row and row[0])
 
+    # Old "<owner>/<name>" -> current one, so URLs survive renames and the move to owner namespaces.
+    def get_alias(self, full: str) -> str | None:
+        with self.pool.connection() as c:
+            row = c.execute("SELECT new FROM fileapi_git_aliases WHERE old = %s", (full,)).fetchone()
+        return row[0] if row else None
+
+    def set_alias(self, old: str, new: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("UPDATE fileapi_git_aliases SET new = %s WHERE new = %s", (new, old))
+            c.execute("DELETE FROM fileapi_git_aliases WHERE old = %s", (new,))
+            c.execute("INSERT INTO fileapi_git_aliases (old, new) VALUES (%s, %s) "
+                      "ON CONFLICT (old) DO UPDATE SET new = EXCLUDED.new", (old, new))
+
+    def drop_aliases(self, full: str) -> None:
+        """Forget aliases named `full` (a real repo now has that name) or pointing at it (it was deleted)."""
+        with self.pool.connection() as c:
+            c.execute("DELETE FROM fileapi_git_aliases WHERE old = %s OR new = %s", (full, full))
+
+    def aliases(self) -> dict[str, str]:
+        with self.pool.connection() as c:
+            return dict(c.execute("SELECT old, new FROM fileapi_git_aliases ORDER BY old").fetchall())
+
     def delete(self, project: str, name: str) -> None:
         with self.pool.connection() as c:
             cur = c.execute("DELETE FROM fileapi_git_repos WHERE project = %s AND name = %s", (project, name))
@@ -432,6 +472,40 @@ class DiskForgeStore:
     def is_public(self, project: str, name: str) -> bool:
         return (self._path(project, name) / "git-daemon-export-ok").exists()
 
+    # Aliases (old name -> current name) live in one JSON file next to the owner directories.
+    def _alias_file(self) -> Path:
+        return self.root / ".aliases.json"
+
+    def aliases(self) -> dict[str, str]:
+        import json
+
+        try:
+            return json.loads(self._alias_file().read_text())
+        except FileNotFoundError:
+            return {}
+
+    def _save_aliases(self, data: dict[str, str]) -> None:
+        import json
+        import os
+
+        tmp = self._alias_file().with_suffix(".tmp")
+        tmp.write_text(json.dumps(dict(sorted(data.items())), indent=1))
+        os.replace(tmp, self._alias_file())
+
+    def get_alias(self, full: str) -> str | None:
+        return self.aliases().get(full)
+
+    def set_alias(self, old: str, new: str) -> None:
+        data = {k: (new if v == old else v) for k, v in self.aliases().items() if k != new}
+        data[old] = new
+        self._save_aliases(data)
+
+    def drop_aliases(self, full: str) -> None:
+        data = self.aliases()
+        kept = {k: v for k, v in data.items() if full not in (k, v)}
+        if kept != data:
+            self._save_aliases(kept)
+
     def delete(self, project: str, name: str) -> None:
         path = self._path(project, name)
         if not path.is_dir():
@@ -443,12 +517,12 @@ class DiskForgeStore:
 
 
 class _Backend(Backend):
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, forge: "Forge"):
+        self.forge = forge
 
     def open_repository(self, path: str):
         try:
-            return self.store.open(*split_repo(path))
+            return self.forge.open(path)
         except StorageError as e:
             raise NotGitRepository(str(e)) from None
 
@@ -460,36 +534,78 @@ def _ident(name: str | None, email: str | None) -> bytes:
 class Forge:
     def __init__(self, store):
         self.store = store
-        self._backend = _Backend(store)
+        self._backend = _Backend(self)
+
+    # -- names ----------------------------------------------------------------
+    def canonical(self, repo: str) -> str:
+        """The current '<owner>/<name>' for a repo, following an alias left by a rename or migration."""
+        full = "/".join(split_repo(repo))
+        return self.store.get_alias(full) or full
+
+    def _parts(self, repo: str) -> tuple[str, str]:
+        return split_repo(self.canonical(repo))
+
+    def migrate_to_owner(self, owner: str) -> list[tuple[str, str]]:
+        """Move every repo outside `owner` into it, keeping the old name as an alias. Idempotent.
+
+        A name already taken in `owner` becomes '<old owner>-<name>'.
+        """
+        owner = check_name("owner", owner)
+        moved = []
+        taken = {i.name for i in self.store.list(owner)}
+        for info in self.store.list(None):
+            if info.project == owner:
+                continue
+            name = info.name if info.name not in taken else check_name("repo", f"{info.project}-{info.name}"[:64])
+            try:
+                self.store.rename(info.project, info.name, owner, name)
+            except (Conflict, NotFound):  # another replica got there first, or a clash: leave it
+                continue
+            self.store.set_alias(info.full_name, f"{owner}/{name}")
+            taken.add(name)
+            moved.append((info.full_name, f"{owner}/{name}"))
+        return moved
 
     # -- repo management ----------------------------------------------------
     def create(self, project: str, name: str, description: str = "", default_branch: str = "main") -> RepoInfo:
-        project, name = check_name("project", project), check_name("repo", name)
+        project, name = check_name("owner", project), check_name("repo", name)
         check_name("branch", default_branch)
-        return self.store.create(project, name, description.strip(), default_branch)
+        info = self.store.create(project, name, description.strip(), default_branch)
+        self.store.drop_aliases(info.full_name)  # a real repo now owns this name
+        return info
 
     def list(self, project: str | None = None) -> list[RepoInfo]:
-        return self.store.list(check_name("project", project) if project else None)
+        return self.store.list(check_name("owner", project) if project else None)
+
+    def info(self, repo: str) -> RepoInfo:
+        owner, name = self._parts(repo)
+        found = next((i for i in self.store.list(owner) if i.name == name), None)
+        if found is None:
+            raise NotFound(f"No such repo: {owner}/{name}")
+        return found
 
     def open(self, repo: str) -> BaseRepo:
-        return self.store.open(*split_repo(repo))
+        return self.store.open(*self._parts(repo))
 
     def delete(self, repo: str) -> None:
-        self.store.delete(*split_repo(repo))
+        owner, name = self._parts(repo)
+        self.store.delete(owner, name)
+        self.store.drop_aliases(f"{owner}/{name}")
 
     def set_public(self, repo: str, public: bool) -> None:
-        self.store.set_public(*split_repo(repo), public)
+        self.store.set_public(*self._parts(repo), public)
 
     def is_public(self, repo: str) -> bool:
-        return self.store.is_public(*split_repo(repo))
+        return self.store.is_public(*self._parts(repo))
 
     def set_description(self, repo: str, description: str) -> None:
-        self.store.set_description(*split_repo(repo), description.strip())
+        self.store.set_description(*self._parts(repo), description.strip())
 
     def rename(self, repo: str, new_repo: str) -> str:
-        old, new = split_repo(repo), split_repo(new_repo)
+        old, new = self._parts(repo), split_repo(new_repo)
         if old != new:
             self.store.rename(*old, *new)
+            self.store.set_alias("/".join(old), "/".join(new))  # old clone URLs keep working
         return "/".join(new)
 
     def set_default_branch(self, repo: str, branch: str) -> None:

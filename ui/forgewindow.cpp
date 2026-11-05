@@ -17,6 +17,7 @@
 #include <QLocale>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -69,6 +70,20 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     leftLay->addWidget(new QLabel("<b>Repositories</b>"));
     m_repos = new QListWidget;
     leftLay->addWidget(m_repos);
+    // New repo: only a name is needed; it is created under the signed-in handle.
+    m_newRow = new QWidget;
+    auto *newLay = new QHBoxLayout(m_newRow);
+    newLay->setContentsMargins(0, 0, 0, 0);
+    m_newName = new QLineEdit;
+    m_newName->setPlaceholderText("new-repo-name");
+    newLay->addWidget(m_newName, 1);
+    m_create = new QPushButton("Create");
+    m_create->setIcon(style()->standardIcon(QStyle::SP_FileDialogNewFolder));
+    newLay->addWidget(m_create);
+    m_newRow->setVisible(false);
+    leftLay->addWidget(m_newRow);
+    connect(m_create, &QPushButton::clicked, this, &ForgeWindow::createRepo);
+    connect(m_newName, &QLineEdit::returnPressed, this, &ForgeWindow::createRepo);
     split->addWidget(left);
     connect(m_repos, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *it) {
         if (it && it->data(PathRole).toString() != m_repo)
@@ -196,11 +211,18 @@ void ForgeWindow::loadMe()
     m_api->get("me", {}, this, [this](const QJsonObject &me, const QString &error) {
         const bool in = error.isEmpty() && me.value("signed_in").toBool();
         const QString admin = me.value("admin").toString();
-        m_who->setText(in ? "Signed in as " + admin : "Public repos only");
+        m_owner = me.value("owner").toString();
+        m_who->setText(in ? "Signed in as " + (m_owner.isEmpty() ? admin : m_owner) : "Public repos only");
         m_signIn->setText(in ? "Sign out" : "Sign in");
         m_signIn->setToolTip(in ? QString() : "Only " + admin + " can sign in, to see private repos.");
         m_signedIn = in;
         m_tabs->setTabVisible(2, in);
+        m_newRow->setVisible(in);
+        m_newName->setToolTip(QStringLiteral("Creates %1/<name>").arg(m_owner));
+        if (m_ownerPrefix)
+            m_ownerPrefix->setText(m_owner + " /");
+        if (m_repos->count() > 0)
+            loadRepos();  // relabel with short names now that we know whose repos they are
     });
 }
 
@@ -216,21 +238,35 @@ void ForgeWindow::loadRepos()
             const QJsonObject r = v.toObject();
             const QString name = r.value("repo").toString();
             const bool pub = r.value("public").toBool();
-            auto *it = new QListWidgetItem(name + (pub ? "" : "  (private)"));
+            auto *it = new QListWidgetItem(shortName(name) + (pub ? "" : "  (private)"));
             it->setData(PathRole, name);
             it->setToolTip(r.value("description").toString());
             m_repos->addItem(it);
         }
         status(repos.isEmpty() ? "No repositories you can see yet." : QStringLiteral("%1 repositories").arg(repos.size()));
-        // Restore #<project>/<repo>[/path] from the page URL.
+        // Restore #<owner>/<repo>[/path] from the page URL.
         const QString hash = m_api->locationHash();
         const QStringList parts = hash.split('/', Qt::SkipEmptyParts);
         if (parts.size() >= 2) {
             const QString repo = parts[0] + "/" + parts[1];
-            m_pendingPath = parts.mid(2).join('/');
-            for (int i = 0; i < m_repos->count(); ++i)
-                if (m_repos->item(i)->data(PathRole).toString() == repo)
+            bool found = false;
+            for (int i = 0; i < m_repos->count() && !found; ++i)
+                if (m_repos->item(i)->data(PathRole).toString() == repo) {
+                    found = true;
+                    if (repo == m_repo) {  // already open (the list reloaded after sign-in): just reselect
+                        const QSignalBlocker block(m_repos);
+                        m_repos->setCurrentRow(i);
+                        break;
+                    }
+                    m_pendingPath = parts.mid(2).join('/');
                     m_repos->setCurrentRow(i);
+                }
+            // An old link (from before repos moved under their owner, or before a rename): the server
+            // resolves the old name, and openRepo switches to the current one.
+            if (!found && repo != m_repo) {
+                m_pendingPath = parts.mid(2).join('/');
+                openRepo(repo);
+            }
         }
     });
 }
@@ -254,12 +290,20 @@ void ForgeWindow::openRepo(const QString &repo)
             return;
         if (!error.isEmpty())
             return status(error, true);
+        const QString current = info.value("repo").toString();
+        if (!current.isEmpty() && current != repo) {  // opened by an old name
+            m_repo = current;
+            const QSignalBlocker block(m_repos);
+            for (int i = 0; i < m_repos->count(); ++i)
+                if (m_repos->item(i)->data(PathRole).toString() == current)
+                    m_repos->setCurrentRow(i);
+        }
         m_info = info;
         fillSettings(info);
         const QString desc = info.value("description").toString();
         m_desc->setText(desc.isEmpty() ? QString() : desc);
         m_desc->setVisible(!desc.isEmpty());
-        m_title->setText(repo + (info.value("public").toBool() ? "" : "  (private)"));
+        m_title->setText(m_repo + (info.value("public").toBool() ? "" : "  (private)"));
         m_clone->setText("git clone " + info.value("clone_url").toString());
         const QString def = info.value("default").toString();
         const QJsonObject branches = info.value("branches").toObject();
@@ -400,10 +444,15 @@ QWidget *ForgeWindow::buildSettings()
 
     auto *general = new QGroupBox("General");
     auto *form = new QFormLayout(general);
+    // Repos always belong to their owner (the signed-in handle); only the name part can change.
+    auto *nameRow = new QHBoxLayout;
+    m_ownerPrefix = new QLabel;
+    nameRow->addWidget(m_ownerPrefix);
     m_editName = new QLineEdit;
-    m_editName->setPlaceholderText("project/repo");
-    m_editName->setToolTip("Renaming changes the clone URL; old URLs stop working.");
-    form->addRow("Name:", m_editName);
+    m_editName->setPlaceholderText("repo-name");
+    m_editName->setToolTip("Renaming changes the clone URL; the old URL keeps working as an alias.");
+    nameRow->addWidget(m_editName, 1);
+    form->addRow("Name:", nameRow);
     m_editDesc = new QLineEdit;
     m_editDesc->setPlaceholderText("A short description");
     form->addRow("Description:", m_editDesc);
@@ -428,7 +477,7 @@ QWidget *ForgeWindow::buildSettings()
     danger->setStyleSheet("QGroupBox { color: #c62828; }");
     auto *dl = new QVBoxLayout(danger);
     auto *warn = new QLabel("This deletes the repository and all of its history. It can't be undone. "
-                            "Type the repository's full name to confirm.");
+                            "Type the repository's name to confirm.");
     warn->setWordWrap(true);
     dl->addWidget(warn);
     auto *delRow = new QHBoxLayout;
@@ -442,7 +491,7 @@ QWidget *ForgeWindow::buildSettings()
     lay->addWidget(danger);
     lay->addStretch(1);
     connect(m_confirmDelete, &QLineEdit::textChanged, this, [this](const QString &t) {
-        m_delete->setEnabled(!m_repo.isEmpty() && t.trimmed() == m_repo);
+        m_delete->setEnabled(!m_repo.isEmpty() && t.trimmed() == m_repo.section('/', 1));
     });
     connect(m_delete, &QPushButton::clicked, this, &ForgeWindow::deleteRepo);
     page->setEnabled(false);
@@ -451,7 +500,8 @@ QWidget *ForgeWindow::buildSettings()
 
 void ForgeWindow::fillSettings(const QJsonObject &info)
 {
-    m_editName->setText(info.value("repo").toString());
+    m_ownerPrefix->setText(info.value("project").toString() + " /");
+    m_editName->setText(info.value("name").toString());
     m_editDesc->setText(info.value("description").toString());
     m_public->setChecked(info.value("public").toBool());
     m_defaultBranch->clear();
@@ -464,7 +514,7 @@ void ForgeWindow::fillSettings(const QJsonObject &info)
     m_defaultBranch->setCurrentText(def);
     m_defaultBranch->setEnabled(m_defaultBranch->count() > 1);
     m_confirmDelete->clear();
-    m_confirmDelete->setPlaceholderText(info.value("repo").toString());
+    m_confirmDelete->setPlaceholderText(info.value("name").toString());
     m_settings->setEnabled(true);
 }
 
@@ -474,7 +524,7 @@ void ForgeWindow::saveSettings()
         return;
     QJsonObject body;
     const QString name = m_editName->text().trimmed();
-    if (!name.isEmpty() && name != m_repo)
+    if (!name.isEmpty() && name != m_info.value("name").toString())
         body["name"] = name;
     if (m_editDesc->text().trimmed() != m_info.value("description").toString())
         body["description"] = m_editDesc->text().trimmed();
@@ -504,7 +554,7 @@ void ForgeWindow::saveSettings()
 void ForgeWindow::deleteRepo()
 {
     const QString repo = m_repo;
-    if (repo.isEmpty() || m_confirmDelete->text().trimmed() != repo)
+    if (repo.isEmpty() || m_confirmDelete->text().trimmed() != repo.section('/', 1))
         return;
     m_delete->setEnabled(false);
     status("Deleting " + repo + "…");
@@ -519,5 +569,34 @@ void ForgeWindow::deleteRepo()
         m_tabs->setCurrentIndex(0);
         loadRepos();
         status("Deleted " + repo + ".");
+    });
+}
+
+QString ForgeWindow::shortName(const QString &repo) const
+{
+    // Your own repos show by name alone; anyone else's keep their owner.
+    return !m_owner.isEmpty() && repo.section('/', 0, 0) == m_owner ? repo.section('/', 1) : repo;
+}
+
+void ForgeWindow::createRepo()
+{
+    const QString name = m_newName->text().trimmed();
+    if (name.isEmpty())
+        return status("Type a name for the new repository.");
+    QJsonObject body;
+    body["name"] = name;
+    m_create->setEnabled(false);
+    status("Creating " + name + "…");
+    m_api->send("POST", "repos", body, this, [this, name](const QJsonObject &info, const QString &error) {
+        m_create->setEnabled(true);
+        if (!error.isEmpty())
+            return status("Could not create " + name + ": " + error, true);
+        m_newName->clear();
+        const QString repo = info.value("repo").toString();
+        m_pendingPath.clear();
+        m_api->setLocationHash(repo);
+        m_repo.clear();
+        loadRepos();  // selects it from the hash
+        status("Created " + repo + ". Push to " + info.value("clone_url").toString());
     });
 }
