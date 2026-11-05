@@ -106,7 +106,19 @@ deploy-only: login
         echo "(Never deployed before? Press Ctrl-C and run 'just launch' instead.)"
         just link
     fi
-    if ! {{fastapi}} cloud env list 2>/dev/null | grep -q 'DATABASE_URL'; then
+    # Ask FastAPI Cloud (as JSON) whether DATABASE_URL is set. Only a clear "not set" provisions it;
+    # if the check itself fails we stop rather than risk replacing a working database.
+    if ! env_json=$({{fastapi}} cloud env list --json); then
+        echo "Couldn't list the FastAPI Cloud env vars (see the error above), so not deploying." >&2
+        exit 1
+    fi
+    has_db=$(printf '%s' "$env_json" | {{python}} -c '
+    import json, sys
+    out = json.load(sys.stdin)
+    names = {v.get("name") for v in out.get("data", {}).get("variables", [])}
+    print("yes" if "DATABASE_URL" in names else "no")
+    ')
+    if [ "$has_db" = "no" ]; then
         echo "DATABASE_URL is not set on FastAPI Cloud, so a deploy would start on a wiped disk. Setting it up now..."
         just cloud-db
     fi
