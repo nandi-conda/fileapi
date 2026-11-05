@@ -13,6 +13,9 @@ class Api : public QObject {
 public:
     using Callback = std::function<void(const QJsonObject &body, const QString &error)>;
 
+    // On an error, the callback's body carries the HTTP status (0 = no response) under this key.
+    static constexpr const char *StatusKey = "_http_status";
+
     explicit Api(QObject *parent = nullptr);
 
     QString baseUrl() const { return m_base; }

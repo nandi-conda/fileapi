@@ -520,6 +520,13 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": log[1]["sha"]}).json()
         assert f["content"] == "x = 1\n"
         assert client.get("/api/forge/repos/web/secret").status_code == 404
+        # The UI's "not found" page relies on a private repo looking exactly like a missing one, even
+        # with a stale/bad token: same status, same message shape.
+        for headers in ({}, {"Authorization": "Bearer not-a-real-token"}):
+            hidden = client.get("/api/forge/repos/web/secret", headers=headers)
+            missing = client.get("/api/forge/repos/web/nope", headers=headers)
+            assert hidden.status_code == missing.status_code == 404
+            assert hidden.json()["detail"].replace("secret", "X") == missing.json()["detail"].replace("nope", "X")
 
         # Signed in: private repos too.
         assert client.get("/api/forge/me", headers=AUTH).json()["signed_in"] is True

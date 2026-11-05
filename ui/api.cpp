@@ -69,12 +69,13 @@ void Api::finish(QNetworkReply *reply, QObject *context, Callback done)
         reply->deleteLater();
         const QByteArray data = reply->readAll();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QJsonObject body = QJsonDocument::fromJson(data).object();
+        QJsonObject body = QJsonDocument::fromJson(data).object();
         QString error;
         if (status >= 400 || (status == 0 && reply->error() != QNetworkReply::NoError)) {
             error = body.value("detail").toString();
             if (error.isEmpty())
                 error = status ? QStringLiteral("HTTP %1").arg(status) : reply->errorString();
+            body.insert(Api::StatusKey, status);  // so callers can tell "not found" from "server down"
         }
         done(body, error);
     });

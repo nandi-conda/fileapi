@@ -182,6 +182,57 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_tabs->setTabVisible(2, false);  // only the signed-in admin can change settings
     lay->addWidget(m_tabs, 1);
     m_main->addWidget(repoView);
+
+    // ---- error page: a repo that can't be opened. For anyone not signed in, a private repo and a missing
+    // one look the same (the server answers 404 for both), so the page never says which it is.
+    auto *errPage = new QWidget;
+    auto *el = new QVBoxLayout(errPage);
+    el->addStretch(1);
+    m_errIcon = new QLabel;
+    m_errIcon->setAlignment(Qt::AlignCenter);
+    el->addWidget(m_errIcon);
+    m_errTitle = new QLabel;
+    QFont ef = m_errTitle->font();
+    ef.setPointSizeF(ef.pointSizeF() * 1.5);
+    ef.setBold(true);
+    m_errTitle->setFont(ef);
+    m_errTitle->setAlignment(Qt::AlignCenter);
+    el->addWidget(m_errTitle);
+    m_errText = new QLabel;
+    m_errText->setWordWrap(true);
+    m_errText->setAlignment(Qt::AlignCenter);
+    m_errText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    el->addWidget(m_errText);
+    el->addSpacing(12);
+    auto *eb = new QHBoxLayout;
+    eb->addStretch(1);
+    m_errSignIn = new QPushButton("Sign in");
+    eb->addWidget(m_errSignIn);
+    m_errRetry = new QPushButton("Try again");
+    m_errRetry->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    eb->addWidget(m_errRetry);
+    auto *errBack = new QPushButton("Back to repositories");
+    errBack->setIcon(style()->standardIcon(QStyle::SP_ArrowBack));
+    eb->addWidget(errBack);
+    eb->addStretch(1);
+    el->addLayout(eb);
+    el->addStretch(2);
+    connect(m_errSignIn, &QPushButton::clicked, this, [this] { m_api->signIn(); });  // keeps #<repo>, comes back to it
+    connect(m_errRetry, &QPushButton::clicked, this, [this] {
+        const QString repo = m_repo;
+        m_repo.clear();
+        openRepo(repo);
+    });
+    connect(errBack, &QPushButton::clicked, this, [this] {
+        m_repo.clear();
+        m_pendingPath.clear();
+        m_api->setLocationHash(QString());
+        const QSignalBlocker block(m_repos);
+        m_repos->setCurrentRow(-1);
+        m_main->setCurrentIndex(0);
+        status(QStringLiteral("%1 repositories").arg(m_repos->count()));
+    });
+    m_main->addWidget(errPage);
     split->addWidget(m_main);
     split->setStretchFactor(1, 1);
     split->setSizes({260, 900});
@@ -198,6 +249,32 @@ void ForgeWindow::status(const QString &text, bool error)
 {
     m_status->setText(text);
     m_status->setStyleSheet(error ? "color: #c62828;" : "");
+}
+
+void ForgeWindow::showRepoError(const QString &repo, int httpStatus, const QString &error)
+{
+    const bool noAccess = httpStatus == 401 || httpStatus == 403 || httpStatus == 404;
+    // A repo name that isn't valid at all (400/422) is just as "not there" as a missing one.
+    const bool missing = noAccess || httpStatus == 400 || httpStatus == 422;
+    m_lastError = {{"repo", repo}, {"status", httpStatus}, {"error", error}};
+    m_main->setCurrentIndex(2);
+    m_errIcon->setPixmap(style()->standardIcon(missing ? QStyle::SP_MessageBoxWarning : QStyle::SP_MessageBoxCritical)
+                             .pixmap(48, 48));
+    if (missing) {
+        m_errTitle->setText("Repository not found");
+        m_errText->setText(m_signedIn
+            ? QStringLiteral("<b>%1</b> doesn't exist. It may have been deleted, or the link may be mistyped.")
+                  .arg(repo.toHtmlEscaped())
+            : QStringLiteral("<b>%1</b> doesn't exist, or it's private and you need to sign in to see it.")
+                  .arg(repo.toHtmlEscaped()));
+    } else {
+        m_errTitle->setText("Couldn't load this repository");
+        m_errText->setText(QStringLiteral("Something went wrong loading <b>%1</b>: %2")
+                               .arg(repo.toHtmlEscaped(), error.toHtmlEscaped()));
+    }
+    m_errSignIn->setVisible(missing && !m_signedIn);
+    m_errRetry->setVisible(!missing);
+    status(missing ? "Not found: " + repo : error, true);
 }
 
 QString ForgeWindow::ref() const
@@ -221,6 +298,9 @@ void ForgeWindow::loadMe()
         m_newName->setToolTip(QStringLiteral("Creates %1/<name>").arg(m_owner));
         if (m_ownerPrefix)
             m_ownerPrefix->setText(m_owner + " /");
+        if (m_main->currentIndex() == 2 && !m_lastError.isEmpty())  // page drawn before we knew: redo the wording
+            showRepoError(m_lastError.value("repo").toString(), m_lastError.value("status").toInt(),
+                          m_lastError.value("error").toString());
         if (m_repos->count() > 0)
             loadRepos();  // relabel with short names now that we know whose repos they are
     });
@@ -289,7 +369,7 @@ void ForgeWindow::openRepo(const QString &repo)
         if (repo != m_repo)
             return;
         if (!error.isEmpty())
-            return status(error, true);
+            return showRepoError(repo, info.value(Api::StatusKey).toInt(), error);
         const QString current = info.value("repo").toString();
         if (!current.isEmpty() && current != repo) {  // opened by an old name
             m_repo = current;

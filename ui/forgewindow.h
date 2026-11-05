@@ -37,6 +37,7 @@ private:
     void setBreadcrumb(const QString &path, bool isFile);
     void updateHash();
     void status(const QString &text, bool error = false);
+    void showRepoError(const QString &repo, int httpStatus, const QString &error);
     QString ref() const;
 
     Api *m_api;
@@ -73,5 +74,11 @@ private:
     QLineEdit *m_confirmDelete;
     QPushButton *m_delete;
     QStackedWidget *m_main;
+    QJsonObject m_lastError;  // {repo, status, error} of the error page, redrawn once we know who's signed in
+    QLabel *m_errIcon;
+    QLabel *m_errTitle;
+    QLabel *m_errText;
+    QPushButton *m_errSignIn;
+    QPushButton *m_errRetry;
     QLabel *m_status;
 };
