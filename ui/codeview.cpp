@@ -1,9 +1,13 @@
 #include "codeview.h"
 
+#include <QApplication>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QScrollBar>
 #include <QTextBlock>
+#include <QTimer>
+#include <QToolTip>
 
 namespace {
 class Gutter : public QWidget {
@@ -20,6 +24,8 @@ private:
 };
 
 constexpr int GutterPad = 8;  // px left and right of the numbers
+
+bool isWordChar(QChar c) { return c.isLetterOrNumber() || c == QLatin1Char('_') || c == QLatin1Char('$'); }
 }  // namespace
 
 CodeView::CodeView(QWidget *parent) : QPlainTextEdit(parent), m_gutter(new Gutter(this))
@@ -29,6 +35,151 @@ CodeView::CodeView(QWidget *parent) : QPlainTextEdit(parent), m_gutter(new Gutte
     updateGutterWidth();
     m_gutter->setCursor(Qt::PointingHandCursor);
     m_gutter->setToolTip(QStringLiteral("Click a line number to link to it; shift-click to link a range"));
+
+    m_hoverTimer = new QTimer(this);
+    m_hoverTimer->setSingleShot(true);
+    m_hoverTimer->setInterval(450);
+    connect(m_hoverTimer, &QTimer::timeout, this, [this] {
+        int line, col;
+        if (m_nav && onWordHover && wordAt(m_hoverPos, &line, &col))
+            onWordHover(line, col, viewport()->mapToGlobal(m_hoverPos));
+    });
+    viewport()->setMouseTracking(true);
+}
+
+void CodeView::setNavEnabled(bool on)
+{
+    m_nav = on;
+    m_hoverTimer->stop();
+    m_hoverWord = QTextCursor();
+    viewport()->setCursor(Qt::IBeamCursor);
+    if (!on)
+        setSymbolMarks({});
+}
+
+bool CodeView::wordAt(const QPoint &pos, int *line, int *col, QTextCursor *word) const
+{
+    QTextCursor c = cursorForPosition(pos);
+    const QTextBlock block = c.block();
+    const QString text = block.text();
+    int i = c.positionInBlock();
+    // cursorForPosition gives the nearest gap between characters: the character under the mouse is
+    // the one before that gap when the mouse is left of it.
+    const QRect r = cursorRect(c);
+    if (pos.x() < r.x())
+        --i;
+    if (i < 0 || i >= text.size() || !isWordChar(text[i]))
+        return false;
+    if (pos.y() < r.top() || pos.y() > r.bottom() + 1)
+        return false;
+    int start = i, end = i + 1;
+    while (start > 0 && isWordChar(text[start - 1]))
+        --start;
+    while (end < text.size() && isWordChar(text[end]))
+        ++end;
+    if (text[start].isDigit())
+        return false;  // a number, not a name
+    *line = block.blockNumber() + 1;
+    *col = i;
+    if (word) {
+        *word = QTextCursor(block);
+        word->setPosition(block.position() + start);
+        word->setPosition(block.position() + end, QTextCursor::KeepAnchor);
+    }
+    return true;
+}
+
+void CodeView::mousePressEvent(QMouseEvent *event)
+{
+    m_pressed = event->button() == Qt::LeftButton;
+    m_pressPos = event->position().toPoint();
+    m_hoverTimer->stop();
+    QToolTip::hideText();
+    QPlainTextEdit::mousePressEvent(event);
+}
+
+void CodeView::mouseReleaseEvent(QMouseEvent *event)
+{
+    QPlainTextEdit::mouseReleaseEvent(event);
+    const bool click = m_pressed && event->button() == Qt::LeftButton
+        && (event->position().toPoint() - m_pressPos).manhattanLength() < QApplication::startDragDistance()
+        && !textCursor().hasSelection();
+    m_pressed = false;
+    int line, col;
+    if (click && m_nav && onWordClicked && wordAt(event->position().toPoint(), &line, &col)) {
+        const bool jump = event->modifiers() & (Qt::ControlModifier | Qt::MetaModifier);
+        onWordClicked(line, col, jump);
+    }
+}
+
+void CodeView::mouseMoveEvent(QMouseEvent *event)
+{
+    QPlainTextEdit::mouseMoveEvent(event);
+    if (!m_nav || (event->buttons() & Qt::LeftButton))
+        return;
+    const QPoint pos = event->position().toPoint();
+    int line, col;
+    QTextCursor word;
+    if (!wordAt(pos, &line, &col, &word)) {
+        if (!m_hoverWord.isNull()) {
+            m_hoverWord = QTextCursor();
+            viewport()->setCursor(Qt::IBeamCursor);
+            QToolTip::hideText();
+        }
+        m_hoverTimer->stop();
+        return;
+    }
+    viewport()->setCursor(Qt::PointingHandCursor);
+    m_hoverPos = pos;
+    if (m_hoverWord.isNull() || m_hoverWord.selectionStart() != word.selectionStart()) {
+        m_hoverWord = word;  // a new word: rest on it a moment before asking the server
+        QToolTip::hideText();
+        m_hoverTimer->start();
+    }
+}
+
+void CodeView::leaveEvent(QEvent *event)
+{
+    QPlainTextEdit::leaveEvent(event);
+    m_hoverTimer->stop();
+    m_hoverWord = QTextCursor();
+}
+
+void CodeView::keyPressEvent(QKeyEvent *event)
+{
+    if (m_nav && onNavKey && event->key() == Qt::Key_F12) {
+        const QTextCursor c = textCursor();
+        onNavKey(c.blockNumber() + 1, c.positionInBlock(), event->modifiers() & Qt::ShiftModifier);
+        return;
+    }
+    QPlainTextEdit::keyPressEvent(event);
+}
+
+void CodeView::setSymbolMarks(const QList<Span> &spans)
+{
+    m_symbols = spans;
+    applyMarks();
+}
+
+void CodeView::scrollToLine(int line)
+{
+    const int lineH = fontMetrics().lineSpacing();
+    const int above = std::max(0, viewport()->height() / 3 / std::max(1, lineH));
+    verticalScrollBar()->setValue(std::max(0, line - 1 - above));
+}
+
+void CodeView::revealSpan(int line, int col, int endCol)
+{
+    const QTextBlock block = document()->findBlockByNumber(line - 1);
+    if (!block.isValid())
+        return;
+    QTextCursor c(block);
+    c.setPosition(block.position() + std::clamp(col, 0, int(block.length() - 1)));
+    c.setPosition(block.position() + std::clamp(endCol, 0, int(block.length() - 1)), QTextCursor::KeepAnchor);
+    setTextCursor(c);
+    scrollToLine(line);
+    horizontalScrollBar()->setValue(0);
+    ensureCursorVisible();
 }
 
 void CodeView::gutterClicked(QMouseEvent *event)
@@ -61,9 +212,7 @@ void CodeView::setMarkedLines(int first, int last, bool scroll)
             // Put the first marked line about a third of the way down, like GitHub does.
             QTextCursor c(document()->findBlockByNumber(m_first - 1));
             setTextCursor(c);
-            const int lineH = fontMetrics().lineSpacing();
-            const int above = std::max(0, viewport()->height() / 3 / std::max(1, lineH));
-            verticalScrollBar()->setValue(std::max(0, m_first - 1 - above));
+            scrollToLine(m_first);
         }
     }
     applyMarks();
@@ -82,6 +231,20 @@ void CodeView::applyMarks()
             sel.format.setProperty(QTextFormat::FullWidthSelection, true);
             marks.append(sel);
         }
+    }
+    // Occurrences of the symbol last clicked: a soft box behind each, like an editor's "highlight references".
+    QColor sym = palette().color(QPalette::Highlight);
+    sym.setAlphaF(0.30f);
+    for (const Span &s : std::as_const(m_symbols)) {
+        const QTextBlock block = document()->findBlockByNumber(s.line - 1);
+        if (!block.isValid())
+            continue;
+        QTextEdit::ExtraSelection sel;
+        sel.cursor = QTextCursor(block);
+        sel.cursor.setPosition(block.position() + std::min(s.col, block.length() - 1));
+        sel.cursor.setPosition(block.position() + std::min(s.endCol, block.length() - 1), QTextCursor::KeepAnchor);
+        sel.format.setBackground(sym);
+        marks.append(sel);
     }
     setExtraSelections(marks);
     m_gutter->update();

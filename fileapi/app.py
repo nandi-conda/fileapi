@@ -328,6 +328,18 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_tree(request: Request, project: str, repo: str, ref: str = "HEAD", path: str = ""):
         return forge.browse(forge_repo(request, project, repo), path, ref)
 
+    # Code navigation (fileapi/codenav.py): a file's outline, and what the identifier at line/col refers to.
+    @app.get("/api/forge/repos/{project}/{repo}/symbols", tags=["forge"])
+    async def forge_symbols(request: Request, project: str, repo: str, path: str, ref: str = "HEAD"):
+        full = forge_repo(request, project, repo)
+        return await run_in_threadpool(forge.symbols, full, path, ref)
+
+    @app.get("/api/forge/repos/{project}/{repo}/symbol", tags=["forge"])
+    async def forge_symbol(request: Request, project: str, repo: str, path: str, line: int = Query(..., ge=1),
+                           col: int = Query(..., ge=0), ref: str = "HEAD", references: bool = True):
+        full = forge_repo(request, project, repo)
+        return await run_in_threadpool(forge.symbol_at, full, path, line, col, ref, references)
+
     # "/commits", not "/log": ad blockers drop URLs ending in /log (tracking-beacon filter rules).
     @app.get("/api/forge/repos/{project}/{repo}/commits", tags=["forge"])
     @app.get("/api/forge/repos/{project}/{repo}/log", include_in_schema=False)  # old name, kept for clients

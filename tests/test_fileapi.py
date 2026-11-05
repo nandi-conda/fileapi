@@ -721,3 +721,58 @@ def test_git_credential_helper_signs_in_in_browser(tmp_path):
         assert git_credential._base("fileapi.example/x/y") == "https://fileapi.example"
     finally:
         server.should_exit = True
+
+
+def test_forge_code_navigation(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("web", "code")
+        forge.commit_files("web/code", "main", {
+            "pkg/util.py": 'def helper(x: int) -> int:\n    """Doubles x.\n\n    Really."""\n    return x * 2\n\n\nclass Box:\n    def open(self):\n        return helper(1)\n',
+            "pkg/main.py": "from .util import helper, Box\n\nprint(helper(3))  # helper in a comment\ns = 'helper'\n",
+            "lib/helper.c": "// C has its own helper\nint helper(int x) { return x; }\n",
+            "web/app.ts": "// Adds one.\nexport function inc(n: number): number { return n + 1 }\nconst y = inc(2)\n",
+        }, "code")
+        forge.set_public("web/code", True)
+        base = "/api/forge/repos/web/code"
+
+        out = client.get(f"{base}/symbols", params={"path": "pkg/util.py"}).json()
+        assert out["supported"] and out["language"] == "Python"
+        assert [(s["name"], s["kind"], s["line"]) for s in out["symbols"]] == [
+            ("helper", "function", 1), ("Box", "class", 8), ("open", "method", 9)]
+        assert out["symbols"][0]["signature"] == "def helper(x: int) -> int"
+        assert out["symbols"][0]["doc"] == "Doubles x.\n\nReally."
+        assert out["symbols"][2]["container"] == "Box"
+
+        # helper(3) in main.py: defined in util.py (not in the C file); used in both Python files.
+        r = client.get(f"{base}/symbol", params={"path": "pkg/main.py", "line": 3, "col": 7}).json()
+        assert r["symbol"] == {"name": "helper", "line": 3, "col": 6, "end_col": 12}
+        assert [(d["path"], d["line"]) for d in r["definitions"]] == [("pkg/util.py", 1)]
+        refs = [(x["path"], x["line"]) for x in r["references"]]
+        assert refs == [("pkg/main.py", 1), ("pkg/main.py", 3), ("pkg/util.py", 1), ("pkg/util.py", 10)]
+        assert [x["definition"] for x in r["references"]] == [False, False, True, False]
+        # Comments and strings aren't identifiers.
+        assert client.get(f"{base}/symbol", params={"path": "pkg/main.py", "line": 3, "col": 25}).json()["symbol"] is None
+        assert client.get(f"{base}/symbol", params={"path": "pkg/main.py", "line": 4, "col": 7}).json()["symbol"] is None
+        # On the definition itself: that definition; hover can skip references.
+        r = client.get(f"{base}/symbol", params={"path": "pkg/util.py", "line": 1, "col": 4, "references": False}).json()
+        assert [(d["path"], d["line"]) for d in r["definitions"]] == [("pkg/util.py", 1)] and r["references"] == []
+
+        r = client.get(f"{base}/symbol", params={"path": "web/app.ts", "line": 3, "col": 10}).json()
+        assert r["definitions"][0]["line"] == 2 and r["definitions"][0]["doc"] == "Adds one."
+        assert r["definitions"][0]["signature"] == "function inc(n: number): number"
+        r = client.get(f"{base}/symbol", params={"path": "lib/helper.c", "line": 2, "col": 5}).json()
+        assert [d["path"] for d in r["definitions"]] == ["lib/helper.c"]
+        assert r["definitions"][0]["signature"] == "int helper(int x)" and r["definitions"][0]["doc"] == "C has its own helper"
+
+        # Parameters and local variables resolve inside their function only.
+        r = client.get(f"{base}/symbol", params={"path": "pkg/util.py", "line": 5, "col": 11}).json()
+        assert r["local"] and [(d["line"], d["kind"]) for d in r["definitions"]] == [(1, "parameter")]
+        assert [(x["line"], x["col"]) for x in r["references"]] == [(1, 11), (5, 11)]
+        r = client.get(f"{base}/symbol", params={"path": "web/app.ts", "line": 2, "col": 48}).json()
+        assert [(d["line"], d["kind"]) for d in r["definitions"]] == [(2, "parameter")]
+
+        assert client.get(f"{base}/symbols", params={"path": "nope.py"}).status_code == 404
+        assert client.get(f"{base}/symbols", params={"path": "pkg"}).status_code == 404
+        forge.create("web", "hidden")
+        assert client.get("/api/forge/repos/web/hidden/symbols", params={"path": "a.py"}).status_code == 404

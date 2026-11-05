@@ -715,6 +715,44 @@ class Forge:
         finally:
             r.close()
 
+    def _file_at(self, r: BaseRepo, ref: str, path: str) -> tuple[Commit, bytes]:
+        commit = self._peel_commit(r, self._resolve(r, ref))
+        obj = r[commit.tree]
+        parts = [p for p in path.strip("/").split("/") if p]
+        sha = None
+        for part in parts:
+            if not isinstance(obj, Tree):
+                raise NotFound(f"No such file at {ref}: {path}")
+            try:
+                _, sha = obj[part.encode()]
+            except KeyError:
+                raise NotFound(f"No such file at {ref}: {path}") from None
+            obj = r[sha]
+        if sha is None or isinstance(obj, Tree):
+            raise NotFound(f"Not a file: {path}")
+        return commit, sha
+
+    def symbols(self, repo: str, path: str, ref: str = "HEAD") -> dict:
+        """The definitions in one file (its outline), for the web UI's symbol list."""
+        from . import codenav
+        r = self.open(repo)
+        try:
+            commit, sha = self._file_at(r, ref, path)
+            return {"commit": commit.id.decode(), **codenav.outline(r, commit, "/".join(p for p in path.split("/") if p), sha)}
+        finally:
+            r.close()
+
+    def symbol_at(self, repo: str, path: str, line: int, col: int, ref: str = "HEAD", references: bool = True) -> dict:
+        """Definitions (and references) of the identifier at line/col of a file, searched across the commit."""
+        from . import codenav
+        r = self.open(repo)
+        try:
+            commit, sha = self._file_at(r, ref, path)
+            clean = "/".join(p for p in path.split("/") if p)
+            return {"commit": commit.id.decode(), **codenav.lookup(r, commit, clean, sha, line, col, references)}
+        finally:
+            r.close()
+
     def log(self, repo: str, ref: str = "HEAD", path: str | None = None, limit: int = 20) -> list[dict]:
         r = self.open(repo)
         try:

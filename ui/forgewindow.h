@@ -2,10 +2,13 @@
 
 #include <QJsonObject>
 #include <QMainWindow>
+#include <QUrlQuery>
 
 class Api;
 class CodeHighlighter;
 class CodeView;
+class NavPanel;
+class QSplitter;
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -45,6 +48,14 @@ private:
     void status(const QString &text, bool error = false);
     void showRepoError(const QString &repo, int httpStatus, const QString &error);
     QString ref() const;
+    // Code navigation (go to definition, references, hover; served by /symbol and /symbols).
+    void loadOutline();
+    void lookupSymbol(int line, int col, bool jump);
+    void hoverSymbol(int line, int col, const QPoint &globalPos);
+    void openPlace(const QString &path, int line, int col, int endCol, bool remember = true);
+    void goBack();
+    void closeNav();
+    QUrlQuery symbolQuery(int line, int col) const;
 
     Api *m_api;
     QString m_repo;       // "<owner>/<repo>"
@@ -54,6 +65,12 @@ private:
     QString m_pendingLines;  // "L12" or "L12-L20" from the page URL, applied once that file opens
     bool m_signedIn = false;
     QJsonObject m_info;   // last /repos/<p>/<r> response
+    struct Place { QString path; int line; };
+    QList<Place> m_backStack;  // where "Back" returns to after jumping to a definition
+    QJsonObject m_pendingSpan; // {line, col, end_col} to select once the file being opened has loaded
+    int m_navSeq = 0;          // drops answers to lookups that were superseded
+    int m_hoverSeq = 0;
+    QList<QJsonObject> m_hoverCache;  // /symbol answers for the open file, reused while hovering
 
     QLabel *m_who;
     QPushButton *m_signIn;
@@ -67,6 +84,9 @@ private:
     QStackedWidget *m_filesStack;
     QTreeWidget *m_entries;
     CodeView *m_viewer;
+    QSplitter *m_fileSplit;
+    NavPanel *m_navPanel;
+    QComboBox *m_outline;
     CodeHighlighter *m_highlighter;
     QTreeWidget *m_commits;
     QWidget *m_settings;

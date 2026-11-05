@@ -2,6 +2,7 @@
 #include "api.h"
 #include "codeview.h"
 #include "highlighter.h"
+#include "navpanel.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -21,7 +22,10 @@
 #include <QProxyStyle>
 #include <QRegularExpression>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSignalBlocker>
+#include <QTextBlock>
+#include <QToolTip>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -55,6 +59,25 @@ QString splitLines(QString &hash)
         return {};
     hash.chop(m.capturedLength());
     return m.captured(1);
+}
+
+// The server counts columns in code points; QString indexes are UTF-16 units. They differ only after
+// characters outside the BMP (emoji and the like) earlier on the line.
+int toUtf16(const QString &text, int codePoints)
+{
+    int i = 0;
+    for (int n = 0; i < text.size() && n < codePoints; ++n)
+        i += (text[i].isHighSurrogate() && i + 1 < text.size()) ? 2 : 1;
+    return i;
+}
+
+int toCodePoints(const QString &text, int utf16)
+{
+    int n = 0;
+    for (int i = 0; i < utf16 && i < text.size(); ++i)
+        if (!text[i].isLowSurrogate())
+            ++n;
+    return n;
 }
 
 // Opens items on a single click, like links on the web (Enter still works too).
@@ -159,6 +182,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     row->addWidget(m_clone, 1);
     lay->addLayout(row);
     connect(m_ref, &QComboBox::textActivated, this, [this] {
+        closeNav();
         browse(QString());
         loadLog();
     });
@@ -176,7 +200,23 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_crumbs->setFixedHeight(m_crumbs->fontMetrics().lineSpacing() + 6);
     m_crumbs->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     connect(m_crumbs, &QLabel::linkActivated, this, [this](const QString &link) { browse(link.mid(1)); });
-    fl->addWidget(m_crumbs);
+    auto *crumbRow = new QHBoxLayout;
+    crumbRow->addWidget(m_crumbs, 1);
+    // The open file's outline: jump to any class/function in it.
+    m_outline = new QComboBox;
+    m_outline->setMinimumWidth(220);
+    m_outline->setMaximumWidth(360);
+    m_outline->setToolTip("Symbols in this file");
+    m_outline->setVisible(false);
+    crumbRow->addWidget(m_outline);
+    fl->addLayout(crumbRow);
+    connect(m_outline, &QComboBox::activated, this, [this](int i) {
+        const QJsonObject d = m_outline->itemData(i).toJsonObject();
+        if (!d.isEmpty())
+            openPlace(m_path, d.value("line").toInt(), d.value("col").toInt(), d.value("end_col").toInt());
+        const QSignalBlocker block(m_outline);
+        m_outline->setCurrentIndex(0);
+    });
     m_filesStack = new QStackedWidget;
     m_entries = new QTreeWidget;
     m_entries->setHeaderLabels({"Name", "Size"});
@@ -201,7 +241,24 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_highlighter = new CodeHighlighter(m_viewer->document());
-    m_filesStack->addWidget(m_viewer);
+    m_viewer->onWordClicked = [this](int line, int col, bool jump) { lookupSymbol(line, col, jump); };
+    m_viewer->onWordHover = [this](int line, int col, const QPoint &at) { hoverSymbol(line, col, at); };
+    m_viewer->onNavKey = [this](int line, int col, bool refs) { lookupSymbol(line, col, !refs); };
+    m_fileSplit = new QSplitter;
+    m_fileSplit->addWidget(m_viewer);
+    m_navPanel = new NavPanel;
+    m_navPanel->setVisible(false);
+    m_navPanel->onOpen = [this](const QString &path, int line, int col, int end) { openPlace(path, line, col, end); };
+    m_navPanel->onClose = [this] { closeNav(); };
+    m_navPanel->onBack = [this] { goBack(); };
+    m_fileSplit->addWidget(m_navPanel);
+    m_fileSplit->setStretchFactor(0, 3);
+    m_fileSplit->setStretchFactor(1, 1);
+    m_filesStack->addWidget(m_fileSplit);
+    auto *back = new QShortcut(QKeySequence(Qt::ALT | Qt::Key_Left), this);
+    connect(back, &QShortcut::activated, this, [this] { goBack(); });
+    auto *esc = new QShortcut(QKeySequence(Qt::Key_Escape), m_fileSplit);
+    connect(esc, &QShortcut::activated, this, [this] { closeNav(); });
     // Highlight colours follow the viewer: dark text-on-light or light-on-dark.
     syncHighlightTheme();  // and again on every palette change, see changeEvent()
     fl->addWidget(m_filesStack, 1);
@@ -419,6 +476,9 @@ void ForgeWindow::openRepo(const QString &repo)
     m_commits->clear();
     m_tabs->setTabText(1, "Commits");
     m_info = {};
+    m_backStack.clear();
+    m_navPanel->setBackEnabled(false);
+    closeNav();
     m_settings->setEnabled(false);
     status("Loading " + repo + "…");
     m_api->get(repoPath(repo), {}, this, [this, repo](const QJsonObject &info, const QString &error) {
@@ -502,6 +562,8 @@ void ForgeWindow::browse(const QString &path)
         status(QStringLiteral("%1 @ %2").arg(ref(), body.value("commit").toString().left(12)));
         if (isFile)
             return showFile(body);
+        m_outline->setVisible(false);
+        m_pendingSpan = {};
         m_entries->clear();
         for (const auto &v : body.value("entries").toArray()) {
             const QJsonObject e = v.toObject();
@@ -537,6 +599,11 @@ void ForgeWindow::changeEvent(QEvent *event)
 void ForgeWindow::showFile(const QJsonObject &file)
 {
     QString lang;
+    m_viewer->setNavEnabled(false);
+    m_hoverCache.clear();
+    m_outline->setVisible(false);
+    ++m_hoverSeq;
+    QToolTip::hideText();
     if (file.value("binary").toBool()) {
         m_highlighter->setFileName(QString());
         m_viewer->setPlainText(QStringLiteral("(binary file, %1)").arg(humanSize(file.value("size").toInteger())));
@@ -560,12 +627,205 @@ void ForgeWindow::showFile(const QJsonObject &file)
         const int first = ends.value(0).mid(1).toInt();
         const QString lastStr = ends.value(1);
         const int last = lastStr.isEmpty() ? first : lastStr.mid(lastStr.startsWith('L') ? 1 : 0).toInt();
-        QTimer::singleShot(0, this, [this, first, last] {
+        const QJsonObject span = std::exchange(m_pendingSpan, QJsonObject());
+        QTimer::singleShot(0, this, [this, first, last, span] {
             m_viewer->setMarkedLines(first, last, true);
+            if (span.value("line").toInt() == first) {  // arrived from a definition/reference: select the name
+                const QString text = m_viewer->document()->findBlockByNumber(first - 1).text();
+                m_viewer->revealSpan(first, toUtf16(text, span.value("col").toInt()),
+                                     toUtf16(text, span.value("end_col").toInt()));
+            }
             updateHash();
         });
     }
+    m_pendingSpan = {};
     m_filesStack->setCurrentIndex(1);
+    if (!file.value("binary").toBool())
+        loadOutline();
+}
+
+QUrlQuery ForgeWindow::symbolQuery(int line, int col) const
+{
+    QUrlQuery q;
+    q.addQueryItem("ref", ref());
+    q.addQueryItem("path", m_path);
+    q.addQueryItem("line", QString::number(line));
+    const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
+    q.addQueryItem("col", QString::number(toCodePoints(text, col)));
+    return q;
+}
+
+void ForgeWindow::loadOutline()
+{
+    const QString repo = m_repo, path = m_path;
+    QUrlQuery q;
+    q.addQueryItem("ref", ref());
+    q.addQueryItem("path", path);
+    m_api->get(repoPath(repo) + "/symbols", q, this, [this, repo, path](const QJsonObject &body, const QString &error) {
+        if (repo != m_repo || path != m_path || m_filesStack->currentIndex() != 1)
+            return;
+        if (!error.isEmpty() || !body.value("supported").toBool())
+            return;  // no code navigation for this file type: the viewer stays a plain viewer
+        m_viewer->setNavEnabled(true);
+        m_viewer->setToolTip(QString());
+        const QJsonArray syms = body.value("symbols").toArray();
+        const QSignalBlocker block(m_outline);
+        m_outline->clear();
+        m_outline->addItem(syms.isEmpty() ? QStringLiteral("No symbols") : QStringLiteral("Symbols (%1)").arg(syms.size()));
+        for (const auto &v : syms) {
+            const QJsonObject d = v.toObject();
+            const QString container = d.value("container").toString();
+            const QString label = (container.isEmpty() ? QString() : QStringLiteral("    "))
+                + d.value("kind").toString() + " " + d.value("name").toString();
+            m_outline->addItem(label, d);
+            m_outline->setItemData(m_outline->count() - 1, d.value("signature").toString(), Qt::ToolTipRole);
+        }
+        m_outline->setVisible(true);
+        status(m_status->text() + " · click a name to see its definition and references (Ctrl+click jumps)");
+    });
+}
+
+void ForgeWindow::lookupSymbol(int line, int col, bool jump)
+{
+    const QString repo = m_repo, path = m_path;
+    const int seq = ++m_navSeq;
+    QToolTip::hideText();
+    const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
+    int s = col, e = col;
+    while (s > 0 && (text[s - 1].isLetterOrNumber() || text[s - 1] == '_' || text[s - 1] == '$'))
+        --s;
+    while (e < text.size() && (text[e].isLetterOrNumber() || text[e] == '_' || text[e] == '$'))
+        ++e;
+    if (!jump) {
+        m_navPanel->setVisible(true);
+        m_navPanel->setLoading(text.mid(s, e - s));
+    }
+    status("Looking up " + text.mid(s, e - s) + "…");
+    m_api->get(repoPath(repo) + "/symbol", symbolQuery(line, col), this,
+               [this, repo, path, seq, jump](const QJsonObject &r, const QString &error) {
+        if (repo != m_repo || path != m_path || seq != m_navSeq)
+            return;
+        if (!error.isEmpty()) {
+            m_navPanel->setError(error);
+            return status("Lookup failed: " + error, true);
+        }
+        if (r.value("symbol").isNull()) {
+            if (!jump)
+                closeNav();
+            return status("Nothing to look up there.");
+        }
+        const QString name = r.value("symbol").toObject().value("name").toString();
+        const QJsonArray defs = r.value("definitions").toArray();
+        const QJsonArray refs = r.value("references").toArray();
+        // Underline the symbol everywhere it occurs in this file.
+        QList<CodeView::Span> spans;
+        for (const auto &v : refs) {
+            const QJsonObject o = v.toObject();
+            if (o.value("path").toString() != path)
+                continue;
+            const int ln = o.value("line").toInt();
+            const QString t = m_viewer->document()->findBlockByNumber(ln - 1).text();
+            spans.append({ln, toUtf16(t, o.value("col").toInt()), toUtf16(t, o.value("end_col").toInt())});
+        }
+        m_viewer->setSymbolMarks(spans);
+        const QJsonObject sym = r.value("symbol").toObject();
+        const QJsonObject first = defs.isEmpty() ? QJsonObject() : defs.first().toObject();
+        const bool onDefinition = !first.isEmpty() && first.value("path").toString() == path
+            && first.value("line").toInt() == sym.value("line").toInt() && first.value("col").toInt() == sym.value("col").toInt();
+        if (jump && !first.isEmpty() && !onDefinition) {
+            status(QStringLiteral("%1 → %2:%3").arg(name, first.value("path").toString()).arg(first.value("line").toInt()));
+            return openPlace(first.value("path").toString(), first.value("line").toInt(), first.value("col").toInt(),
+                             first.value("end_col").toInt());
+        }
+        m_navPanel->setVisible(true);
+        m_navPanel->setResult(r);
+        if (m_fileSplit->sizes().value(1) < 120)
+            m_fileSplit->setSizes({std::max(300, m_fileSplit->width() * 2 / 3), std::max(240, m_fileSplit->width() / 3)});
+        status(QStringLiteral("%1: %2 definition(s), %3 reference(s)")
+                   .arg(name).arg(defs.size()).arg(r.value("reference_count").toInt(refs.size())));
+    });
+}
+
+void ForgeWindow::hoverSymbol(int line, int col, const QPoint &globalPos)
+{
+    const auto show = [this, globalPos](const QJsonObject &r) {
+        const QJsonArray defs = r.value("definitions").toArray();
+        if (defs.isEmpty())
+            return;
+        const QJsonObject d = defs.first().toObject();
+        QString html = "<pre style='margin:0'>" + d.value("signature").toString().toHtmlEscaped() + "</pre>";
+        const QString doc = d.value("doc").toString();
+        if (!doc.isEmpty()) {
+            QString shortDoc = doc.left(800);
+            if (shortDoc.size() < doc.size())
+                shortDoc += "…";
+            html += "<p style='white-space:pre-wrap; margin-top:6px'>" + shortDoc.toHtmlEscaped() + "</p>";
+        }
+        QString where = QStringLiteral("%1:%2").arg(d.value("path").toString()).arg(d.value("line").toInt());
+        if (defs.size() > 1)
+            where += QStringLiteral(" · and %1 more").arg(defs.size() - 1);
+        html += "<p style='margin-top:6px'><i>" + where.toHtmlEscaped() + "</i> &nbsp;·&nbsp; click for references</p>";
+        QToolTip::showText(globalPos, html, m_viewer);
+    };
+    const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
+    const int cp = toCodePoints(text, col);
+    for (const QJsonObject &r : std::as_const(m_hoverCache)) {
+        const QJsonObject s = r.value("symbol").toObject();
+        if (s.value("line").toInt() == line && s.value("col").toInt() <= cp && cp < s.value("end_col").toInt())
+            return show(r);
+    }
+    const QString repo = m_repo, path = m_path;
+    const int seq = ++m_hoverSeq;
+    QUrlQuery q = symbolQuery(line, col);
+    q.addQueryItem("references", "false");
+    m_api->get(repoPath(repo) + "/symbol", q, this, [this, repo, path, seq, show](const QJsonObject &r, const QString &error) {
+        if (!error.isEmpty() || repo != m_repo || path != m_path || r.value("symbol").isNull())
+            return;
+        if (m_hoverCache.size() > 200)
+            m_hoverCache.clear();
+        m_hoverCache.append(r);
+        if (seq == m_hoverSeq && m_viewer->underMouse())
+            show(r);
+    });
+}
+
+void ForgeWindow::openPlace(const QString &path, int line, int col, int endCol, bool remember)
+{
+    if (remember && !m_path.isEmpty() && m_filesStack->currentIndex() == 1) {
+        m_backStack.append({m_path, m_viewer->textCursor().blockNumber() + 1});
+        if (m_backStack.size() > 100)
+            m_backStack.removeFirst();
+        m_navPanel->setBackEnabled(true);
+    }
+    if (path == m_path && m_filesStack->currentIndex() == 1) {
+        m_viewer->setMarkedLines(line, line, false);
+        const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
+        if (endCol > col)
+            m_viewer->revealSpan(line, toUtf16(text, col), toUtf16(text, endCol));
+        else
+            m_viewer->setMarkedLines(line, line, true);
+        updateHash();
+        return;
+    }
+    m_pendingLines = QStringLiteral("L%1").arg(line);
+    m_pendingSpan = endCol > col ? QJsonObject{{"line", line}, {"col", col}, {"end_col", endCol}} : QJsonObject();
+    browse(path);
+}
+
+void ForgeWindow::goBack()
+{
+    if (m_backStack.isEmpty())
+        return;
+    const Place p = m_backStack.takeLast();
+    m_navPanel->setBackEnabled(!m_backStack.isEmpty());
+    openPlace(p.path, p.line, 0, 0, false);
+}
+
+void ForgeWindow::closeNav()
+{
+    ++m_navSeq;
+    m_navPanel->setVisible(false);
+    m_viewer->setSymbolMarks({});
 }
 
 void ForgeWindow::loadLog()

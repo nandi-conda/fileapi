@@ -10,3 +10,4 @@ repos/
 .pixi/
 ui/.toolchain/
 ui/build/
+aqtinstall.log
