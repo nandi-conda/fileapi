@@ -1,8 +1,9 @@
-// Small client for fileapi's read-only forge JSON API (/api/forge/...).
+// Small client for fileapi's forge JSON API (/api/forge/...).
 #pragma once
 
 #include <QJsonObject>
 #include <QNetworkAccessManager>
+#include <QNetworkRequest>
 #include <QObject>
 #include <QUrlQuery>
 #include <functional>
@@ -20,6 +21,8 @@ public:
 
     // GET <base>/api/forge/<path>?<query>; `error` is empty on success.
     void get(const QString &path, const QUrlQuery &query, QObject *context, Callback done);
+    // PATCH/DELETE/... <base>/api/forge/<path> with an optional JSON body.
+    void send(const QByteArray &method, const QString &path, const QJsonObject &body, QObject *context, Callback done);
 
     // Hand-offs to the page's JavaScript (index.html), which runs the OAuth sign-in.
     void signIn();
@@ -30,6 +33,9 @@ public:
     void setLocationHash(const QString &hash);
 
 private:
+    QNetworkRequest request(const QString &path, const QUrlQuery &query = {}) const;
+    void finish(QNetworkReply *reply, QObject *context, Callback done);
+
     QNetworkAccessManager m_net;
     QString m_base;
 };

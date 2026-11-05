@@ -42,6 +42,13 @@ class MoveBody(BaseModel):
     overwrite: bool = False
 
 
+class RepoSettingsBody(BaseModel):
+    description: str | None = None
+    default_branch: str | None = None
+    public: bool | None = None
+    name: str | None = None  # new "<project>/<repo>" (or just "<repo>" to keep the project)
+
+
 def _request_token(request: Request) -> str | None:
     scheme, _, value = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() == "bearer" and value.strip():
@@ -316,6 +323,33 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_log(request: Request, project: str, repo: str, ref: str = "HEAD", path: str | None = None,
                   limit: int = Query(50, ge=1, le=200)):
         return {"commits": forge.log(forge_repo(request, project, repo), ref, path, limit)}
+
+    # Repo settings (signed-in admin only; the only identity that can sign in is the admin).
+    def forge_admin(request: Request) -> None:
+        if not forge_viewer(request):
+            raise HTTPException(401, "Sign in to change repo settings", headers={"WWW-Authenticate": "Bearer"})
+
+    @app.patch("/api/forge/repos/{project}/{repo}", tags=["forge"])
+    def forge_update_repo(request: Request, project: str, repo: str, body: RepoSettingsBody):
+        forge_admin(request)
+        full = "/".join(split_repo(f"{project}/{repo}"))
+        forge.open(full).close()  # 404 before changing anything
+        if body.default_branch is not None:
+            forge.set_default_branch(full, body.default_branch.strip())
+        if body.description is not None:
+            forge.set_description(full, body.description)
+        if body.public is not None:
+            forge.set_public(full, body.public)
+        if body.name:
+            new = body.name.strip().strip("/")
+            full = forge.rename(full, new if "/" in new else f"{full.split('/')[0]}/{new}")
+        return forge_repo_info(request, *full.split("/"))
+
+    @app.delete("/api/forge/repos/{project}/{repo}", tags=["forge"], status_code=204)
+    def forge_delete_repo(request: Request, project: str, repo: str):
+        forge_admin(request)
+        forge.delete(f"{project}/{repo}")
+        return Response(status_code=204)
 
     # ---- Web UI (Qt for WebAssembly build in fileapi/static/forge) --------
     ui_dir = Path(__file__).parent / "static" / "forge"

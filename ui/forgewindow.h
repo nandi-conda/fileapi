@@ -4,6 +4,7 @@
 #include <QMainWindow>
 
 class Api;
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -27,6 +28,10 @@ private:
     void browse(const QString &path);
     void loadLog();
     void showFile(const QJsonObject &file);
+    QWidget *buildSettings();
+    void fillSettings(const QJsonObject &info);
+    void saveSettings();
+    void deleteRepo();
     void setBreadcrumb(const QString &path, bool isFile);
     void updateHash();
     void status(const QString &text, bool error = false);
@@ -36,6 +41,8 @@ private:
     QString m_repo;       // "<project>/<repo>"
     QString m_path;       // current path inside the repo
     QString m_pendingPath;
+    bool m_signedIn = false;
+    QJsonObject m_info;   // last /repos/<p>/<r> response
 
     QLabel *m_who;
     QPushButton *m_signIn;
@@ -50,6 +57,14 @@ private:
     QTreeWidget *m_entries;
     QPlainTextEdit *m_viewer;
     QTreeWidget *m_commits;
+    QWidget *m_settings;
+    QCheckBox *m_public;
+    QLineEdit *m_editDesc;
+    QComboBox *m_defaultBranch;
+    QLineEdit *m_editName;
+    QPushButton *m_save;
+    QLineEdit *m_confirmDelete;
+    QPushButton *m_delete;
     QStackedWidget *m_main;
     QLabel *m_status;
 };

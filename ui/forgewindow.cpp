@@ -1,12 +1,16 @@
 #include "forgewindow.h"
 #include "api.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QFontDatabase>
+#include <QFormLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
+#include <QJsonValue>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -158,6 +162,9 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
             && (m_commits->topLevelItemCount() == 0 || m_tabs->tabText(1).endsWith("(error)")))
             loadLog();
     });
+    m_settings = buildSettings();
+    m_tabs->addTab(m_settings, "Settings");
+    m_tabs->setTabVisible(2, false);  // only the signed-in admin can change settings
     lay->addWidget(m_tabs, 1);
     m_main->addWidget(repoView);
     split->addWidget(m_main);
@@ -192,6 +199,8 @@ void ForgeWindow::loadMe()
         m_who->setText(in ? "Signed in as " + admin : "Public repos only");
         m_signIn->setText(in ? "Sign out" : "Sign in");
         m_signIn->setToolTip(in ? QString() : "Only " + admin + " can sign in, to see private repos.");
+        m_signedIn = in;
+        m_tabs->setTabVisible(2, in);
     });
 }
 
@@ -237,12 +246,16 @@ void ForgeWindow::openRepo(const QString &repo)
     m_entries->clear();
     m_commits->clear();
     m_tabs->setTabText(1, "Commits");
+    m_info = {};
+    m_settings->setEnabled(false);
     status("Loading " + repo + "…");
     m_api->get(repoPath(repo), {}, this, [this, repo](const QJsonObject &info, const QString &error) {
         if (repo != m_repo)
             return;
         if (!error.isEmpty())
             return status(error, true);
+        m_info = info;
+        fillSettings(info);
         const QString desc = info.value("description").toString();
         m_desc->setText(desc.isEmpty() ? QString() : desc);
         m_desc->setVisible(!desc.isEmpty());
@@ -377,4 +390,134 @@ void ForgeWindow::loadLog()
 void ForgeWindow::updateHash()
 {
     m_api->setLocationHash(m_repo + (m_path.isEmpty() ? "" : "/" + m_path));
+}
+
+QWidget *ForgeWindow::buildSettings()
+{
+    auto *page = new QWidget;
+    auto *lay = new QVBoxLayout(page);
+    lay->setContentsMargins(8, 8, 8, 8);
+
+    auto *general = new QGroupBox("General");
+    auto *form = new QFormLayout(general);
+    m_editName = new QLineEdit;
+    m_editName->setPlaceholderText("project/repo");
+    m_editName->setToolTip("Renaming changes the clone URL; old URLs stop working.");
+    form->addRow("Name:", m_editName);
+    m_editDesc = new QLineEdit;
+    m_editDesc->setPlaceholderText("A short description");
+    form->addRow("Description:", m_editDesc);
+    m_defaultBranch = new QComboBox;
+    m_defaultBranch->setMinimumWidth(160);
+    form->addRow("Default branch:", m_defaultBranch);
+    m_public = new QCheckBox("Public: anyone can browse and clone it without signing in");
+    form->addRow("Visibility:", m_public);
+    m_save = new QPushButton("Save changes");
+    m_save->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
+    auto *saveRow = new QHBoxLayout;
+    saveRow->addStretch(1);
+    saveRow->addWidget(m_save);
+    form->addRow(saveRow);
+    lay->addWidget(general);
+    connect(m_save, &QPushButton::clicked, this, &ForgeWindow::saveSettings);
+    connect(m_editName, &QLineEdit::returnPressed, this, &ForgeWindow::saveSettings);
+    connect(m_editDesc, &QLineEdit::returnPressed, this, &ForgeWindow::saveSettings);
+
+    // No modal dialogs: they need a nested event loop, which Qt for WebAssembly can't run.
+    auto *danger = new QGroupBox("Delete repository");
+    danger->setStyleSheet("QGroupBox { color: #c62828; }");
+    auto *dl = new QVBoxLayout(danger);
+    auto *warn = new QLabel("This deletes the repository and all of its history. It can't be undone. "
+                            "Type the repository's full name to confirm.");
+    warn->setWordWrap(true);
+    dl->addWidget(warn);
+    auto *delRow = new QHBoxLayout;
+    m_confirmDelete = new QLineEdit;
+    delRow->addWidget(m_confirmDelete, 1);
+    m_delete = new QPushButton("Delete");
+    m_delete->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    m_delete->setEnabled(false);
+    delRow->addWidget(m_delete);
+    dl->addLayout(delRow);
+    lay->addWidget(danger);
+    lay->addStretch(1);
+    connect(m_confirmDelete, &QLineEdit::textChanged, this, [this](const QString &t) {
+        m_delete->setEnabled(!m_repo.isEmpty() && t.trimmed() == m_repo);
+    });
+    connect(m_delete, &QPushButton::clicked, this, &ForgeWindow::deleteRepo);
+    page->setEnabled(false);
+    return page;
+}
+
+void ForgeWindow::fillSettings(const QJsonObject &info)
+{
+    m_editName->setText(info.value("repo").toString());
+    m_editDesc->setText(info.value("description").toString());
+    m_public->setChecked(info.value("public").toBool());
+    m_defaultBranch->clear();
+    const QString def = info.value("default").toString();
+    const QStringList branches = info.value("branches").toObject().keys();
+    for (const QString &b : branches)
+        m_defaultBranch->addItem(b);
+    if (!def.isEmpty() && !branches.contains(def))
+        m_defaultBranch->addItem(def);  // empty repo: HEAD names the branch the first push will create
+    m_defaultBranch->setCurrentText(def);
+    m_defaultBranch->setEnabled(m_defaultBranch->count() > 1);
+    m_confirmDelete->clear();
+    m_confirmDelete->setPlaceholderText(info.value("repo").toString());
+    m_settings->setEnabled(true);
+}
+
+void ForgeWindow::saveSettings()
+{
+    if (m_repo.isEmpty() || m_info.isEmpty())
+        return;
+    QJsonObject body;
+    const QString name = m_editName->text().trimmed();
+    if (!name.isEmpty() && name != m_repo)
+        body["name"] = name;
+    if (m_editDesc->text().trimmed() != m_info.value("description").toString())
+        body["description"] = m_editDesc->text().trimmed();
+    if (m_public->isChecked() != m_info.value("public").toBool())
+        body["public"] = m_public->isChecked();
+    const QString branch = m_defaultBranch->currentText();
+    if (!branch.isEmpty() && branch != m_info.value("default").toString())
+        body["default_branch"] = branch;
+    if (body.isEmpty())
+        return status("Nothing to save.");
+    const QString repo = m_repo;
+    m_save->setEnabled(false);
+    status("Saving settings…");
+    m_api->send("PATCH", repoPath(repo), body, this, [this, repo](const QJsonObject &info, const QString &error) {
+        m_save->setEnabled(true);
+        if (!error.isEmpty())
+            return status("Could not save settings: " + error, true);
+        const QString now = info.value("repo").toString();
+        m_pendingPath = m_path;
+        m_api->setLocationHash(now + (m_path.isEmpty() ? "" : "/" + m_path));
+        m_repo.clear();  // reopen (as the new name, if renamed) once the list reloads
+        loadRepos();
+        status("Settings saved.");
+    });
+}
+
+void ForgeWindow::deleteRepo()
+{
+    const QString repo = m_repo;
+    if (repo.isEmpty() || m_confirmDelete->text().trimmed() != repo)
+        return;
+    m_delete->setEnabled(false);
+    status("Deleting " + repo + "…");
+    m_api->send("DELETE", repoPath(repo), {}, this, [this, repo](const QJsonObject &, const QString &error) {
+        if (!error.isEmpty()) {
+            m_delete->setEnabled(true);
+            return status("Could not delete " + repo + ": " + error, true);
+        }
+        m_repo.clear();
+        m_api->setLocationHash(QString());
+        m_main->setCurrentIndex(0);
+        m_tabs->setCurrentIndex(0);
+        loadRepos();
+        status("Deleted " + repo + ".");
+    });
 }

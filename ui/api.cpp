@@ -35,7 +35,7 @@ QString Api::token() const
 #endif
 }
 
-void Api::get(const QString &path, const QUrlQuery &query, QObject *context, Callback done)
+QNetworkRequest Api::request(const QString &path, const QUrlQuery &query) const
 {
     QUrl url(m_base + "/api/forge/" + path);
     url.setQuery(query);
@@ -44,7 +44,27 @@ void Api::get(const QString &path, const QUrlQuery &query, QObject *context, Cal
     const QString t = token();
     if (!t.isEmpty())
         req.setRawHeader("Authorization", "Bearer " + t.toUtf8());
-    QNetworkReply *reply = m_net.get(req);
+    return req;
+}
+
+void Api::get(const QString &path, const QUrlQuery &query, QObject *context, Callback done)
+{
+    finish(m_net.get(request(path, query)), context, done);
+}
+
+void Api::send(const QByteArray &method, const QString &path, const QJsonObject &body, QObject *context, Callback done)
+{
+    QNetworkRequest req = request(path);
+    QByteArray data;
+    if (!body.isEmpty()) {
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        data = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
+    finish(m_net.sendCustomRequest(req, method, data), context, done);
+}
+
+void Api::finish(QNetworkReply *reply, QObject *context, Callback done)
+{
     connect(reply, &QNetworkReply::finished, context, [reply, done]() {
         reply->deleteLater();
         const QByteArray data = reply->readAll();

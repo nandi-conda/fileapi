@@ -524,6 +524,26 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert client.get("/api/forge/repos/web/secret", headers=AUTH).json()["branches"] == {}
         assert client.get("/api/forge/repos/web/secret/tree", headers=AUTH).status_code == 404  # empty repo
 
+        # Settings: admin only.
+        url = "/api/forge/repos/web/site"
+        assert client.patch(url, json={"public": False}).status_code == 401
+        assert client.delete(url).status_code == 401
+        forge.commit_files("web/site", "dev", {"x": "y\n"}, "dev")
+        r = client.patch(url, headers=AUTH, json={"public": False, "description": " New ", "default_branch": "dev"})
+        assert r.status_code == 200, r.text
+        assert (r.json()["public"], r.json()["description"], r.json()["default"]) == (False, "New", "dev")
+        assert client.patch(url, headers=AUTH, json={"default_branch": "nope"}).status_code == 404
+        assert client.patch(url, headers=AUTH, json={"name": "secret"}).status_code == 409
+        r = client.patch(url, headers=AUTH, json={"name": "blog"})
+        assert r.json()["repo"] == "web/blog" and r.json()["default"] == "dev" and r.json()["description"] == "New"
+        assert client.get(url, headers=AUTH).status_code == 404
+        r = client.patch("/api/forge/repos/web/blog", headers=AUTH, json={"name": "docs/site", "default_branch": "main"})
+        assert r.json()["repo"] == "docs/site" and r.json()["default"] == "main"
+        assert len(client.get("/api/forge/repos/docs/site/commits", headers=AUTH).json()["commits"]) == 2
+        assert client.patch("/api/forge/repos/web/secret", headers=AUTH, json={"default_branch": "trunk"}).json()["default"] == "trunk"
+        assert client.delete("/api/forge/repos/docs/site", headers=AUTH).status_code == 204
+        assert client.get("/api/forge/repos/docs/site", headers=AUTH).status_code == 404
+
         # The committed Qt for WebAssembly build is served from /forge/.
         r = client.get("/forge", follow_redirects=False)
         assert r.status_code == 307 and r.headers["location"] == "/forge/"

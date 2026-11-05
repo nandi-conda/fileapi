@@ -324,6 +324,23 @@ class PgForgeStore:
         if cur.rowcount == 0:
             raise NotFound(f"No such repo: {project}/{name}")
 
+    def set_description(self, project: str, name: str, description: str) -> None:
+        with self.pool.connection() as c:
+            cur = c.execute("UPDATE fileapi_git_repos SET description = %s WHERE project = %s AND name = %s",
+                            (description, project, name))
+        if cur.rowcount == 0:
+            raise NotFound(f"No such repo: {project}/{name}")
+
+    def rename(self, project: str, name: str, new_project: str, new_name: str) -> None:
+        with self.pool.connection() as c:
+            if c.execute("SELECT 1 FROM fileapi_git_repos WHERE project = %s AND name = %s",
+                         (new_project, new_name)).fetchone():
+                raise Conflict(f"Repo already exists: {new_project}/{new_name}")
+            cur = c.execute("UPDATE fileapi_git_repos SET project = %s, name = %s WHERE project = %s AND name = %s",
+                            (new_project, new_name, project, name))
+        if cur.rowcount == 0:
+            raise NotFound(f"No such repo: {project}/{name}")
+
     def is_public(self, project: str, name: str) -> bool:
         with self.pool.connection() as c:
             row = c.execute("SELECT public FROM fileapi_git_repos WHERE project = %s AND name = %s",
@@ -395,6 +412,23 @@ class DiskForgeStore:
         marker = path / "git-daemon-export-ok"
         marker.touch() if public else marker.unlink(missing_ok=True)
 
+    def set_description(self, project: str, name: str, description: str) -> None:
+        path = self._path(project, name)
+        if not path.is_dir():
+            raise NotFound(f"No such repo: {project}/{name}")
+        (path / "description").write_text(description + "\n")
+
+    def rename(self, project: str, name: str, new_project: str, new_name: str) -> None:
+        path, new = self._path(project, name), self._path(new_project, new_name)
+        if not path.is_dir():
+            raise NotFound(f"No such repo: {project}/{name}")
+        if new.exists():
+            raise Conflict(f"Repo already exists: {new_project}/{new_name}")
+        new.parent.mkdir(parents=True, exist_ok=True)
+        path.rename(new)
+        if not any(path.parent.iterdir()):
+            path.parent.rmdir()
+
     def is_public(self, project: str, name: str) -> bool:
         return (self._path(project, name) / "git-daemon-export-ok").exists()
 
@@ -448,6 +482,27 @@ class Forge:
 
     def is_public(self, repo: str) -> bool:
         return self.store.is_public(*split_repo(repo))
+
+    def set_description(self, repo: str, description: str) -> None:
+        self.store.set_description(*split_repo(repo), description.strip())
+
+    def rename(self, repo: str, new_repo: str) -> str:
+        old, new = split_repo(repo), split_repo(new_repo)
+        if old != new:
+            self.store.rename(*old, *new)
+        return "/".join(new)
+
+    def set_default_branch(self, repo: str, branch: str) -> None:
+        r = self.open(repo)
+        try:
+            heads = [k for k in r.refs.allkeys() if k.startswith(b"refs/heads/")]
+            if b"refs/heads/" + branch.encode() not in heads:
+                if heads:
+                    raise NotFound(f"No such branch: {branch}")
+                check_name("branch", branch)  # empty repo: any sane name, for the first push
+            r.refs.set_symbolic_ref(b"HEAD", b"refs/heads/" + branch.encode())
+        finally:
+            r.close()
 
     # -- smart HTTP -----------------------------------------------------------
     def advertise(self, repo: str, service: str) -> bytes:
