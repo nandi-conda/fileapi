@@ -100,7 +100,7 @@ It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) that reads a read-onl
 | `GET /api/forge/repos` | Repos the caller can see (public ones when anonymous) |
 | `GET /api/forge/repos/<project>/<repo>` | Description, visibility, default branch, branches, tags, clone URL |
 | `GET /api/forge/repos/<project>/<repo>/tree?ref=&path=` | A directory listing or a file's content |
-| `GET /api/forge/repos/<project>/<repo>/log?ref=&path=&limit=` | Recent commits |
+| `GET /api/forge/repos/<project>/<repo>/commits?ref=&path=&limit=` | Recent commits (also at `/log`, but ad blockers block that path) |
 
 Send `Authorization: Bearer <access token>` for private repos; to anonymous callers a private repo is a 404.
 The page signs in as a public OAuth client of fileapi itself (PKCE, redirect back to `/forge/`) and keeps the token in the browser's localStorage.

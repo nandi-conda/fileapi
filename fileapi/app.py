@@ -310,7 +310,9 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_tree(request: Request, project: str, repo: str, ref: str = "HEAD", path: str = ""):
         return forge.browse(forge_repo(request, project, repo), path, ref)
 
-    @app.get("/api/forge/repos/{project}/{repo}/log", tags=["forge"])
+    # "/commits", not "/log": ad blockers drop URLs ending in /log (tracking-beacon filter rules).
+    @app.get("/api/forge/repos/{project}/{repo}/commits", tags=["forge"])
+    @app.get("/api/forge/repos/{project}/{repo}/log", include_in_schema=False)  # old name, kept for clients
     def forge_log(request: Request, project: str, repo: str, ref: str = "HEAD", path: str | None = None,
                   limit: int = Query(50, ge=1, le=200)):
         return {"commits": forge.log(forge_repo(request, project, repo), ref, path, limit)}

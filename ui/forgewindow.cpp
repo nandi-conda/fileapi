@@ -341,7 +341,7 @@ void ForgeWindow::loadLog()
     q.addQueryItem("ref", ref());
     q.addQueryItem("limit", "100");
     m_tabs->setTabText(1, "Commits (loading…)");
-    m_api->get(repoPath(repo) + "/log", q, this, [this, repo](const QJsonObject &body, const QString &error) {
+    m_api->get(repoPath(repo) + "/commits", q, this, [this, repo](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
         m_commits->clear();

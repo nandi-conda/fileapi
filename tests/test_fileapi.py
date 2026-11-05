@@ -511,7 +511,8 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert f["type"] == "file" and f["content"] == "x = 2\n"
         old = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": "main~1"})
         assert old.status_code == 404  # only branch, tag or sha refs
-        log = client.get("/api/forge/repos/web/site/log").json()["commits"]
+        log = client.get("/api/forge/repos/web/site/commits").json()["commits"]
+        assert client.get("/api/forge/repos/web/site/log").json()["commits"] == log  # old name still works
         assert [c["message"] for c in log] == ["second", "first"]
         f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": log[1]["sha"]}).json()
         assert f["content"] == "x = 1\n"
