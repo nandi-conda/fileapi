@@ -153,6 +153,11 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         loadLog();
     });
     m_tabs->addTab(m_commits, "Commits");
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
+        if (i == 1 && !m_repo.isEmpty() && m_ref->count() > 0
+            && (m_commits->topLevelItemCount() == 0 || m_tabs->tabText(1).endsWith("(error)")))
+            loadLog();
+    });
     lay->addWidget(m_tabs, 1);
     m_main->addWidget(repoView);
     split->addWidget(m_main);
@@ -231,6 +236,7 @@ void ForgeWindow::openRepo(const QString &repo)
     m_ref->clear();
     m_entries->clear();
     m_commits->clear();
+    m_tabs->setTabText(1, "Commits");
     status("Loading " + repo + "…");
     m_api->get(repoPath(repo), {}, this, [this, repo](const QJsonObject &info, const QString &error) {
         if (repo != m_repo)
@@ -334,13 +340,22 @@ void ForgeWindow::loadLog()
     QUrlQuery q;
     q.addQueryItem("ref", ref());
     q.addQueryItem("limit", "100");
+    m_tabs->setTabText(1, "Commits (loading…)");
     m_api->get(repoPath(repo) + "/log", q, this, [this, repo](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
         m_commits->clear();
-        if (!error.isEmpty())
+        if (!error.isEmpty()) {
+            qWarning("forge: loading commits for %s failed: %s", qPrintable(repo), qPrintable(error));
+            auto *it = new QTreeWidgetItem(m_commits);
+            it->setText(0, "Could not load commits: " + error + " (open this tab again to retry)");
+            m_tabs->setTabText(1, "Commits (error)");
             return;
-        for (const auto &v : body.value("commits").toArray()) {
+        }
+        const QJsonArray commits = body.value("commits").toArray();
+        if (commits.isEmpty())
+            (new QTreeWidgetItem(m_commits))->setText(0, "No commits on " + ref());
+        for (const auto &v : commits) {
             const QJsonObject c = v.toObject();
             const QString msg = c.value("message").toString();
             QString author = c.value("author").toString();
@@ -355,7 +370,7 @@ void ForgeWindow::loadLog()
             it->setFont(3, QFontDatabase::systemFont(QFontDatabase::FixedFont));
             it->setData(0, ShaRole, c.value("sha").toString());
         }
-        m_tabs->setTabText(1, QStringLiteral("Commits (%1)").arg(m_commits->topLevelItemCount()));
+        m_tabs->setTabText(1, QStringLiteral("Commits (%1)").arg(commits.size()));
     });
 }
 
