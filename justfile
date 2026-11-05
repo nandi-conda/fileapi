@@ -85,8 +85,20 @@ login:
 link app_id="": login
     {{fastapi}} cloud link {{app_id}}
 
-# Deploy to FastAPI Cloud. Makes sure DATABASE_URL is set there first so state survives the deploy.
-deploy: login
+# git pull --ff-only, then deploy to FastAPI Cloud (ensures DATABASE_URL is set there first). deploy-only skips the pull.
+deploy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Pulling the latest code..."
+    if ! git pull --ff-only; then
+        echo "git pull couldn't fast-forward (local commits, or uncommitted changes in files the pull touches)." >&2
+        echo "Sort that out (git status), or run 'just deploy-only' to deploy what you have." >&2
+        exit 1
+    fi
+    just deploy-only
+
+# Deploy to FastAPI Cloud without pulling first
+deploy-only: login
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f .fastapicloud/cloud.json ]; then
