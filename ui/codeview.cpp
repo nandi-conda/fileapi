@@ -1,6 +1,8 @@
 #include "codeview.h"
 
+#include <QMouseEvent>
 #include <QPainter>
+#include <QScrollBar>
 #include <QTextBlock>
 
 namespace {
@@ -11,6 +13,7 @@ public:
 
 protected:
     void paintEvent(QPaintEvent *event) override { m_view->paintGutter(event); }
+    void mousePressEvent(QMouseEvent *event) override { m_view->gutterClicked(event); }
 
 private:
     CodeView *m_view;
@@ -24,6 +27,64 @@ CodeView::CodeView(QWidget *parent) : QPlainTextEdit(parent), m_gutter(new Gutte
     connect(this, &QPlainTextEdit::blockCountChanged, this, [this] { updateGutterWidth(); });
     connect(this, &QPlainTextEdit::updateRequest, this, [this](const QRect &r, int dy) { updateGutter(r, dy); });
     updateGutterWidth();
+    m_gutter->setCursor(Qt::PointingHandCursor);
+    m_gutter->setToolTip(QStringLiteral("Click a line number to link to it; shift-click to link a range"));
+}
+
+void CodeView::gutterClicked(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton)
+        return;
+    const int line = cursorForPosition(QPoint(0, int(event->position().y()))).blockNumber() + 1;
+    int first = line, last = line;
+    if ((event->modifiers() & Qt::ShiftModifier) && m_anchor > 0) {
+        first = std::min(m_anchor, line);
+        last = std::max(m_anchor, line);
+    } else {
+        m_anchor = line;
+    }
+    setMarkedLines(first, last, false);
+    if (onLinesClicked)
+        onLinesClicked(first, last);
+}
+
+void CodeView::setMarkedLines(int first, int last, bool scroll)
+{
+    const int count = blockCount();
+    if (first <= 0 || first > count) {
+        m_first = m_last = m_anchor = 0;
+    } else {
+        m_first = first;
+        m_last = std::clamp(std::max(first, last), first, count);
+        if (scroll) {
+            m_anchor = m_first;
+            // Put the first marked line about a third of the way down, like GitHub does.
+            QTextCursor c(document()->findBlockByNumber(m_first - 1));
+            setTextCursor(c);
+            const int lineH = fontMetrics().lineSpacing();
+            const int above = std::max(0, viewport()->height() / 3 / std::max(1, lineH));
+            verticalScrollBar()->setValue(std::max(0, m_first - 1 - above));
+        }
+    }
+    applyMarks();
+}
+
+void CodeView::applyMarks()
+{
+    QList<QTextEdit::ExtraSelection> marks;
+    if (m_first > 0) {
+        QColor bg = palette().color(QPalette::Highlight);
+        bg.setAlphaF(0.22f);
+        for (int n = m_first; n <= m_last; ++n) {
+            QTextEdit::ExtraSelection sel;
+            sel.cursor = QTextCursor(document()->findBlockByNumber(n - 1));
+            sel.format.setBackground(bg);
+            sel.format.setProperty(QTextFormat::FullWidthSelection, true);
+            marks.append(sel);
+        }
+    }
+    setExtraSelections(marks);
+    m_gutter->update();
 }
 
 int CodeView::gutterWidth() const
@@ -62,6 +123,8 @@ void CodeView::changeEvent(QEvent *event)
     QPlainTextEdit::changeEvent(event);
     if (event->type() == QEvent::FontChange)
         updateGutterWidth();
+    if (event->type() == QEvent::PaletteChange)
+        applyMarks();
 }
 
 void CodeView::paintGutter(QPaintEvent *event)
@@ -82,6 +145,14 @@ void CodeView::paintGutter(QPaintEvent *event)
     int bottom = top + qRound(blockBoundingRect(block).height());
     const int w = m_gutter->width() - GutterPad;
     while (block.isValid() && top <= event->rect().bottom()) {
+        const int n = block.blockNumber() + 1;
+        const bool marked = n >= m_first && n <= m_last && m_first > 0;
+        if (marked) {
+            QColor bg = pal.color(QPalette::Highlight);
+            bg.setAlphaF(0.35f);
+            p.fillRect(0, top, m_gutter->width(), bottom - top, bg);
+        }
+        p.setPen(marked ? pal.color(QPalette::Text) : num);
         if (block.isVisible() && bottom >= event->rect().top())
             p.drawText(0, top, w, fontMetrics().height(), Qt::AlignRight, QString::number(block.blockNumber() + 1));
         block = block.next();

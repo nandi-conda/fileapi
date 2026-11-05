@@ -19,6 +19,7 @@
 #include <QLocale>
 #include <QPlainTextEdit>
 #include <QProxyStyle>
+#include <QRegularExpression>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSplitter>
@@ -26,7 +27,9 @@
 #include <QStatusBar>
 #include <QStyle>
 #include <QStyleFactory>
+#include <QTabBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -42,6 +45,17 @@ QString humanSize(qint64 n)
 }
 
 QString repoPath(const QString &repo) { return "repos/" + repo; }
+
+// Splits a trailing "#L12" or "#L12-L20" (GitHub-style line link) off a location hash; returns "L12…" or "".
+QString splitLines(QString &hash)
+{
+    static const QRegularExpression re(QStringLiteral("#(L\\d+(?:-L?\\d+)?)$"));
+    const auto m = re.match(hash);
+    if (!m.hasMatch())
+        return {};
+    hash.chop(m.capturedLength());
+    return m.captured(1);
+}
 
 // Opens items on a single click, like links on the web (Enter still works too).
 class SingleClickStyle : public QProxyStyle {
@@ -121,9 +135,15 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     tf.setBold(true);
     m_title->setFont(tf);
     m_title->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    // The header keeps one fixed size while a repo loads, so nothing below it jumps: the description
+    // always takes exactly one line (cut off when long, full text in the tooltip), even when empty.
+    m_title->setFixedHeight(QFontMetrics(tf).lineSpacing() + 4);
+    m_title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     lay->addWidget(m_title);
     m_desc = new QLabel;
-    m_desc->setWordWrap(true);
+    m_desc->setWordWrap(false);
+    m_desc->setFixedHeight(m_desc->fontMetrics().lineSpacing() + 2);
+    m_desc->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     lay->addWidget(m_desc);
 
     auto *row = new QHBoxLayout;
@@ -144,12 +164,17 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     });
 
     m_tabs = new QTabWidget;
+    // Wide enough for "Commits (100)", so the tabs don't shift when the commit count arrives.
+    m_tabs->tabBar()->setStyleSheet(QStringLiteral("QTabBar::tab { min-width: %1px; }")
+                                        .arg(m_tabs->fontMetrics().horizontalAdvance("Commits (100)") + 8));
     // Files tab: breadcrumb, then either a directory listing or a file viewer.
     auto *files = new QWidget;
     auto *fl = new QVBoxLayout(files);
     fl->setContentsMargins(4, 4, 4, 4);
     m_crumbs = new QLabel;
     m_crumbs->setTextFormat(Qt::RichText);
+    m_crumbs->setFixedHeight(m_crumbs->fontMetrics().lineSpacing() + 6);
+    m_crumbs->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     connect(m_crumbs, &QLabel::linkActivated, this, [this](const QString &link) { browse(link.mid(1)); });
     fl->addWidget(m_crumbs);
     m_filesStack = new QStackedWidget;
@@ -171,6 +196,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     });
     m_filesStack->addWidget(m_entries);
     m_viewer = new CodeView;
+    m_viewer->onLinesClicked = [this](int, int) { updateHash(); };
     m_viewer->setReadOnly(true);
     m_viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
@@ -350,7 +376,8 @@ void ForgeWindow::loadRepos()
         }
         status(repos.isEmpty() ? "No repositories you can see yet." : QStringLiteral("%1 repositories").arg(repos.size()));
         // Restore #<owner>/<repo>[/path] from the page URL.
-        const QString hash = m_api->locationHash();
+        QString hash = m_api->locationHash();
+        const QString lines = splitLines(hash);
         const QStringList parts = hash.split('/', Qt::SkipEmptyParts);
         if (parts.size() >= 2) {
             const QString repo = parts[0] + "/" + parts[1];
@@ -364,12 +391,14 @@ void ForgeWindow::loadRepos()
                         break;
                     }
                     m_pendingPath = parts.mid(2).join('/');
+                    m_pendingLines = lines;
                     m_repos->setCurrentRow(i);
                 }
             // An old link (from before repos moved under their owner, or before a rename): the server
             // resolves the old name, and openRepo switches to the current one.
             if (!found && repo != m_repo) {
                 m_pendingPath = parts.mid(2).join('/');
+                m_pendingLines = lines;
                 openRepo(repo);
             }
         }
@@ -382,6 +411,8 @@ void ForgeWindow::openRepo(const QString &repo)
     m_main->setCurrentIndex(1);
     m_title->setText(repo);
     m_desc->clear();
+    m_desc->setToolTip(QString());
+    m_crumbs->setText(QStringLiteral("<b>%1</b>").arg(repo.section('/', 1).toHtmlEscaped()));
     m_clone->clear();
     m_ref->clear();
     m_entries->clear();
@@ -406,8 +437,8 @@ void ForgeWindow::openRepo(const QString &repo)
         m_info = info;
         fillSettings(info);
         const QString desc = info.value("description").toString();
-        m_desc->setText(desc.isEmpty() ? QString() : desc);
-        m_desc->setVisible(!desc.isEmpty());
+        m_desc->setText(desc);
+        m_desc->setToolTip(desc);
         m_title->setText(m_repo + (info.value("public").toBool() ? "" : "  (private)"));
         m_clone->setText("git clone " + info.value("clone_url").toString());
         const QString def = info.value("default").toString();
@@ -464,6 +495,9 @@ void ForgeWindow::browse(const QString &path)
         m_path = body.value("path").toString();
         const bool isFile = body.value("type").toString() == "file";
         setBreadcrumb(m_path, isFile);
+        m_viewer->setMarkedLines(0, 0, false);  // line marks belong to the file they were made in
+        if (!isFile)
+            m_pendingLines.clear();
         updateHash();
         status(QStringLiteral("%1 @ %2").arg(ref(), body.value("commit").toString().left(12)));
         if (isFile)
@@ -518,6 +552,20 @@ void ForgeWindow::showFile(const QJsonObject &file)
     if (!lang.isEmpty())
         m_status->setText(m_status->text() + " · " + lang);
     m_filesStack->setCurrentIndex(1);
+    // Line link from the URL (#L12 or #L12-L20): mark and scroll to it once the view has its size.
+    const QString lines = std::exchange(m_pendingLines, QString());
+    m_viewer->setMarkedLines(0, 0, false);
+    if (!lines.isEmpty()) {
+        const QStringList ends = lines.split('-');
+        const int first = ends.value(0).mid(1).toInt();
+        const QString lastStr = ends.value(1);
+        const int last = lastStr.isEmpty() ? first : lastStr.mid(lastStr.startsWith('L') ? 1 : 0).toInt();
+        QTimer::singleShot(0, this, [this, first, last] {
+            m_viewer->setMarkedLines(first, last, true);
+            updateHash();
+        });
+    }
+    m_filesStack->setCurrentIndex(1);
 }
 
 void ForgeWindow::loadLog()
@@ -526,7 +574,7 @@ void ForgeWindow::loadLog()
     QUrlQuery q;
     q.addQueryItem("ref", ref());
     q.addQueryItem("limit", "100");
-    m_tabs->setTabText(1, "Commits (loading…)");
+    m_tabs->setTabText(1, "Commits");
     m_api->get(repoPath(repo) + "/commits", q, this, [this, repo](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
@@ -562,7 +610,13 @@ void ForgeWindow::loadLog()
 
 void ForgeWindow::updateHash()
 {
-    m_api->setLocationHash(m_repo + (m_path.isEmpty() ? "" : "/" + m_path));
+    QString hash = m_repo + (m_path.isEmpty() ? "" : "/" + m_path);
+    if (m_filesStack->currentIndex() == 1 && m_viewer->markedFirst() > 0) {
+        hash += QStringLiteral("#L%1").arg(m_viewer->markedFirst());
+        if (m_viewer->markedLast() > m_viewer->markedFirst())
+            hash += QStringLiteral("-L%1").arg(m_viewer->markedLast());
+    }
+    m_api->setLocationHash(hash);
 }
 
 QWidget *ForgeWindow::buildSettings()

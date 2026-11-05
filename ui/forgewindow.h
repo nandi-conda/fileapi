@@ -5,6 +5,7 @@
 
 class Api;
 class CodeHighlighter;
+class CodeView;
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -50,6 +51,7 @@ private:
     QString m_owner;      // signed-in account's handle: the namespace new repos go into
     QString m_path;       // current path inside the repo
     QString m_pendingPath;
+    QString m_pendingLines;  // "L12" or "L12-L20" from the page URL, applied once that file opens
     bool m_signedIn = false;
     QJsonObject m_info;   // last /repos/<p>/<r> response
 
@@ -64,7 +66,7 @@ private:
     QLabel *m_crumbs;
     QStackedWidget *m_filesStack;
     QTreeWidget *m_entries;
-    QPlainTextEdit *m_viewer;
+    CodeView *m_viewer;
     CodeHighlighter *m_highlighter;
     QTreeWidget *m_commits;
     QWidget *m_settings;
