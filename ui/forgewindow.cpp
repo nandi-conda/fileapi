@@ -1,5 +1,6 @@
 #include "forgewindow.h"
 #include "api.h"
+#include "highlighter.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -152,7 +153,10 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_viewer->setReadOnly(true);
     m_viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    m_highlighter = new CodeHighlighter(m_viewer->document());
     m_filesStack->addWidget(m_viewer);
+    // Highlight colours follow the viewer: dark text-on-light or light-on-dark.
+    syncHighlightTheme();  // and again on every palette change, see changeEvent()
     fl->addWidget(m_filesStack, 1);
     m_tabs->addTab(files, "Files");
 
@@ -462,12 +466,36 @@ void ForgeWindow::browse(const QString &path)
     });
 }
 
+void ForgeWindow::syncHighlightTheme()
+{
+    // Highlight colours follow the viewer: dark-on-light or light-on-dark (the browser's colour scheme).
+    m_highlighter->setDark(m_viewer->palette().color(QPalette::Base).lightness() < 128);
+}
+
+void ForgeWindow::changeEvent(QEvent *event)
+{
+    QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange)
+        syncHighlightTheme();
+}
+
 void ForgeWindow::showFile(const QJsonObject &file)
 {
-    if (file.value("binary").toBool())
+    QString lang;
+    if (file.value("binary").toBool()) {
+        m_highlighter->setFileName(QString());
         m_viewer->setPlainText(QStringLiteral("(binary file, %1)").arg(humanSize(file.value("size").toInteger())));
-    else
-        m_viewer->setPlainText(file.value("content").toString());
+    } else {
+        const QString content = file.value("content").toString();
+        // Huge files stay plain: highlighting runs on the UI thread and would freeze the page.
+        constexpr qsizetype HighlightLimit = 1 << 20;
+        m_highlighter->setFileName(QString());
+        m_viewer->setPlainText(content);
+        if (content.size() <= HighlightLimit)
+            lang = m_highlighter->setFileName(file.value("path").toString());
+    }
+    if (!lang.isEmpty())
+        m_status->setText(m_status->text() + " · " + lang);
     m_filesStack->setCurrentIndex(1);
 }
 

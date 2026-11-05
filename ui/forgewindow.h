@@ -4,6 +4,7 @@
 #include <QMainWindow>
 
 class Api;
+class CodeHighlighter;
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -21,7 +22,11 @@ class ForgeWindow : public QMainWindow {
 public:
     explicit ForgeWindow(QWidget *parent = nullptr);
 
+protected:
+    void changeEvent(QEvent *event) override;
+
 private:
+    void syncHighlightTheme();
     void loadMe();
     void loadRepos();
     void openRepo(const QString &repo);
@@ -60,6 +65,7 @@ private:
     QStackedWidget *m_filesStack;
     QTreeWidget *m_entries;
     QPlainTextEdit *m_viewer;
+    CodeHighlighter *m_highlighter;
     QTreeWidget *m_commits;
     QWidget *m_settings;
     QCheckBox *m_public;
