@@ -1,5 +1,6 @@
 #include "forgewindow.h"
 #include "api.h"
+#include "codeview.h"
 #include "highlighter.h"
 
 #include <QCheckBox>
@@ -17,12 +18,14 @@
 #include <QListWidget>
 #include <QLocale>
 #include <QPlainTextEdit>
+#include <QProxyStyle>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QStyle>
+#include <QStyleFactory>
 #include <QTabWidget>
 #include <QToolBar>
 #include <QTreeWidget>
@@ -39,6 +42,18 @@ QString humanSize(qint64 n)
 }
 
 QString repoPath(const QString &repo) { return "repos/" + repo; }
+
+// Opens items on a single click, like links on the web (Enter still works too).
+class SingleClickStyle : public QProxyStyle {
+public:
+    using QProxyStyle::QProxyStyle;
+    int styleHint(StyleHint hint, const QStyleOption *opt, const QWidget *w, QStyleHintReturn *ret) const override
+    {
+        if (hint == SH_ItemView_ActivateItemOnSingleClick)
+            return 1;
+        return QProxyStyle::styleHint(hint, opt, w, ret);
+    }
+};
 }  // namespace
 
 ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(this))
@@ -142,6 +157,12 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_entries->setHeaderLabels({"Name", "Size"});
     m_entries->setRootIsDecorated(false);
     m_entries->setUniformRowHeights(true);
+    {
+        auto *single = new SingleClickStyle(QStyleFactory::create("Fusion"));
+        single->setParent(m_entries);
+        m_entries->setStyle(single);
+    }
+    m_entries->setCursor(Qt::PointingHandCursor);
     m_entries->header()->setStretchLastSection(false);
     m_entries->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_entries->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
@@ -149,7 +170,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         browse(it->data(0, PathRole).toString());
     });
     m_filesStack->addWidget(m_entries);
-    m_viewer = new QPlainTextEdit;
+    m_viewer = new CodeView;
     m_viewer->setReadOnly(true);
     m_viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));

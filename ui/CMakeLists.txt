@@ -8,7 +8,7 @@ set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
-qt_add_executable(forgeui main.cpp forgewindow.cpp forgewindow.h api.cpp api.h highlighter.cpp highlighter.h)
+qt_add_executable(forgeui main.cpp forgewindow.cpp forgewindow.h api.cpp api.h highlighter.cpp highlighter.h codeview.cpp codeview.h)
 target_link_libraries(forgeui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
 
 if(EMSCRIPTEN)
