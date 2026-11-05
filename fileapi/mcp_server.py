@@ -203,6 +203,8 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
         if res["type"] == "dir":
             rows = [e["name"] if e["size"] is None else f"{e['name']}\t{e['size']}B" for e in res["entries"]]
             return head + "\n" + ("\n".join(rows) or "(empty)")
+        if res.get("lfs"):
+            return head + f"\n(stored with Git LFS, {res['size']} bytes, sha256 {res['lfs']['oid']})"
         if res.get("binary"):
             return head + f"\n(binary file, {res['size']} bytes)"
         return res["content"]

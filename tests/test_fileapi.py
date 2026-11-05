@@ -3,6 +3,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import httpx
 import httpx2
@@ -42,7 +43,7 @@ def backend(request):
         import psycopg
 
         with psycopg.connect(PG_URL, autocommit=True) as c:
-            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_git_repos, fileapi_git_aliases")
+            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_git_repos, fileapi_git_aliases")
         return {"DATABASE_URL": PG_URL}
     return {}
 
@@ -776,3 +777,140 @@ def test_forge_code_navigation(tmp_path, backend):
         assert client.get(f"{base}/symbols", params={"path": "pkg"}).status_code == 404
         forge.create("web", "hidden")
         assert client.get("/api/forge/repos/web/hidden/symbols", params={"path": "a.py"}).status_code == 404
+
+
+# ---- Git LFS -------------------------------------------------------------------
+
+
+def test_lfs_batch_api(tmp_path, backend):
+    import hashlib
+
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("web", "site")
+        data = os.urandom(5000)
+        oid = hashlib.sha256(data).hexdigest()
+        batch = "/git/web/site.git/info/lfs/objects/batch"
+        hdr = {"Accept": "application/vnd.git-lfs+json", "Content-Type": "application/vnd.git-lfs+json"}
+        up = {"operation": "upload", "transfers": ["basic"], "objects": [{"oid": oid, "size": len(data)}]}
+
+        r = client.post(batch, json=up, headers=hdr)
+        assert r.status_code == 401 and r.headers["lfs-authenticate"].startswith("Basic")
+        r = client.post(batch, json=up, headers=hdr, auth=("x", TOKEN))
+        assert r.status_code == 200 and r.headers["content-type"].startswith("application/vnd.git-lfs+json")
+        action = r.json()["objects"][0]["actions"]["upload"]
+        assert action["href"].endswith(f"/git/web/site.git/info/lfs/objects/{oid}")
+        assert action["header"]["Authorization"].startswith("Basic ")
+
+        href = f"/git/web/site.git/info/lfs/objects/{oid}"
+        assert client.put(href, content=data).status_code == 401
+        assert client.put(href, content=data[:-1], headers=AUTH).status_code == 422  # wrong content
+        assert client.put(href, content=data, headers=AUTH).status_code == 200
+        assert client.put(href, content=data, headers=AUTH).status_code == 200  # idempotent
+        # Already stored: nothing to upload.
+        assert "actions" not in client.post(batch, json=up, headers={**hdr, **AUTH}).json()["objects"][0]
+
+        down = {"operation": "download", "objects": [{"oid": oid, "size": len(data)}, {"oid": "0" * 64, "size": 1},
+                                                      {"oid": "nope", "size": 1}]}
+        objs = client.post(batch, json=down, headers={**hdr, **AUTH}).json()["objects"]
+        assert "download" in objs[0]["actions"] and objs[1]["error"]["code"] == 404 and objs[2]["error"]["code"] == 422
+        r = client.get(href, headers=AUTH)
+        assert r.status_code == 200 and r.content == data
+        assert client.get(href).status_code == 401
+        assert client.get(f"/git/web/site.git/info/lfs/objects/{'0' * 64}", headers=AUTH).status_code == 404
+        assert client.get("/git/web/nope.git/info/lfs/objects/" + oid, headers=AUTH).status_code == 404
+        assert client.post("/git/web/site.git/info/lfs/locks/verify", json={}, headers=AUTH).json() == {"ours": [], "theirs": []}
+
+        # Public repos: anonymous download, but still no anonymous upload.
+        forge.set_public("web/site", True)
+        assert client.get(href).content == data
+        assert client.post(batch, json=up, headers=hdr).status_code == 401
+
+        # The pointer shows up as an LFS file when browsing; LFS objects go away with the repo.
+        pointer = f"version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {len(data)}\n"
+        forge.commit_files("web/site", "main", {"big.bin": pointer}, "big")
+        f = client.get("/api/forge/repos/web/site/tree", params={"path": "big.bin"}).json()
+        assert f["lfs"] == {"oid": oid, "size": len(data)} and f["size"] == len(data) and f["content"] is None
+        forge.rename("web/site", "web/renamed")
+        assert client.get(f"/git/web/renamed.git/info/lfs/objects/{oid}").content == data
+        forge.delete("web/renamed")
+        forge.create("web", "renamed")
+        assert client.app.state.forge.is_public("web/renamed") is False
+        assert client.get(f"/git/web/renamed.git/info/lfs/objects/{oid}", headers=AUTH).status_code == 404
+
+
+@pytest.mark.skipif(subprocess.run(["git", "lfs", "version"], capture_output=True).returncode != 0,
+                    reason="git-lfs not installed")
+def test_helper_moves_big_files_to_lfs(server_url, tmp_path):
+    """After `setup`, a clone of a fileapi repo commits files over the threshold as LFS pointers, and
+    git-lfs pushes and fetches their content through the server, authenticated by the helper."""
+    import json
+
+    r = httpx.post(f"{server_url}/api/forge/repos", json={"name": "media"}, headers=AUTH)
+    assert r.status_code == 201, r.text
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    helper = bindir / "git-credential-fileapi"
+    src = (Path(__file__).parent.parent / "fileapi" / "git_credential.py").read_text()
+    helper.write_text(src.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+    helper.chmod(0o755)
+    xdg = tmp_path / "xdg"
+    (xdg / "git-credential-fileapi").mkdir(parents=True)
+    # A signed-in helper: the preset server token stands in for the browser sign-in.
+    (xdg / "git-credential-fileapi" / "tokens.json").write_text(json.dumps(
+        {server_url: {"access_token": TOKEN, "expires_at": int(time.time()) + 86400}}))
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = T\n\temail = t@x\n")
+    env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_GLOBAL": str(gitconfig), "XDG_CONFIG_HOME": str(xdg), "HOME": str(tmp_path)}
+
+    def run(*args, cwd=None):
+        r = subprocess.run(args, env=env, cwd=cwd, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, f"{args}: {r.stdout}\n{r.stderr}"
+        return r
+
+    run("git-credential-fileapi", "setup", server_url)
+    assert "filter.lfs.clean" in run("git", "config", "--global", "--list").stdout
+    work = tmp_path / "media"
+    run("git", "clone", f"{server_url}/git/nandi.uk/media.git", str(work))
+    assert "git-credential-fileapi" in (work / ".git" / "hooks" / "pre-commit").read_text()
+    run("git", "config", "fileapi.lfsThreshold", "4k", cwd=work)
+
+    big = os.urandom(10_000)
+    (work / "notes.txt").write_text("small\n")
+    (work / "assets").mkdir()
+    (work / "assets" / "big file.bin").write_bytes(big)
+    run("git", "add", ".", cwd=work)
+    r = run("git", "commit", "-m", "add media", cwd=work)
+    assert "stored with Git LFS" in r.stderr and "assets/big file.bin" in r.stderr
+    attrs = (work / ".gitattributes").read_text()
+    assert "filter=lfs" in attrs and "notes.txt" not in attrs
+    blob = run("git", "cat-file", "-p", "HEAD:assets/big file.bin", cwd=work).stdout
+    assert blob.startswith("version https://git-lfs.github.com/spec/v1")
+    assert run("git", "cat-file", "-p", "HEAD:notes.txt", cwd=work).stdout == "small\n"
+    assert run("git", "status", "--porcelain", cwd=work).stdout == ""
+    run("git", "push", "origin", "HEAD:main", cwd=work)
+
+    # A fresh clone gets the real bytes back from the LFS store.
+    again = tmp_path / "again"
+    run("git", "clone", f"{server_url}/git/nandi.uk/media.git", str(again))
+    assert (again / "assets" / "big file.bin").read_bytes() == big
+
+    # Under the threshold, or turned off: normal blobs.
+    (work / "mid.bin").write_bytes(os.urandom(3000))
+    run("git", "add", "mid.bin", cwd=work)
+    assert "LFS" not in run("git", "commit", "-m", "mid", cwd=work).stderr
+    run("git", "config", "fileapi.autoLfs", "false", cwd=work)
+    (work / "off.bin").write_bytes(os.urandom(10_000))
+    run("git", "add", "off.bin", cwd=work)
+    run("git", "commit", "-m", "off", cwd=work)
+    assert run("git", "cat-file", "-s", "HEAD:off.bin", cwd=work).stdout.strip() == "10000"
+    assert "off.bin" not in (work / ".gitattributes").read_text()
+
+    # Repos without a fileapi remote are left alone.
+    other = tmp_path / "other"
+    run("git", "init", "-q", str(other))
+    (other / "big.bin").write_bytes(big)
+    run("git", "add", ".", cwd=other)
+    run("git", "-c", "fileapi.lfsThreshold=4k", "commit", "-m", "x", cwd=other)
+    assert not (other / ".gitattributes").exists()

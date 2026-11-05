@@ -36,6 +36,7 @@ from dulwich.refs import SYMREF, RefsContainer
 from dulwich.repo import BaseRepo, MemoryRepo, Repo
 from dulwich.server import Backend, ReceivePackHandler, UploadPackHandler
 
+from .lfs import parse_pointer
 from .storage import Conflict, NotFound, StorageError
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -708,6 +709,10 @@ class Forge:
                 entries.sort(key=lambda e: (not e["name"].endswith("/"), e["name"]))
                 return {**base, "type": "dir", "entries": entries}
             data = obj.as_raw_string()
+            pointer = parse_pointer(data)
+            if pointer:  # stored with Git LFS: the blob is a pointer, the content lives in the LFS store
+                return {**base, "type": "file", "size": pointer[1], "content": None, "binary": True,
+                        "lfs": {"oid": pointer[0], "size": pointer[1]}}
             try:
                 return {**base, "type": "file", "size": len(data), "content": data.decode()}
             except UnicodeDecodeError:

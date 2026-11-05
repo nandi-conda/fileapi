@@ -16,11 +16,13 @@ from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response,
+                               StreamingResponse)
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name
+from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name, split_repo
+from .lfs import DiskLfsStore, PgLfsStore, Spool, check_oid
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
 from . import auth as oauth
@@ -97,6 +99,7 @@ def create_app(
         storage.init()
         kv = PostgresKV(storage)
         forge = Forge(PgForgeStore(storage.pool))
+        lfs = PgLfsStore(storage.pool)
     else:
         storage = Storage(root)
         storage.init()
@@ -108,7 +111,9 @@ def create_app(
         if git == storage.root or storage.root in git.parents:
             raise RuntimeError("FILEAPI_GIT_ROOT must be outside FILEAPI_ROOT")
         forge = Forge(DiskForgeStore(git))
+        lfs = DiskLfsStore(git)
     forge.store.init()
+    lfs.init()
     passes = RepoPasses(kv)
     # The admin is pinned by DID; the handle is only a login hint and display name.
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
@@ -138,7 +143,7 @@ def create_app(
         async with mcp.session_manager.run():
             yield
 
-    app = FastAPI(title="fileapi", version="1.5.0", lifespan=lifespan)
+    app = FastAPI(title="fileapi", version="1.6.0", lifespan=lifespan)
     app.state.storage = storage
     app.state.auth = auth
     app.state.forge = forge
@@ -288,6 +293,122 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
                 raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
         data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
         return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
+
+    # ---- Git LFS ----------------------------------------------------------
+    # git-lfs derives its endpoint from the remote URL (<remote>.git/info/lfs) and authenticates the same
+    # way as git (it asks the same credential helper). Download is allowed wherever clone is (public repos
+    # anonymously); upload needs push access. Only the "basic" transfer adapter is offered.
+    lfs_max = int(os.environ.get("FILEAPI_LFS_MAX_OBJECT", 2 * 1024 * 1024 * 1024))
+    LFS_JSON = "application/vnd.git-lfs+json"
+
+    def lfs_auth(request: Request, project: str, repo: str, upload: bool) -> tuple[str, str] | Response:
+        try:
+            full = git_auth(request, project, repo, "git-receive-pack" if upload else "git-upload-pack")
+        except HTTPException as e:
+            if e.status_code != 401:
+                raise
+            return JSONResponse({"message": "Credentials needed"}, status_code=401, media_type=LFS_JSON,
+                                headers={"WWW-Authenticate": 'Basic realm="fileapi git"',
+                                         "LFS-Authenticate": 'Basic realm="fileapi git"'})
+        try:
+            forge.open(full).close()
+        except StorageError:
+            return JSONResponse({"message": "Repository not found"}, status_code=404, media_type=LFS_JSON)
+        return split_repo(full)
+
+    @app.post("/git/{project}/{repo}/info/lfs/objects/batch", include_in_schema=False)
+    async def lfs_batch(request: Request, project: str, repo: str):
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"message": "Body must be JSON"}, status_code=422, media_type=LFS_JSON)
+        op = body.get("operation")
+        if op not in ("upload", "download"):
+            return JSONResponse({"message": "operation must be upload or download"}, status_code=422, media_type=LFS_JSON)
+        parts = lfs_auth(request, project, repo, op == "upload")
+        if isinstance(parts, Response):
+            return parts
+        if "basic" not in (body.get("transfers") or ["basic"]):
+            return JSONResponse({"message": "Only the basic transfer adapter is supported"}, status_code=422,
+                                media_type=LFS_JSON)
+        href_base = f"{oauth.base_url(request, public_url)}/git/{parts[0]}/{parts[1]}.git/info/lfs/objects"
+        # The client already authenticated for the batch call; hand the same credentials to the actions.
+        header = {"Authorization": request.headers["authorization"]} if request.headers.get("authorization") else {}
+        out = []
+        for obj in body.get("objects") or []:
+            oid, size = str(obj.get("oid", "")), obj.get("size")
+            item = {"oid": oid, "size": size}
+            try:
+                check_oid(oid)
+                if not isinstance(size, int) or size < 0:
+                    raise StorageError("size must be a non-negative integer")
+            except StorageError as e:
+                out.append({**item, "error": {"code": 422, "message": str(e)}})
+                continue
+            have = await run_in_threadpool(lfs.size, *parts, oid)
+            action = {"href": f"{href_base}/{oid}", "header": header, "expires_in": 3600}
+            if op == "download":
+                if have is None:
+                    item["error"] = {"code": 404, "message": "Object does not exist"}
+                else:
+                    item.update(size=have, authenticated=True, actions={"download": action})
+            elif have is None:
+                if size > lfs_max:
+                    item["error"] = {"code": 422, "message": f"Larger than FILEAPI_LFS_MAX_OBJECT ({lfs_max} bytes)"}
+                else:
+                    item.update(authenticated=True, actions={"upload": {**action, "header": {
+                        **header, "Content-Type": "application/octet-stream"}}})
+            out.append(item)  # an upload the server already has gets no actions: nothing to send
+        return JSONResponse({"transfer": "basic", "objects": out, "hash_algo": "sha256"}, media_type=LFS_JSON)
+
+    @app.put("/git/{project}/{repo}/info/lfs/objects/{oid}", include_in_schema=False)
+    async def lfs_upload(request: Request, project: str, repo: str, oid: str):
+        parts = lfs_auth(request, project, repo, True)
+        if isinstance(parts, Response):
+            return parts
+        check_oid(oid)
+        spool = Spool(lfs_max)
+        try:
+            try:
+                async for chunk in request.stream():
+                    spool.write(chunk)
+            except StorageError as e:
+                return JSONResponse({"message": str(e)}, status_code=413, media_type=LFS_JSON)
+            if spool.sha.hexdigest() != oid:
+                return JSONResponse({"message": "Content does not match the object id (sha256)"}, status_code=422,
+                                    media_type=LFS_JSON)
+            spool.file.seek(0)
+            await run_in_threadpool(lfs.put, *parts, oid, spool.size, spool.file)
+        finally:
+            spool.close()
+        return Response(status_code=200)
+
+    @app.get("/git/{project}/{repo}/info/lfs/objects/{oid}", include_in_schema=False)
+    async def lfs_download(request: Request, project: str, repo: str, oid: str):
+        parts = lfs_auth(request, project, repo, False)
+        if isinstance(parts, Response):
+            return parts
+        size = await run_in_threadpool(lfs.size, *parts, check_oid(oid))
+        if size is None:
+            return JSONResponse({"message": "Object does not exist"}, status_code=404, media_type=LFS_JSON)
+        return StreamingResponse(lfs.read(*parts, oid), media_type="application/octet-stream",
+                                 headers={"Content-Length": str(size)})
+
+    # File locking isn't supported, but git-lfs checks locks before every push; answering "no locks"
+    # keeps it from printing a warning each time.
+    @app.post("/git/{project}/{repo}/info/lfs/locks/verify", include_in_schema=False)
+    def lfs_locks_verify(request: Request, project: str, repo: str):
+        parts = lfs_auth(request, project, repo, True)
+        if isinstance(parts, Response):
+            return parts
+        return JSONResponse({"ours": [], "theirs": []}, media_type=LFS_JSON)
+
+    @app.get("/git/{project}/{repo}/info/lfs/locks", include_in_schema=False)
+    def lfs_locks(request: Request, project: str, repo: str):
+        parts = lfs_auth(request, project, repo, False)
+        if isinstance(parts, Response):
+            return parts
+        return JSONResponse({"locks": []}, media_type=LFS_JSON)
 
     # ---- Forge JSON API (used by the web UI at /forge/) ---------
     # Public repos are readable by anyone; everything else needs a signed-in token. A private repo looks

@@ -56,6 +56,20 @@ git clone https://<host>/git/<handle>/<repo>.git
 
 When the server answers `401`, git asks the helper. It registers itself as an OAuth client of fileapi, opens `/authorize` in the browser with a one-off redirect to `http://127.0.0.1:<random port>/callback`, swaps the code (PKCE) for tokens and gives git the access token as the password. Tokens live in `~/.config/git-credential-fileapi/tokens.json` (mode 600): the access token (24 h) is reused, then refreshed silently with the refresh token (90 days, rotated), so the browser only opens again after that. `setup` puts an empty `credential.<url>.helper` first, which keeps global helpers (store, cache, libsecret) from shadowing it with a stale token. Other commands: `git-credential-fileapi login|logout [url]`, `status`. On a machine with no browser, open the printed URL on the same machine (the redirect goes to 127.0.0.1).
 
+### Big files go to Git LFS automatically
+
+Every repo has a Git LFS endpoint at `https://<host>/git/<handle>/<repo>.git/info/lfs` (the batch API with the basic transfer; git-lfs finds it from the remote URL and signs in through the same credential helper). Download works wherever clone does, so public repos serve LFS files anonymously; upload needs push access. Objects are stored per repo: chunked rows in Postgres (`fileapi_lfs_objects`, `fileapi_lfs_chunks`) or `<repo>.git/lfs/objects/` on disk, and are deleted with the repo. `FILEAPI_LFS_MAX_OBJECT` caps one object (default 2 GiB).
+
+With [git-lfs](https://git-lfs.com) installed, `git-credential-fileapi setup` also runs `git lfs install` and adds a pre-commit hook to git's template dir (`init.templateDir`, unless you already have one, in which case the hook goes into yours), so every repo cloned or created afterwards has it. On commit, in a repo with a fileapi remote, staged files over the threshold are added to `.gitattributes` with `git lfs track --filename` and re-staged as LFS pointers; `git push` then uploads them. Nothing else to do, and the hook never blocks a commit.
+
+```sh
+git config --global fileapi.lfsThreshold 50m   # default 10m; 0 turns it off
+git config fileapi.autoLfs true                # auto (default: repos with a fileapi remote) | true | false
+git-credential-fileapi lfs-install             # in a repo cloned before setup
+```
+
+Files committed before they crossed the threshold stay in git history; `git lfs migrate import --include=<path>` moves them. The repo browser and `browse_repo` show LFS files as such (size and sha256) rather than the pointer text.
+
 ### Tokens by hand
 
 ```sh
