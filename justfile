@@ -24,6 +24,10 @@ test:
 ui:
     {{run}} ui/build.sh
 
+# Generate ui/build/compile_commands.json so clangd resolves Qt headers (uses the host Qt; editing only)
+ui-lsp:
+    cmake -S ui -B ui/build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
+
 # Run locally with auto-reload (uses DATABASE_URL from .env if present)
 dev:
     FILEAPI_ROOT="${FILEAPI_ROOT:-./data}" {{fastapi}} dev

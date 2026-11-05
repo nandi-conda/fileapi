@@ -9,3 +9,4 @@ state/
 repos/
 .pixi/
 ui/.toolchain/
+ui/build/
