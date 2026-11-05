@@ -34,7 +34,14 @@ def _like_prefix(prefix: str) -> str:
 
 class PostgresStorage:
     def __init__(self, dsn: str, pool: ConnectionPool | None = None):
-        self.pool = pool or ConnectionPool(dsn, min_size=1, max_size=5, open=True, kwargs={"autocommit": True})
+        # Hosted Postgres (Neon) drops idle connections when the compute suspends, so a pooled connection
+        # can be dead by the time a request borrows it, which used to surface as a 500 on the first request
+        # after a quiet spell. check= pings each connection on checkout and replaces a dead one; max_idle
+        # retires connections before the server-side idle timeout; TCP keepalives catch silent drops.
+        self.pool = pool or ConnectionPool(
+            dsn, min_size=1, max_size=5, open=True, check=ConnectionPool.check_connection, max_idle=120,
+            kwargs={"autocommit": True, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
+                    "keepalives_count": 3})
         self.root = "postgres"
 
     def init(self) -> None:
