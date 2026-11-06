@@ -1,0 +1,18 @@
+# Deploys fileapi to FastAPI Cloud from a Depot build (the forge's "deploy" job in .forge/jobs.toml).
+# Nothing is pushed or saved: the build exists to run ci/deploy.py on Depot's builders with the forge's
+# FASTAPI_TOKEN secret mounted as a build secret (never in a layer or the image).
+FROM python:3.13-slim
+RUN pip install --no-cache-dir --quiet "fastapi-cli[standard]"
+WORKDIR /src
+COPY . .
+ARG FORGE_SHA
+ARG FORGE_RUN
+ENV FASTAPI_CLOUD_APP=fileapi \
+    FASTAPI_CLOUD_APP_ID=bdd95917-35be-404b-82bb-58203a95a7d9 \
+    FILEAPI_URL=https://fileapi.fastapicloud.dev \
+    FASTAPI_CLI=fastapi \
+    CI=true
+# FORGE_RUN differs on every run, so this step never comes from the cache.
+RUN --mount=type=secret,id=FASTAPI_TOKEN \
+    FASTAPI_CLOUD_TOKEN="$(cat /run/secrets/FASTAPI_TOKEN)" DEPLOY_SHA="$FORGE_SHA" FORGE_RUN="$FORGE_RUN" \
+    python ci/deploy.py

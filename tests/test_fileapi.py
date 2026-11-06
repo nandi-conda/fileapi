@@ -1603,6 +1603,14 @@ run = "echo deploying $FORGE_SHA"
         assert "refs/heads/main: kept as it is there" in out
         assert Repo(str(target)).refs[b"refs/heads/main"] == c.id
 
+        # A token secret that isn't set: the mirror is skipped (not failed), and so is what waits for it.
+        toml2 = toml.replace(f'url = "{target}"', f'url = "{target}", token = "${{NOT_SET_TOKEN}}"')
+        forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": toml2}, "token")
+        jobs.wait()
+        latest = {r["job"]: r for r in client.get(f"{base}/runs", headers=AUTH).json()["runs"][:2]}
+        assert latest["github"]["status"] == "skipped" and "NOT_SET_TOKEN" in latest["github"]["error"]
+        assert latest["deploy"]["status"] == "skipped"
+
     for bad, msg in (("[[job]]\nname='a'\nafter='nope'\nrun='x'\n", "no such job"),
                      ("[[job]]\nname='a'\nafter='b'\nrun='x'\n[[job]]\nname='b'\nafter='a'\nrun='x'\n", "wait for each other"),
                      ("[[job]]\nname='a'\nmirror={colour='x'}\n", "unknown mirror setting"),

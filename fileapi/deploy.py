@@ -45,7 +45,7 @@ Deploy jobs
         tags = ["*"]
         [job.mirror]
         url = "https://github.com/me/app.git"
-        token = "${GITHUB_MIRROR_TOKEN}"   # HTTPS password; username defaults to x-access-token
+        token = "${GITHUB_MIRROR_TOKEN}"   # HTTPS password (user x-access-token); unset secret = run skipped
         force = false                 # default: only fast-forwards; a diverged ref is reported, not overwritten
 
         [[job]]                       # start a Depot CI workflow (workflow_dispatch) and follow it
@@ -119,6 +119,10 @@ MAX_TIMEOUT = 3600
 DEPOT_CLI_VERSION = "2.103.9"  # FILEAPI_DEPOT_CLI_VERSION overrides ("latest" works too)
 UNMASKED = {"DEPOT_PROJECT_ID"}  # secrets for convenience, not secret: masking them would break build links
 DEPOT_URL_RE = re.compile(r"https://depot\.dev/orgs/[\w-]+/projects/[\w-]+/builds/[\w-]+")
+
+
+class SkipJob(Exception):
+    """A job that can't apply (say, a mirror whose token secret isn't set): the run shows as skipped, not failed."""
 
 
 class SecretsUnavailable(StorageError):
@@ -728,6 +732,9 @@ class Jobs:
             status = "success" if code == 0 else "cancelled" if code == 130 else "failed"
         except subprocess.TimeoutExpired:
             status, error = "timeout", f"Stopped after {job['timeout']} s"
+        except SkipJob as e:
+            status, error = "skipped", out.mask(str(e))
+            out.write(f"Skipped: {error}\n")
         except Exception as e:  # noqa: BLE001 - every failure belongs in the run record
             status, error = "error", out.mask(str(e))
         run.update(status=status, exit_code=code, finished=_now(),
@@ -918,6 +925,9 @@ class Jobs:
         from dulwich.graph import can_fast_forward
 
         m = job["mirror"]
+        missing = [v for v in _VAR_RE.findall(m["token"] or "") if not env.get(v)]
+        if missing:
+            raise SkipJob(f"set the {', '.join(missing)} secret to turn this mirror on")
         url = _expand(m["url"], env)
         token = _expand(m["token"], env) if m["token"] else None
         if m["token"] and not token:

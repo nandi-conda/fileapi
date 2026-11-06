@@ -1,8 +1,21 @@
 # CI for fileapi on its own forge (nandi.uk/fileapi). See "Deploy jobs" in README.md.
-# Needs secrets: GITHUB_MIRROR_TOKEN (repo), DEPOT_TOKEN (user or repo), FASTAPI_TOKEN (repo).
+# Uses the secrets DEPOT_TOKEN + DEPOT_PROJECT_ID (user secrets) and FASTAPI_TOKEN (repo secret).
 
-# Every push (branches and tags) goes to GitHub as a backup. Only fast-forwards: if GitHub has commits the
-# forge doesn't, that ref is reported and left alone.
+# Pushes to main deploy to FastAPI Cloud from a Depot build: ci/Dockerfile.deploy runs ci/deploy.py on
+# Depot's builders, with FASTAPI_TOKEN as a build secret. The build output (fastapi deploy's log) is
+# this run's output, with the Depot build link.
+[[job]]
+name = "deploy"
+branches = ["main"]
+timeout = 1800
+[job.depot]
+file = "ci/Dockerfile.deploy"
+save = false
+build_args = { FORGE_SHA = "${FORGE_SHA}", FORGE_RUN = "${FORGE_URL}/forge/#${FORGE_REPO}/-/deploys/${FORGE_RUN_ID}" }
+args = ["--secret", "id=FASTAPI_TOKEN,env=FASTAPI_TOKEN"]
+
+# Backup to GitHub on every push (branches and tags), fast-forwards only. Skipped until the
+# GITHUB_MIRROR_TOKEN secret exists (a fine-grained token with Contents: Read and write on the repo).
 [[job]]
 name = "github-mirror"
 branches = ["*"]
@@ -11,16 +24,3 @@ timeout = 900
 [job.mirror]
 url = "https://github.com/nandi-conda/fileapi.git"
 token = "${GITHUB_MIRROR_TOKEN}"
-
-# Pushes to main deploy to FastAPI Cloud on Depot CI (.depot/workflows/deploy.yml), once GitHub has the
-# commit. The Depot run is followed here; it keeps going if this server is replaced mid-deploy.
-[[job]]
-name = "deploy"
-branches = ["main"]
-after = "github-mirror"
-timeout = 1800
-[job.depot_ci]
-repo = "nandi-conda/fileapi"
-workflow = "deploy.yml"
-inputs = { sha = "${FORGE_SHA}", forge_run = "${FORGE_URL}/forge/#${FORGE_REPO}/-/deploys/${FORGE_RUN_ID}" }
-secrets = ["FASTAPI_TOKEN"]

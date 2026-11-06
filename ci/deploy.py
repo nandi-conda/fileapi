@@ -1,4 +1,4 @@
-"""Deploy this checkout to FastAPI Cloud from CI (.depot/workflows/deploy.yml). Standard library only.
+"""Deploy this checkout to FastAPI Cloud from CI (ci/Dockerfile.deploy, built on Depot). Standard library only.
 
 1. Finds the app's ID from its name (FASTAPI_CLOUD_APP), unless FASTAPI_CLOUD_APP_ID is set.
 2. Checks the app's environment on FastAPI Cloud: no DATABASE_URL means a deploy would start on a wiped disk, so
@@ -7,7 +7,8 @@
 4. Writes the commit to fileapi/BUILD (the server reports it in /health), runs `fastapi deploy`, and waits
    until FILEAPI_URL/health reports that commit.
 
-Needs FASTAPI_CLOUD_TOKEN: a deploy token for the app (`fastapi cloud tokens create`).
+Needs FASTAPI_CLOUD_TOKEN: a deploy token for the app (`fastapi cloud tokens create`), and the app ID in
+FASTAPI_CLOUD_APP_ID (deploy tokens can't look an app up by name).
 """
 
 import json

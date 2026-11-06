@@ -157,7 +157,7 @@ headers = { Authorization = "Bearer ${SOME_TOKEN}" }
 body = '{"sha": "${FORGE_SHA}"}'
 ```
 
-Jobs get a clean environment (only `PATH` from the server, never `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. Set `FILEAPI_JOBS=off` to turn jobs off.
+Jobs get a clean environment (only `PATH` from the server, never `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. A job that can't apply, like a mirror whose token secret isn't set, shows as `skipped`. Set `FILEAPI_JOBS=off` to turn jobs off.
 
 #### Container builds on Depot
 
@@ -182,7 +182,7 @@ args = ["--no-cache"]            # any other `depot build` flags
 
 `depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). For all your repos at once, `just depot-user-token [repo]` stores your Depot user token (`depot login token`, which can build in any project you can see) as the user secret `DEPOT_TOKEN`; with a repo it also sets that repo's `DEPOT_PROJECT_ID`. Each repo still needs its project: `project` in the job, a `DEPOT_PROJECT_ID` secret, or one run of that command per repo. By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
 
-A `mirror` job pushes every branch and tag of the repo to another git host, say a backup on GitHub. Only fast-forwards and new refs go: a ref that moved on the other side is reported in the run and left alone (`force = true` overwrites instead). Nothing is deleted there. `token` is the HTTPS password (username `x-access-token` unless you set `username`); for GitHub, a fine-grained personal access token with **Contents: Read and write** on that one repo.
+A `mirror` job pushes every branch and tag of the repo to another git host, say a backup on GitHub. Only fast-forwards and new refs go: a ref that moved on the other side is reported in the run and left alone (`force = true` overwrites instead). Nothing is deleted there. `token` is the HTTPS password (username `x-access-token` unless you set `username`; if the secret it names isn't set, the run is skipped); for GitHub, a fine-grained personal access token with **Contents: Read and write** on that one repo.
 
 ```toml
 [[job]]
@@ -325,17 +325,13 @@ Then connect a client (below) and sign in as the admin. Tables are created autom
 
 ### Deploys from CI
 
-fileapi's own repo lives on its forge as `nandi.uk/fileapi`, and that's where to push. Its [`.forge/jobs.toml`](.forge/jobs.toml) mirrors every push to GitHub (`nandi-conda/fileapi`, as a backup), and for pushes to `main` it then starts [`.depot/workflows/deploy.yml`](.depot/workflows/deploy.yml) on Depot CI. That workflow runs [`.depot/deploy.py`](.depot/deploy.py): it looks up the FastAPI Cloud app `fileapi` by name, stops if `DATABASE_URL` isn't set there (warns if `FILEAPI_SECRETS_KEY` isn't), checks the committed forge UI build is present (CI doesn't run `just ui`), writes the commit to `fileapi/BUILD`, runs `fastapi deploy`, and waits until `/health` reports that commit as `build`.
+fileapi's own repo lives on its forge as `nandi.uk/fileapi`, and that's where to push. Its [`.forge/jobs.toml`](.forge/jobs.toml) deploys every push to `main` from a [Depot](https://depot.dev) build: [`ci/Dockerfile.deploy`](ci/Dockerfile.deploy) installs the FastAPI CLI and runs [`ci/deploy.py`](ci/deploy.py) on Depot's builders, with the `FASTAPI_TOKEN` secret mounted as a build secret (never in a layer; nothing is pushed or saved). The code goes straight from the forge to Depot, no GitHub involved, and a deploy that replaces the server running the job doesn't matter: once `fastapi deploy` has uploaded, FastAPI Cloud finishes on its own.
 
-`just deploy` pushes your current commit to `main` on the forge and prints the CI run links (`/forge/#nandi.uk/fileapi/-/deploys/<run>`, plus the Depot run once it starts), following them to the end. One-time setup, as secrets on the forge (repo Settings tab, or the user Settings page for user secrets):
+`ci/deploy.py` deploys to the app `fileapi` (its ID is in the Dockerfile: deploy tokens can't look an app up by name), checks `DATABASE_URL` and `FILEAPI_SECRETS_KEY` are set there when the token may read env vars (a deploy token gets 403, so it warns; the app refuses to start without `DATABASE_URL` anyway, and FastAPI Cloud then keeps the old version), checks the committed forge UI build is present (CI doesn't run `just ui`), writes the commit to `fileapi/BUILD` (served as `build` in `/health`), runs `fastapi deploy`, and waits for `/health` to report the commit.
 
-| Secret | Scope | What |
-| --- | --- | --- |
-| `GITHUB_MIRROR_TOKEN` | repo | GitHub fine-grained personal access token: resource owner `nandi-conda`, only the `fileapi` repo, **Contents: Read and write** |
-| `DEPOT_TOKEN` | user or repo | Depot organization API token (Organization settings → API tokens) or your user token (`depot login token`) |
-| `FASTAPI_TOKEN` | repo | FastAPI Cloud deploy token for the app: `pixi run fastapi cloud tokens create --name forge-ci` (copied into Depot CI on each run) |
+`just deploy` pushes your current commit to `main` on the forge and prints the CI run links (`/forge/#nandi.uk/fileapi/-/deploys/<run>`, plus the Depot build once it starts), following them to the end. Secrets used: `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` (user secrets, from `just depot-user-token`) and `FASTAPI_TOKEN` (repo secret: a deploy token from `pixi run fastapi cloud tokens create --name forge-ci`).
 
-Also install Depot's GitHub app on `nandi-conda/fileapi` (Depot → CI → connect GitHub), since Depot CI checks out from GitHub. The app ID is in the workflow (`FASTAPI_CLOUD_APP_ID`, from `app_id` in `.fastapicloud/cloud.json`): deploy tokens can't look an app up by name.
+A `github-mirror` job backs every push up to `github.com/nandi-conda/fileapi`, fast-forwards only. It's skipped until there's a `GITHUB_MIRROR_TOKEN` secret: a GitHub fine-grained personal access token (resource owner `nandi-conda`, only the `fileapi` repo, **Contents: Read and write**).
 
 ## Run elsewhere
 
