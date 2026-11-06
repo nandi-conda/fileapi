@@ -2,7 +2,7 @@
 # Nothing is pushed or saved: the build exists to run ci/deploy.py on Depot's builders with the forge's
 # FASTAPI_TOKEN secret mounted as a build secret (never in a layer or the image).
 FROM python:3.13-slim
-RUN pip install --no-cache-dir --quiet "fastapi-cli[standard]"
+RUN pip install --no-cache-dir --quiet --root-user-action=ignore "fastapi[standard]" && fastapi --version
 WORKDIR /src
 COPY . .
 ARG FORGE_SHA

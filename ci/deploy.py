@@ -95,7 +95,10 @@ def main() -> None:
     if missing:
         fail(f"The forge UI build is missing {', '.join(missing)} in {ui}: run `just ui` and commit the result.")
     Path("fileapi/BUILD").write_text(sha + "\n")
-    code = subprocess.run([CLI, "deploy", "--app-id", app]).returncode
+    import shutil
+
+    cli = [CLI] if shutil.which(CLI) else [sys.executable, "-m", "fastapi"]
+    code = subprocess.run([*cli, "deploy", "--app-id", app]).returncode
     if code != 0:
         fail(f"fastapi deploy failed (exit {code}); FastAPI Cloud keeps serving the previous version.")
     if not SITE:
