@@ -85,8 +85,7 @@ login:
 link app_id="": login
     {{fastapi}} cloud link {{app_id}}
 
-# Deploy through CI: push this branch's commit to main on the forge (nandi.uk/fileapi), which mirrors it to
-# GitHub and runs the FastAPI Cloud deploy on Depot CI (.forge/jobs.toml). Prints the CI run links and follows
+# Deploy through CI: push this branch's commit to main on the forge (nandi.uk/fileapi), which runs the FastAPI Cloud deploy on Depot CI (.forge/jobs.toml). Prints the CI run links and follows
 # them. Signs in through git-credential-fileapi (`just git-setup` once). `just deploy-only` deploys from here.
 deploy url=fileapi_url repo="nandi.uk/fileapi":
     #!/usr/bin/env bash
@@ -187,9 +186,9 @@ claude-add url=fileapi_url scope="user":
     claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp"
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
 
-# Copy GitHub's branches and tags to the forge as <handle>/fileapi. The forge is primary now (it mirrors itself
-# to GitHub on every push), so this is only for catching up commits that landed on GitHub first: fast-forwards
-# only, nothing on the forge is overwritten or deleted. Signs in through git-credential-fileapi (`just git-setup`).
+# Copy GitHub's branches and tags to the forge as <handle>/fileapi. You rarely need it: the forge pulls GitHub's
+# main by itself every minute ([upstream] in .forge/jobs.toml) and deploys it. This catches up other branches and
+# tags: fast-forwards only, nothing on the forge is overwritten or deleted. Signs in through git-credential-fileapi (`just git-setup`).
 # If one push of a branch fails, it falls back to one commit at a time (a safety net; the server streams big pushes).
 forge-mirror url=fileapi_url repo="nandi.uk/fileapi":
     #!/usr/bin/env bash
