@@ -335,7 +335,7 @@ fileapi's own repo lives on its forge as `nandi.uk/fileapi`, and that's where to
 | `DEPOT_TOKEN` | user or repo | Depot organization API token (Organization settings → API tokens) or your user token (`depot login token`) |
 | `FASTAPI_TOKEN` | repo | FastAPI Cloud deploy token for the app: `pixi run fastapi cloud tokens create --name forge-ci` (copied into Depot CI on each run) |
 
-Also install Depot's GitHub app on `nandi-conda/fileapi` (Depot → CI → connect GitHub), since Depot CI checks out from GitHub. If the deploy token can't list apps, add the app's ID (`app_id` in `.fastapicloud/cloud.json`) as a Depot CI secret `FASTAPI_CLOUD_APP_ID` and map it in the workflow.
+Also install Depot's GitHub app on `nandi-conda/fileapi` (Depot → CI → connect GitHub), since Depot CI checks out from GitHub. The app ID is in the workflow (`FASTAPI_CLOUD_APP_ID`, from `app_id` in `.fastapicloud/cloud.json`): deploy tokens can't look an app up by name.
 
 ## Run elsewhere
 

@@ -20,7 +20,8 @@ jobs:
     runs-on: depot-ubuntu-latest
     timeout-minutes: 25
     env:
-      FASTAPI_CLOUD_APP: fileapi          # the app's name on FastAPI Cloud; its ID is looked up from it
+      FASTAPI_CLOUD_APP: fileapi                                     # the app on FastAPI Cloud
+      FASTAPI_CLOUD_APP_ID: bdd95917-35be-404b-82bb-58203a95a7d9     # its ID (deploy tokens cannot look it up by name)
       FILEAPI_URL: https://fileapi.fastapicloud.dev
     steps:
       - uses: actions/checkout@v4
