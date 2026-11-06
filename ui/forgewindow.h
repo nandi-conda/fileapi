@@ -9,6 +9,7 @@ class Api;
 class QAction;
 class CodeHighlighter;
 class CodeView;
+class CommitView;
 class MarkdownView;
 class QScrollArea;
 class QToolButton;
@@ -66,6 +67,7 @@ private:
     QString currentHash() const;
     QString defaultRef() const;
     void selectPendingCommit();
+    void showCommit(const QString &sha, Nav nav);
     void loadLog();
     void showFile(const QJsonObject &file);
     // README under a folder's listing; Preview/Code for Markdown files.
@@ -151,6 +153,8 @@ private:
     QComboBox *m_outline;
     CodeHighlighter *m_highlighter;
     QTreeWidget *m_commits;
+    QStackedWidget *m_commitStack;
+    CommitView *m_commitView;
     QWidget *m_settings;
     QCheckBox *m_public;
     QLineEdit *m_editDesc;

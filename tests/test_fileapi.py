@@ -602,6 +602,18 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert [c["message"] for c in log] == ["second", "first"]
         f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": log[1]["sha"]}).json()
         assert f["content"] == "x = 1\n"
+        d = client.get(f"/api/forge/repos/web/site/commits/{log[0]['sha'][:12]}").json()
+        assert d["sha"] == log[0]["sha"] and d["message"] == "second" and d["parents"] == [log[1]["sha"]]
+        assert d["stats"] == {"files": 1, "additions": 1, "deletions": 1} and d["truncated"] is False
+        [fd] = d["files"]
+        assert (fd["path"], fd["status"], fd["old_path"]) == ("src/a.py", "modified", None)
+        assert fd["hunks"] == [{"old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1,
+                                "lines": ["-x = 1", "+x = 2"]}]
+        root = client.get(f"/api/forge/repos/web/site/commits/{log[1]['sha']}").json()
+        assert [(f["path"], f["status"], f["additions"]) for f in root["files"]] == [
+            ("README.md", "added", 1), ("src/a.py", "added", 1)]
+        assert root["files"][0]["hunks"][0]["old_start"] == 0
+        assert client.get("/api/forge/repos/web/site/commits/abcdef1").status_code == 404
         raw = client.get("/api/forge/repos/web/site/raw", params={"path": "README.md"})
         assert raw.status_code == 200 and raw.content == b"hi\n" and raw.headers["content-type"].startswith("text/markdown")
         assert "sandbox" in raw.headers["content-security-policy"] and raw.headers["x-content-type-options"] == "nosniff"

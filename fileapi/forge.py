@@ -1218,6 +1218,15 @@ class Forge:
         finally:
             r.close()
 
+    def commit_diff(self, repo: str, sha: str) -> dict:
+        """One commit's message and its changes against its first parent, as unified-diff hunks."""
+        from .diff import commit_diff
+        r = self.open(repo)
+        try:
+            return commit_diff(r, self._peel_commit(r, self._resolve(r, sha)))
+        finally:
+            r.close()
+
     def commit_files(self, repo: str, branch: str, files: dict[str, str | None], message: str,
                      author_name: str | None = None, author_email: str | None = None,
                      expected_head: str | None = None) -> dict:

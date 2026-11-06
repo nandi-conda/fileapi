@@ -649,6 +649,12 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
                   limit: int = Query(50, ge=1, le=200)):
         return {"commits": forge.log(forge_repo(request, project, repo), ref, path, limit)}
 
+    @app.get("/api/forge/repos/{project}/{repo}/commits/{sha}", tags=["forge"])
+    async def forge_commit(request: Request, project: str, repo: str, sha: str):
+        """A commit and its diff against its first parent (changed files with unified-diff hunks)."""
+        full = forge_repo(request, project, repo)
+        return await run_in_threadpool(forge.commit_diff, full, sha)
+
     # Repo settings (signed-in admin only; the only identity that can sign in is the admin).
     def forge_admin(request: Request) -> str:
         me = owner_of(auth.identify(_request_token(request)))

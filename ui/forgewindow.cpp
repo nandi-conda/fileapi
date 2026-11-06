@@ -2,6 +2,7 @@
 #include "api.h"
 #include "appstyle.h"
 #include "codeview.h"
+#include "diffview.h"
 #include "highlighter.h"
 #include "markdownview.h"
 #include "navpanel.h"
@@ -260,6 +261,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     lay->addLayout(m_headRow);
     connect(m_ref, &QComboBox::textActivated, this, [this] {
         closeNav();
+        m_commitStack->setCurrentIndex(0);
         if (m_tabs->currentIndex() == 0)
             browse(QString(), Nav::Push);
         else {
@@ -432,21 +434,35 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_commits->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     for (int i = 1; i < 4; ++i)
         m_commits->header()->setSectionResizeMode(i, QHeaderView::ResizeToContents);
-    m_commits->setToolTip("Double-click a commit to browse the files as they were then.");
+    m_commits->setToolTip("Click a commit to see its changes.");
+    m_commits->setProperty("singleClick", true);
     touchScroll(m_commits);
     connect(m_commits, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *it) {
-        m_ref->setCurrentText(it->data(0, ShaRole).toString().left(12));
+        const QString sha = it->data(0, ShaRole).toString();
+        if (!sha.isEmpty())
+            showCommit(sha, Nav::Push);
+    });
+    // The Commits tab: the list, or one commit's diff (#<repo>/-/commits/<sha>).
+    m_commitStack = new QStackedWidget;
+    m_commitStack->addWidget(m_commits);
+    m_commitView = new CommitView(m_api);
+    connect(m_commitView, &CommitView::back, this, [this] {
+        m_commitStack->setCurrentIndex(0);
+        updateHash(Nav::Push);
+    });
+    connect(m_commitView, &CommitView::openCommit, this, [this](const QString &sha) { showCommit(sha, Nav::Push); });
+    connect(m_commitView, &CommitView::statusText, this, [this](const QString &t, bool e) { status(t, e); });
+    connect(m_commitView, &CommitView::browseFiles, this, [this](const QString &sha) {
+        m_ref->setCurrentText(sha.left(12));
+        m_commitStack->setCurrentIndex(0);
         m_routing = true;  // one history entry for the whole move, made by browse
         m_tabs->setCurrentIndex(0);
         m_routing = false;
         browse(QString(), Nav::Push);
         loadLog();
     });
-    connect(m_commits, &QTreeWidget::itemSelectionChanged, this, [this] {
-        m_pendingCommit.clear();
-        updateHash(Nav::Replace);  // #<repo>/-/commits/<sha>: a link to the selected commit
-    });
-    m_tabs->addTab(m_commits, "Commits");
+    m_commitStack->addWidget(m_commitView);
+    m_tabs->addTab(m_commitStack, "Commits");
     // Releases: everyone who can see the repo can download; the owner makes them and uploads files.
     m_releases = new ReleasesPanel(m_api);
     connect(m_releases, &ReleasesPanel::statusText, this, [this](const QString &t, bool e) { status(t, e); });
@@ -653,6 +669,7 @@ void ForgeWindow::setCompact(bool compact)
     m_fileSplit->setOrientation(compact ? Qt::Vertical : Qt::Horizontal);
     m_commits->setColumnHidden(1, compact);  // author
     m_commits->setColumnHidden(3, compact);  // sha
+    m_commitView->setCompact(compact);
     for (int c : {2, 3, 4, 6})              // branch, commit, started, trigger (the Depot link stays)
         m_runs->setColumnHidden(c, compact);
     m_repoSecrets->setCompact(compact);
@@ -904,6 +921,9 @@ void ForgeWindow::applyPendingTab()
     if (tab == 1) {
         m_pendingCommit = item;
         selectPendingCommit();
+        if (!item.isEmpty())
+            m_commitView->showCommit(item);
+        m_commitStack->setCurrentIndex(item.isEmpty() ? 0 : 1);
     } else if (tab == 2) {
         if (item != m_releases->pickedTag())
             m_releases->selectTag(item);
@@ -917,6 +937,15 @@ void ForgeWindow::applyPendingTab()
     m_tabs->setCurrentIndex(tab);
     m_routing = false;
     updateHash(Nav::Replace);
+}
+
+void ForgeWindow::showCommit(const QString &sha, Nav nav)
+{
+    m_commitView->showCommit(sha);
+    m_commitStack->setCurrentIndex(1);
+    m_pendingCommit = sha;
+    selectPendingCommit();  // so Back to the list lands on it
+    updateHash(nav);
 }
 
 void ForgeWindow::selectPendingCommit()
@@ -955,9 +984,11 @@ void ForgeWindow::openRepo(const QString &repo, Nav nav)
     m_path.clear();
     m_entries->clear();
     {
-        const QSignalBlocker block(m_commits);  // its selection handler would rewrite the URL mid-switch
+        const QSignalBlocker block(m_commits);
         m_commits->clear();
     }
+    m_commitView->setRepo(repo);
+    m_commitStack->setCurrentIndex(0);
     setTabBadge(1, QString());
     m_info = {};
     m_backStack.clear();
@@ -1487,8 +1518,8 @@ QString ForgeWindow::currentHash() const
     else
         hash += "/-/" + TabNames.value(tab);
     if (tab == 1) {
-        const auto sel = m_commits->selectedItems();
-        item = !sel.isEmpty() ? sel.first()->data(0, ShaRole).toString().left(12) : m_pendingCommit;
+        if (m_commitStack->currentIndex() == 1)
+            item = m_commitView->sha().left(12);
     } else if (tab == 2) {
         item = m_releases->pickedTag();
     } else if (tab == 4) {
