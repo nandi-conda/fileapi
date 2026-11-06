@@ -1049,7 +1049,7 @@ def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
         jobs.wait()
         runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"]
         assert sorted(r["job"] for r in runs) == ["build", "hook"]
-        assert all(r["status"] == "success" and r["sha"] == sha and r["trigger"] == "push" for r in runs), runs
+        assert all(r["status"] == "success" and r["sha"] == sha and r["trigger"] == "push" for r in runs), [(r["job"], r["status"], r.get("error")) for r in runs]
         build = next(r for r in runs if r["job"] == "build")
         out = client.get(f"{base}/runs/{build['id']}", headers=AUTH).json()["output"]
         assert f"deploying nandi.uk/app main {sha}" in out and "print('hi')" in out and "env is clean" in out

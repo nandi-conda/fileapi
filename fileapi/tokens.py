@@ -45,12 +45,17 @@ class FileKV:
 
     def create(self, key: str, value: dict) -> bool:
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Written to a temp file, then linked into place: the link fails if the key exists, and a reader
+        # never sees a half-written file (O_EXCL + write left a window where get() read an empty file).
+        tmp = self.dir / f"{key}.{secrets.token_hex(4)}.tmp"
+        tmp.write_text(json.dumps(value))
+        os.chmod(tmp, 0o600)
         try:
-            fd = os.open(self._path(key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.link(tmp, self._path(key))
         except FileExistsError:
             return False
-        with os.fdopen(fd, "w") as f:
-            json.dump(value, f)
+        finally:
+            tmp.unlink(missing_ok=True)
         return True
 
     def pop(self, key: str) -> dict | None:

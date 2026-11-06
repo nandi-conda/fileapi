@@ -719,6 +719,9 @@ class Jobs:
         def progress() -> None:
             # A Depot build link shows up in the output early: put it on the record right away, so the
             # Deploys tab can link to the build while it's still going.
+            saved = self.kv.get(f"forge_run_{run['id']}") or {}
+            if saved.get("status") not in (None, "running"):
+                return  # the end was already recorded (by the server this job deployed): don't undo it
             if not (run.get("depot") or {}).get("url"):
                 link = DEPOT_URL_RE.search("".join(out.parts))
                 if link:
@@ -751,7 +754,11 @@ class Jobs:
         if error:
             run["error"] = error
         out.on_write = None
-        self._save_run(run)
+        saved = self.kv.get(f"forge_run_{run['id']}") or {}
+        if saved.get("live_check"):
+            run = saved  # the server this job deployed already said it's live; a kill on shutdown doesn't undo that
+        else:
+            self._save_run(run)
         self._release_children(run)
 
     def _run_shell(self, run: dict, job: dict, env: dict, out: _Output) -> int:
@@ -1134,7 +1141,7 @@ class Jobs:
             return False
         note = (f"\nThe new version ({(sha or '')[:12]}) is live: it started up and recorded this. The job's own "
                 "server was the one this deploy replaced, so it couldn't.\n")
-        run.update(status="success", exit_code=0, finished=_now(),
+        run.update(status="success", exit_code=0, finished=_now(), live_check=sha or True,
                    duration=round(time.time() - (run.get("started_ts") or time.time()), 1),
                    output=(run.get("output") or "") + note)
         self._save_run(run)
