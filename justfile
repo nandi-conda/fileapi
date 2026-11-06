@@ -147,6 +147,11 @@ secrets-key: login
     {{fastapi}} cloud env set FILEAPI_SECRETS_KEY "$key"
     echo "FILEAPI_SECRETS_KEY set on FastAPI Cloud."
 
+# Connect a forge repo to Depot: browser sign-in to Depot and fileapi, find/create the Depot project
+# (default: named after the repo), make a project token, store DEPOT_TOKEN + DEPOT_PROJECT_ID as repo secrets
+depot-token repo project="" url=fileapi_url:
+    {{python}} -m fileapi.depot_setup --url "{{url}}" "{{repo}}" "{{project}}"
+
 # First deploy: creates the app, then sets DATABASE_URL (which redeploys with Postgres)
 launch: login
     #!/usr/bin/env bash

@@ -1079,8 +1079,8 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
         run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
         assert run["status"] == "success", run
         assert run["depot"]["build_id"] == "b123" and run["depot"]["digest"] == "sha256:abc"
-        # The project ID came from a secret, so it's masked like any secret value.
-        assert run["depot"]["url"] == "https://depot.dev/orgs/org1/projects/***/builds/b123"
+        # DEPOT_PROJECT_ID is a secret for convenience only, so it isn't masked (the link keeps working).
+        assert run["depot"]["url"] == "https://depot.dev/orgs/org1/projects/proj9/builds/b123"
         assert "image" not in run["depot"]  # pushed, not saved to the Depot registry
         args = log.read_text()
         assert args.startswith("build\n--metadata-file\n")
@@ -1091,15 +1091,15 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
         assert "--save" not in args
         assert base64.b64encode(b"me:ghcr-pw-1").decode() in args  # registry login for the push
         out = client.get(f"{base}/runs/{run['id']}", headers=AUTH).json()["output"]
-        assert "$ depot build --project *** --progress plain" in out and "pushed ghcr.io/me/img:" in out
+        assert "$ depot build --project proj9 --progress plain" in out and "pushed ghcr.io/me/img:" in out
         assert "depot-tok-1" not in out and "ghcr-pw-1" not in out
 
         # Bare `depot = true`: ./Dockerfile, saved to the Depot registry.
         forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": "[[job]]\nname='img'\ndepot = true\n"}, "b")
         jobs.wait()
         run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
-        assert run["status"] == "success" and run["depot"]["image"] == "registry.depot.dev/***:b123"
-        # A project ID written in the jobs file isn't a secret, so it shows.
+        assert run["status"] == "success" and run["depot"]["image"] == "registry.depot.dev/proj9:b123"
+        # A project ID in the jobs file wins over the secret.
         toml2 = "[[job]]\nname='img'\ndepot = { project = 'pub7' }\n"
         forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": toml2}, "b2")
         jobs.wait()
@@ -1166,3 +1166,49 @@ async def test_git_push_runs_deploy_job(server_url, tmp_path):
         r = await c.call_tool("run_deploy", {"repo": "site"})
         assert not r.is_error and "ship" in text(r)
         assert not (await c.call_tool("delete_repo_secret", {"repo": "site", "name": "API_KEY"})).is_error
+
+
+def test_depot_token_setup(tmp_path, monkeypatch):
+    from fileapi import depot_setup
+
+    state = tmp_path / "projects.json"
+    state.write_text('[{"id": "old1", "name": "other"}]')
+    fake = tmp_path / "bin" / "depot"
+    fake.parent.mkdir()
+    fake.write_text(f"""#!/bin/sh
+case "$1 $2" in
+  "login --quiet") exit 0 ;;
+  "login token") echo user-tok-9 ;;
+  "projects list") cat {state} ;;
+  "projects create") printf '[{{"id": "old1", "name": "other"}}, {{"id": "new2", "name": "%s"}}]' "$3" > {state} ;;
+  *) exit 9 ;;
+esac
+""")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}:{os.environ['PATH']}")
+    monkeypatch.setattr(depot_setup.git_credential, "token_for", lambda base: {"access_token": "fa-tok"})
+    calls, api = [], []
+
+    def fileapi(base, token, method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/forge/repos":
+            return {"repos": [{"repo": "nandi.uk/site", "name": "site"}]}
+        return {"enabled": True}
+
+    def depot_api(method, body, token):
+        api.append((method, body, token))
+        return {"tokenId": "t1", "secret": "proj-secret-1"}
+
+    monkeypatch.setattr(depot_setup, "fileapi", fileapi)
+    monkeypatch.setattr(depot_setup, "depot_api", depot_api)
+    assert depot_setup.main(["site"]) == 0
+    assert api == [("depot.core.v1.ProjectService/CreateToken",
+                    {"projectId": "new2", "description": "fileapi forge nandi.uk/site"}, "user-tok-9")]
+    assert ("PUT", "/api/forge/repos/nandi.uk/site/secrets/DEPOT_TOKEN", {"value": "proj-secret-1"}) in calls
+    assert ("PUT", "/api/forge/repos/nandi.uk/site/secrets/DEPOT_PROJECT_ID", {"value": "new2"}) in calls
+    # An existing project, by ID, isn't created again.
+    api.clear()
+    assert depot_setup.main(["nandi.uk/site", "old1"]) == 0
+    assert api[0][1]["projectId"] == "old1"
+    with pytest.raises(SystemExit):
+        depot_setup.main(["nope"])

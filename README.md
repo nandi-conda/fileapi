@@ -176,7 +176,7 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }  # r
 args = ["--no-cache"]            # any other `depot build` flags
 ```
 
-`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret: a project token (Depot → the project → **Settings → Project tokens**) or an organization token (**Organization settings → API tokens**). The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
+`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
 
 | Endpoint (signed in) | Does |
 | --- | --- |

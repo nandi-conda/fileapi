@@ -25,7 +25,7 @@ Deploy jobs
         [[job]]                       # a container image build on Depot (depot.dev): remote BuildKit, no Docker here
         name = "image"
         [job.depot]
-        project = "abc123xyz"         # Depot project ID; default: the DEPOT_PROJECT_ID secret
+        project = "abc123xyz"         # Depot project ID; default: the DEPOT_PROJECT_ID secret (not masked)
         platforms = ["linux/amd64", "linux/arm64"]
         tags = ["ghcr.io/me/app:${FORGE_SHA}"]
         push = true                   # push the tags; default: save to the Depot registry instead
@@ -77,6 +77,7 @@ MAX_OUTPUT = 64 * 1024
 DEFAULT_TIMEOUT = 600
 MAX_TIMEOUT = 3600
 DEPOT_CLI_VERSION = "2.103.9"  # FILEAPI_DEPOT_CLI_VERSION overrides ("latest" works too)
+UNMASKED = {"DEPOT_PROJECT_ID"}  # secrets for convenience, not secret: masking them would break build links
 DEPOT_URL_RE = re.compile(r"https://depot\.dev/orgs/[\w-]+/projects/[\w-]+/builds/[\w-]+")
 
 
@@ -491,7 +492,7 @@ class Jobs:
     # -- running ----------------------------------------------------------------------
     def _execute(self, run: dict, job: dict) -> None:
         secrets = self.secrets.values(run["repo"])
-        out = _Output(secrets)
+        out = _Output({k: v for k, v in secrets.items() if k not in UNMASKED})
         run.update(status="running", started=_now(), started_ts=time.time())
         self._save_run(run)
         env = {**secrets, "FORGE_REPO": run["repo"], "FORGE_BRANCH": run["branch"],
