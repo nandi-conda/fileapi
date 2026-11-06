@@ -3,6 +3,8 @@
 #include <QJsonDocument>
 #include <QNetworkReply>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
+#include <QUrl>
 
 #ifdef Q_OS_WASM
 #include <emscripten/val.h>
@@ -131,8 +133,18 @@ void Api::signOut()
 QString Api::locationHash() const
 {
 #ifdef Q_OS_WASM
-    QString h = QString::fromStdString(val::global("location")["hash"].as<std::string>());
-    return QUrl::fromPercentEncoding(h.mid(h.startsWith('#') ? 1 : 0).toUtf8());
+    val location = val::global("location");
+    const auto part = [&](const char *name) {
+        return QUrl::fromPercentEncoding(QByteArray::fromStdString(location[name].as<std::string>()));
+    };
+    const QString path = part("pathname");
+    if (!path.startsWith(QStringLiteral("/forge/")) || path.size() == 7)
+        return {};
+    QString route = path.mid(7);
+    const QString search = part("search");
+    if (search.startsWith(QStringLiteral("?ref=")))
+        route += search;
+    return route + part("hash");
 #else
     return {};
 #endif
@@ -143,14 +155,27 @@ void Api::setLocationHash(const QString &hash, bool push)
 #ifdef Q_OS_WASM
     if (hash == locationHash())
         return;
-    val location = val::global("location");
-    // No hash at all for the repo list, rather than a bare "#".
-    const std::string url = hash.isEmpty()
-        ? location["pathname"].as<std::string>() + location["search"].as<std::string>()
-        : ("#" + hash).toStdString();
-    val::global("history").call<void>(push ? "pushState" : "replaceState", val::null(), std::string(""), url);
+    // <path>?ref=<ref>#L12 -> /forge/<path, percent-encoded>?ref=<ref, encoded>#L12
+    QString route = hash, lines, ref;
+    static const QRegularExpression linesRe(QStringLiteral("#L\\d+(?:-L?\\d+)?$"));
+    const auto m = linesRe.match(route);
+    if (m.hasMatch()) {
+        lines = m.captured(0);
+        route.chop(m.capturedLength());
+    }
+    const int at = route.lastIndexOf(QStringLiteral("?ref="));
+    if (at >= 0) {
+        ref = route.mid(at + 5);
+        route.truncate(at);
+    }
+    QByteArray url = "/forge/" + QUrl::toPercentEncoding(route, "/!$&'()*+,;=:@");
+    if (!ref.isEmpty())
+        url += "?ref=" + QUrl::toPercentEncoding(ref, "/");
+    url += lines.toUtf8();
+    val::global("history").call<void>(push ? "pushState" : "replaceState", val::null(), std::string(""), url.toStdString());
 #else
     Q_UNUSED(hash);
     Q_UNUSED(push);
 #endif
 }
+

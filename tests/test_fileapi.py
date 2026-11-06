@@ -678,7 +678,8 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert r.status_code == 307 and r.headers["location"] == "/forge/"
         page = client.get("/forge/")
         assert page.status_code == 200 and "qtLoad" in page.text and "fileapiToken" in page.text
-        assert client.get("/forge/nope/deep").text == page.text
+        deep = client.get("/forge/nope/deep")
+        assert deep.status_code == 200 and "qtLoad" in deep.text and '"/forge/forgeui.js"' in deep.text
         wasm = client.get("/forge/forgeui.wasm", headers={"Accept-Encoding": "gzip"})
         assert wasm.status_code == 200 and wasm.headers["content-type"] == "application/wasm"
         assert wasm.content[:4] == b"\0asm"  # httpx undoes the gzip
@@ -695,6 +696,69 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
             r = client.get(f"/{name}")
             assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n", name
         assert client.get("/site.webmanifest").json()["start_url"] == "/forge/"
+
+
+def _og(text: str) -> dict:
+    import html, re
+    return {m[0]: html.unescape(m[1]) for m in re.findall(r'<meta (?:property|name)="((?:og|twitter):[^"]+)" content="([^"]*)"', text)}
+
+
+def test_forge_link_previews(tmp_path):
+    """Forge pages carry Open Graph / Twitter tags for the route they were opened at, as an anonymous
+    visitor sees it: private repos look exactly like missing ones."""
+    with TestClient(app_for(tmp_path)) as client:
+        forge, releases = client.app.state.forge, client.app.state.releases
+        forge.create("web", "site", "The site & <friends>")
+        forge.commit_files("web/site", "main", {"README.md": "# Hello\n\nworld\n", "src/a.py": "x = 1\n"}, "first")
+        c2 = forge.commit_files("web/site", "main", {"src/a.py": "x = 2\ny = 3\n"}, "Tune a\n\nBecause x was too small.")
+        forge.set_public("web/site", True)
+        releases.create("web/site", "v1.0", name="First one", notes="## New\n- **fast** [docs](https://x.y)")
+        forge.create("web", "secret", "Top secret plans")
+        forge.commit_files("web/secret", "main", {"plan.txt": "world domination\n"}, "the plan")
+
+        generic = _og(client.get("/forge/").text)
+        assert generic["og:title"] == "fileapi forge" and generic["twitter:card"] == "summary_large_image"
+        assert generic["og:image"].startswith("http://testserver/api/forge/card.png?")
+
+        repo = _og(client.get("/forge/web/site").text)
+        assert repo["og:title"] == "web/site" and repo["og:description"] == "The site & <friends>"
+        assert repo["og:url"] == "http://testserver/forge/web/site"
+        assert "&lt;friends&gt;" in client.get("/forge/web/site").text  # escaped in the HTML
+
+        sha = c2["commit"] if isinstance(c2, dict) and "commit" in c2 else forge.log("web/site")[0]["sha"]
+        commit = _og(client.get(f"/forge/web/site/-/commits/{sha[:12]}").text)
+        assert commit["og:title"] == "Tune a"
+        assert "1 file changed, +2 −1" in commit["og:description"] and "Because x was too small." in commit["og:description"]
+
+        rel = _og(client.get("/forge/web/site/-/releases/v1.0").text)
+        assert rel["og:title"] == "First one" and rel["og:description"] == "New fast docs"
+
+        f = _og(client.get("/forge/web/site/src/a.py", params={"ref": "main"}).text)
+        assert f["og:title"] == "a.py · web/site" and "x = 2 y = 3" in f["og:description"] and "at main" in f["og:description"]
+        assert f["og:url"] == "http://testserver/forge/web/site/src/a.py?ref=main"
+        d = _og(client.get("/forge/web/site/src").text)
+        assert d["og:title"] == "src/ · web/site"
+        # A path that isn't there (any more) falls back to the repo's card.
+        assert _og(client.get("/forge/web/site/gone.txt").text)["og:title"] == "web/site"
+
+        # Private: nothing about the repo leaks, at any route, not even to a signed-in browser.
+        for route in ("web/secret", "web/secret/plan.txt", "web/secret/-/commits", "web/nope"):
+            for headers in ({}, AUTH):
+                page = client.get(f"/forge/{route}", headers=headers).text
+                tags = _og(page)
+                assert tags["og:title"] == "fileapi forge" and tags["og:description"] == generic["og:description"]
+                assert "secret plans" not in page.lower() and "plan.txt" not in page.split("<script")[0].replace(route, "")
+
+        # The card image.
+        img = client.get(repo["og:image"].removeprefix("http://testserver"))
+        assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+        assert img.content[:8] == b"\x89PNG\r\n\x1a\n"
+        from PIL import Image
+        import io
+        assert Image.open(io.BytesIO(img.content)).size == (1200, 630)
+        hidden = client.get("/api/forge/card.png", params={"r": "web/secret"}).content
+        assert hidden == client.get("/api/forge/card.png", params={"r": "web/nope"}).content
+        assert hidden == client.get("/api/forge/card.png").content
 
 
 def test_repos_move_under_the_owner_and_keep_old_urls(tmp_path, backend):

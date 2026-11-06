@@ -34,6 +34,7 @@ from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
 from .upstream import Upstream, enabled_from_env as upstream_enabled
 from . import auth as oauth
+from . import preview
 from .auth import Auth
 from .tokens import FileKV
 
@@ -921,11 +922,31 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_ui_root():
         return RedirectResponse("/forge/")
 
+    def forge_page(request: Request, route: str) -> Response:
+        """The app's page with link-preview tags (fileapi/preview.py) for the route it was opened at."""
+        index = ui_dir / "index.html"
+        if not index.is_file():
+            raise HTTPException(404, "Web UI not built: run `just ui`")
+        base = oauth.base_url(request, public_url)
+        ref = request.query_params.get("ref", "")
+        p = preview.describe(forge, releases, route, ref)
+        page_url = f"{base}/forge/{quote(route, safe='/-._~!$&()*+,;=:@')}" + (f"?ref={quote(ref, safe='')}" if ref else "")
+        image_url = f"{base}/api/forge/card.png?{preview.image_query(p, route, ref)}"
+        body = preview.inject(index.read_text(), p, page_url, image_url)
+        return HTMLResponse(body, headers={"Cache-Control": "no-cache"})
+
+    @app.get("/api/forge/card.png", include_in_schema=False)
+    def forge_card(r: str = "", ref: str = ""):
+        """The link-preview image for /forge/<r>. Private and missing repos get the generic card."""
+        png = preview.render_card(preview.describe(forge, releases, r, ref))
+        return Response(png, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+
     @app.get("/forge/{name:path}", include_in_schema=False)
     def forge_ui(request: Request, name: str = ""):
-        name = name or "index.html"
-        if "/" in name or name.startswith(".") or Path(name).suffix not in ui_types:
-            name = "index.html"  # deep links like /forge/<project>/<repo> load the app, which routes itself
+        if not name or name == "index.html" or "/" in name or name.startswith(".") or Path(name).suffix not in ui_types:
+            # The app's routes are paths (/forge/<owner>/<repo>/-/commits/<sha>, /forge/settings): the page
+            # loads the app, which routes itself, with preview tags for crawlers that never run it.
+            return forge_page(request, "" if name == "index.html" else name)
         path = ui_dir / name
         headers = {"Cache-Control": "no-cache"}
         # Large assets are committed gzipped only; serve them as-is to browsers that accept gzip.

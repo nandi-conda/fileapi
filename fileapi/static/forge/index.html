@@ -42,6 +42,11 @@
 <div id="screen"></div>
 
 <script>
+// Routes are paths (/forge/<owner>/<repo>/-/commits/<sha>), which link previews can see; older links
+// kept them in the hash (/forge/#<owner>/<repo>/...), so move those into the path.
+if (location.pathname === "/forge/" && location.hash.length > 1)
+  history.replaceState(null, "", "/forge/" + location.hash.slice(1));
+
 // ---- Sign-in: a public OAuth client of this same server (PKCE), so the admin can see private repos.
 // The access token lives in localStorage and is read by the Qt app through fileapiToken().
 const KEY = "fileapi_forge_auth";
@@ -79,7 +84,7 @@ window.fileapiSignIn = async () => {
   const id = await clientId();
   const verifier = random(), state = random(16);
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
-  sessionStorage.setItem("fileapi_forge_pkce", JSON.stringify({ verifier, state, hash: location.hash }));
+  sessionStorage.setItem("fileapi_forge_pkce", JSON.stringify({ verifier, state, route: location.pathname + location.search + location.hash }));
   location.href = "/authorize?" + new URLSearchParams({ response_type: "code", client_id: id, redirect_uri: redirectUri,
     state, code_challenge: challenge, code_challenge_method: "S256", scope: "fileapi" });
 };
@@ -96,7 +101,7 @@ async function finishAuth() {
   if (q.has("code") || q.has("error")) {
     const pending = JSON.parse(sessionStorage.getItem("fileapi_forge_pkce") || "{}");
     sessionStorage.removeItem("fileapi_forge_pkce");
-    history.replaceState(null, "", "/forge/" + (pending.hash || ""));
+    history.replaceState(null, "", pending.route || "/forge/" + (pending.hash || ""));
     if (q.has("error")) throw new Error(q.get("error_description") || q.get("error"));
     if (!pending.state || q.get("state") !== pending.state) throw new Error("Sign-in state mismatch; try again");
     const s = load();

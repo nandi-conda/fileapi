@@ -40,7 +40,9 @@ public:
     void signIn();
     void signOut();
 
-    // The #<owner>/<repo>... part of the page URL, so links to a repo and its tabs can be shared.
+    // The app's route: the page URL after /forge/ (<owner>/<repo>[/<path>][?ref=<ref>][#L12], decoded), so
+    // links to a repo and its tabs can be shared, and the server sees enough of them for link previews.
+    // (The route used to be the URL's hash; index.html turns those old links into paths.)
     QString locationHash() const;
     // push = a new browser history entry (Back returns to the old one), else the current one is rewritten.
     // Does nothing when the URL already says this.

@@ -223,7 +223,8 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
         copyText(url, url.contains("?dl=") ? "download link (private repo: it works for an hour)" : "download link");
     });
     connect(m_copyRelease, &QPushButton::clicked, this, [this] {
-        copyText(m_api->baseUrl() + "/forge/#" + m_repo + "/-/releases/" + m_shownTag, "link to " + m_shownTag);
+        copyText(m_api->baseUrl() + "/forge/" + m_repo + "/-/releases/" + QString::fromLatin1(QUrl::toPercentEncoding(m_shownTag)),
+                 "link to " + m_shownTag);
     });
     connect(m_upload, &QPushButton::clicked, this, &ReleasesPanel::upload);
     connect(m_deleteAsset, &QPushButton::clicked, this, &ReleasesPanel::deleteAsset);
