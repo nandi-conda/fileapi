@@ -356,14 +356,20 @@ def _register_deploy_tools(mcp: MCPServer, forge: Forge, jobs, guard, default_ow
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
     def list_repo_secrets(ctx: Context, repo: RepoArg) -> str:
-        """Names of a repo's secrets and when each was set. Values are write-only and never shown."""
+        """Names of a repo's secrets (its own and the user secrets it inherits) and when each was set.
+        Values are write-only and never shown."""
         full = guard(ctx, lambda: full_name(ctx, repo))
         if not secrets.enabled:
             return "Secrets are turned off on this server: FILEAPI_SECRETS_KEY is not set."
         rows = secrets.list(full)
-        if not rows:
-            return f"{full} has no secrets. Add one with set_repo_secret."
-        return "\n".join(f"{r['name']}  (set {r['updated']})" for r in rows)
+        inherited = secrets.inherited(full)
+        lines = [f"{r['name']}  (set {r['updated']})" for r in rows] or [
+            f"{full} has no secrets of its own. Add one with set_repo_secret."]
+        if inherited:
+            lines.append("\nFrom your user secrets (all your repos get these):")
+            lines += [f"{r['name']}  (set {r['updated']})" + ("  overridden by the repo's own" if r["overridden"] else "")
+                      for r in inherited]
+        return "\n".join(lines)
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def set_repo_secret(
@@ -383,6 +389,40 @@ def _register_deploy_tools(mcp: MCPServer, forge: Forge, jobs, guard, default_ow
         full = guard(ctx, lambda: full_name(ctx, repo))
         guard(ctx, lambda: secrets.delete(full, name.strip()))
         return f"Deleted secret {name.strip()} from {full}."
+
+    def me(ctx: Context) -> str:
+        return _owner(ctx, default_owner)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def list_user_secrets(ctx: Context) -> str:
+        """Names of your user secrets, which deploy jobs of every repo you own get (a repo secret of the
+        same name overrides one). Values are write-only and never shown."""
+        if not secrets.enabled:
+            return "Secrets are turned off on this server: FILEAPI_SECRETS_KEY is not set."
+        owner = guard(ctx, lambda: me(ctx))
+        rows = secrets.list_user(owner)
+        if not rows:
+            return f"{owner} has no user secrets. Add one with set_user_secret."
+        return "\n".join(f"{r['name']}  (set {r['updated']})" for r in rows)
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def set_user_secret(
+        ctx: Context,
+        name: Annotated[str, Field(description="Env-var style name, e.g. DEPOT_TOKEN")],
+        value: Annotated[str, Field(description="The secret value. It is encrypted and can't be read back")],
+    ) -> str:
+        """Create or replace an encrypted user secret: deploy jobs of all your repos get it as an env var,
+        unless the repo has its own secret of the same name."""
+        owner = guard(ctx, lambda: me(ctx))
+        out = guard(ctx, lambda: secrets.set_user(owner, name, value))
+        return f"{'Added' if out['created'] else 'Replaced'} user secret {out['name']} for all of {owner}'s repos."
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def delete_user_secret(ctx: Context, name: str) -> str:
+        """Delete a user secret (repos that have their own secret of that name keep it)."""
+        owner = guard(ctx, lambda: me(ctx))
+        guard(ctx, lambda: secrets.delete_user(owner, name.strip()))
+        return f"Deleted user secret {name.strip()}."
 
     @mcp.tool(structured_output=False)
     def run_deploy(

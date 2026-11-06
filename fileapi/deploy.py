@@ -6,6 +6,9 @@ Secrets
     write-only: the API and MCP tools list names and dates, never values. Values only ever leave the server
     as environment variables of a deploy job (and they are masked in its output).
 
+    User secrets belong to an owner (the signed-in account) and every repo under that owner gets them, e.g.
+    one DEPOT_TOKEN or FLY_API_TOKEN for all your repos. A repo secret of the same name overrides it.
+
 Deploy jobs
     A repo opts in by committing `.forge/jobs.toml`. After every push (git, push_bundle or commit_files) the
     server reads that file from the pushed commit and runs the jobs whose `branches` match, in a background
@@ -31,7 +34,7 @@ Deploy jobs
         push = true                   # push the tags; default: save to the Depot registry instead
         login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
 
-    A depot job needs the DEPOT_TOKEN secret (a Depot project or organization token). The server downloads the
+    A depot job needs the DEPOT_TOKEN secret (a Depot project, organization or user token; repo or user secret). The server downloads the
     Depot CLI the first time it's needed; shell jobs whose script mentions `depot` get it on PATH too.
 
     `${NAME}` in post/headers/body (and the depot table) is replaced by that secret or FORGE_* value. Each run (status, output
@@ -120,13 +123,18 @@ def check_secret_name(name: str) -> str:
     return name
 
 
+def _user_key(owner: str) -> str:
+    return _repo_key("forge_user_secrets_", owner)
+
+
 class RepoSecrets:
-    """Encrypted, write-only secrets per repo, one KV record per repo."""
+    """Encrypted, write-only secrets, one KV record per repo, plus one per user (owner) that every repo
+    the user owns gets too. A repo secret wins over a user secret of the same name."""
 
     def __init__(self, kv, key: bytes | None):
         self.kv = kv
         self._aes = AESGCM(key) if key else None
-        self._lock = threading.Lock()  # read-modify-write of a repo's record within this process
+        self._lock = threading.Lock()  # read-modify-write of a record within this process
 
     @property
     def enabled(self) -> bool:
@@ -137,19 +145,19 @@ class RepoSecrets:
             raise SecretsUnavailable(f"Secrets are turned off: set {KEY_ENV} on the server (32 random bytes, base64)")
         return self._aes
 
-    def _record(self, repo: str) -> dict:
-        return (self.kv.get(_repo_key("forge_secrets_", repo)) or {}).get("secrets", {})
+    def _record(self, key: str) -> dict:
+        return (self.kv.get(key) or {}).get("secrets", {})
 
-    def _save(self, repo: str, secrets: dict) -> None:
+    def _save(self, key: str, secrets: dict) -> None:
         if secrets:
-            self.kv.put(_repo_key("forge_secrets_", repo), {"secrets": secrets})
+            self.kv.put(key, {"secrets": secrets})
         else:
-            self.kv.pop(_repo_key("forge_secrets_", repo))
+            self.kv.pop(key)
 
-    def list(self, repo: str) -> list[dict]:
-        return [{"name": n, "updated": s.get("updated", "")} for n, s in sorted(self._record(repo).items())]
+    def _list(self, key: str) -> list[dict]:
+        return [{"name": n, "updated": s.get("updated", "")} for n, s in sorted(self._record(key).items())]
 
-    def set(self, repo: str, name: str, value: str) -> dict:
+    def _set(self, key: str, name: str, value: str, what: str) -> dict:
         aes = self._need()
         name = check_secret_name(name)
         data = value.encode()
@@ -159,33 +167,61 @@ class RepoSecrets:
         # The name is authenticated data, so a ciphertext can't be passed off as another secret.
         box = base64.b64encode(nonce + aes.encrypt(nonce, data, name.encode())).decode()
         with self._lock:
-            current = self._record(repo)
+            current = self._record(key)
             if name not in current and len(current) >= MAX_SECRETS:
-                raise StorageError(f"A repo can have at most {MAX_SECRETS} secrets")
+                raise StorageError(f"A {what} can have at most {MAX_SECRETS} secrets")
             created = name not in current
             current[name] = {"v": box, "updated": _now()}
-            self._save(repo, current)
+            self._save(key, current)
         return {"name": name, "updated": current[name]["updated"], "created": created}
 
-    def delete(self, repo: str, name: str) -> None:
+    def _delete(self, key: str, name: str) -> None:
         with self._lock:
-            current = self._record(repo)
+            current = self._record(key)
             if current.pop(name, None) is None:
                 raise NotFound(f"No such secret: {name}")
-            self._save(repo, current)
+            self._save(key, current)
 
-    def values(self, repo: str) -> dict[str, str]:
-        """Decrypted values, for a job's environment. Unreadable ones (key changed) are skipped."""
+    def _values(self, key: str) -> dict[str, str]:
         if self._aes is None:
             return {}
         out = {}
-        for name, s in self._record(repo).items():
+        for name, s in self._record(key).items():
             try:
                 raw = base64.b64decode(s["v"])
                 out[name] = self._aes.decrypt(raw[:12], raw[12:], name.encode()).decode()
             except (InvalidTag, KeyError, ValueError, binascii.Error):
-                continue
+                continue  # unreadable (the key changed): skipped
         return out
+
+    # -- a repo's own secrets
+    def list(self, repo: str) -> list[dict]:
+        return self._list(_repo_key("forge_secrets_", repo))
+
+    def set(self, repo: str, name: str, value: str) -> dict:
+        return self._set(_repo_key("forge_secrets_", repo), name, value, "repo")
+
+    def delete(self, repo: str, name: str) -> None:
+        self._delete(_repo_key("forge_secrets_", repo), name)
+
+    def inherited(self, repo: str) -> list[dict]:
+        """The owner's user secrets as this repo sees them: overridden = the repo has its own of that name."""
+        own = set(self._record(_repo_key("forge_secrets_", repo)))
+        return [{**s, "overridden": s["name"] in own} for s in self.list_user(repo.split("/")[0])]
+
+    # -- user secrets: every repo under the owner gets them
+    def list_user(self, owner: str) -> list[dict]:
+        return self._list(_user_key(owner))
+
+    def set_user(self, owner: str, name: str, value: str) -> dict:
+        return self._set(_user_key(owner), name, value, "user")
+
+    def delete_user(self, owner: str, name: str) -> None:
+        self._delete(_user_key(owner), name)
+
+    def values(self, repo: str) -> dict[str, str]:
+        """Decrypted values for a job's environment: the owner's user secrets, then the repo's on top."""
+        return {**self._values(_user_key(repo.split("/")[0])), **self._values(_repo_key("forge_secrets_", repo))}
 
     def move(self, old: str, new: str) -> None:
         with self._lock:
@@ -313,7 +349,7 @@ _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 def _expand(text: str, env: dict[str, str]) -> str:
     def sub(m):
         if m.group(1) not in env:
-            raise StorageError(f"${{{m.group(1)}}} is not a secret of this repo (or a FORGE_ variable)")
+            raise StorageError(f"${{{m.group(1)}}} is not a secret of this repo or its owner (or a FORGE_ variable)")
         return env[m.group(1)]
 
     return _VAR_RE.sub(sub, text)
@@ -602,7 +638,8 @@ class Jobs:
         d = job["depot"]
         if not env.get("DEPOT_TOKEN"):
             raise StorageError("A depot job needs the DEPOT_TOKEN secret: a Depot project token (project > Settings > "
-                               "Project tokens) or an organization token (organization Settings > API tokens)")
+                               "Project tokens) or an organization token (organization Settings > API tokens), as a repo "
+                               "secret or a user secret for all your repos (`just depot-user-token`)")
         project = _expand(d["project"], env) if d["project"] else env.get("DEPOT_PROJECT_ID", "")
         if not project:
             raise StorageError("Set depot.project in the job, or a DEPOT_PROJECT_ID secret (the ID on the "

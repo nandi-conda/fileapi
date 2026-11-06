@@ -538,7 +538,9 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.get("/api/forge/repos/{project}/{repo}/secrets", tags=["forge"])
     def forge_secrets(request: Request, project: str, repo: str):
         full = admin_repo(request, project, repo)
-        return {"enabled": repo_secrets.enabled, "key_env": KEY_ENV, "secrets": repo_secrets.list(full)}
+        # inherited: the owner's user secrets (names only); overridden = this repo has its own of that name.
+        return {"enabled": repo_secrets.enabled, "key_env": KEY_ENV, "secrets": repo_secrets.list(full),
+                "inherited": repo_secrets.inherited(full)}
 
     @app.put("/api/forge/repos/{project}/{repo}/secrets/{name}", tags=["forge"])
     def forge_set_secret(request: Request, project: str, repo: str, name: str, body: SecretBody):
@@ -550,6 +552,24 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.delete("/api/forge/repos/{project}/{repo}/secrets/{name}", tags=["forge"], status_code=204)
     def forge_delete_secret(request: Request, project: str, repo: str, name: str):
         repo_secrets.delete(admin_repo(request, project, repo), name)
+        return Response(status_code=204)
+
+    # User secrets: every repo the signed-in account owns gets them; a repo secret of the same name wins.
+    @app.get("/api/forge/user/secrets", tags=["forge"])
+    def forge_user_secrets(request: Request):
+        me = forge_admin(request)
+        return {"enabled": repo_secrets.enabled, "key_env": KEY_ENV, "owner": me,
+                "secrets": repo_secrets.list_user(me)}
+
+    @app.put("/api/forge/user/secrets/{name}", tags=["forge"])
+    def forge_set_user_secret(request: Request, name: str, body: SecretBody):
+        """Create or replace a user secret, which jobs of all your repos get (unless a repo sets the same name)."""
+        out = repo_secrets.set_user(forge_admin(request), name, body.value)
+        return JSONResponse({"name": out["name"], "updated": out["updated"]}, status_code=201 if out["created"] else 200)
+
+    @app.delete("/api/forge/user/secrets/{name}", tags=["forge"], status_code=204)
+    def forge_delete_user_secret(request: Request, name: str):
+        repo_secrets.delete_user(forge_admin(request), name)
         return Response(status_code=204)
 
     @app.get("/api/forge/repos/{project}/{repo}/runs", tags=["forge"])

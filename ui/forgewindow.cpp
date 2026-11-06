@@ -3,6 +3,7 @@
 #include "codeview.h"
 #include "highlighter.h"
 #include "navpanel.h"
+#include "secretspanel.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -111,6 +112,12 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_who = new QLabel;
     m_who->setContentsMargins(0, 0, 8, 0);
     bar->addWidget(m_who);
+    m_userSettingsBtn = new QPushButton("Settings");
+    m_userSettingsBtn->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+    m_userSettingsBtn->setToolTip("Your settings: secrets for all your repos");
+    m_userSettingsAct = bar->addWidget(m_userSettingsBtn);  // a toolbar widget is shown/hidden via its action
+    m_userSettingsAct->setVisible(false);
+    connect(m_userSettingsBtn, &QPushButton::clicked, this, [this] { showUserSettings(); });
     m_signIn = new QPushButton("Sign in");
     bar->addWidget(m_signIn);
     connect(m_signIn, &QPushButton::clicked, this, [this] {
@@ -350,6 +357,27 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         status(QStringLiteral("%1 repositories").arg(m_repos->count()));
     });
     m_main->addWidget(errPage);
+
+    // ---- user settings (page 3): things that apply to every repo the signed-in account owns
+    auto *userPage = new QWidget;
+    auto *ul = new QVBoxLayout(userPage);
+    ul->setContentsMargins(8, 8, 8, 8);
+    auto *userTitle = new QLabel("Your settings");
+    QFont utf = userTitle->font();
+    utf.setPointSizeF(utf.pointSizeF() * 1.5);
+    utf.setBold(true);
+    userTitle->setFont(utf);
+    ul->addWidget(userTitle);
+    m_userSecrets = new SecretsPanel(m_api, "User secrets",
+        "Every repo you own gets these in its deploy jobs (<code>.forge/jobs.toml</code>), as environment variables "
+        "and <code>${NAME}</code>: set a token like <code>DEPOT_TOKEN</code> once instead of per repo. A repo "
+        "secret of the same name (repo Settings tab) overrides one for that repo. Encrypted on the server and "
+        "never shown again.");
+    m_userSecrets->setPath("user/secrets");
+    connect(m_userSecrets, &SecretsPanel::statusText, this, &ForgeWindow::status);
+    ul->addWidget(m_userSecrets);
+    ul->addStretch(1);
+    m_main->addWidget(userPage);
     split->addWidget(m_main);
     split->setStretchFactor(1, 1);
     split->setSizes({260, 900});
@@ -413,6 +441,9 @@ void ForgeWindow::loadMe()
         m_tabs->setTabVisible(2, in);
         m_tabs->setTabVisible(3, in);
         m_newRow->setVisible(in);
+        m_userSettingsAct->setVisible(in);
+        if (in && m_api->locationHash() == "settings")
+            showUserSettings();
         m_newName->setToolTip(QStringLiteral("Creates %1/<name>").arg(m_owner));
         if (m_ownerPrefix)
             m_ownerPrefix->setText(m_owner + " /");
@@ -490,7 +521,7 @@ void ForgeWindow::openRepo(const QString &repo)
     m_navPanel->setBackEnabled(false);
     closeNav();
     m_settings->setEnabled(false);
-    m_secrets->clear();
+    m_repoSecrets->setPath(repoPath(repo) + "/secrets");
     m_runs->clear();
     m_runOutput->clear();
     m_runShown.clear();
@@ -948,50 +979,14 @@ QWidget *ForgeWindow::buildSettings()
     dl->addLayout(delRow);
 
     // Secrets: write-only. The list shows names and dates; a value can be replaced but never read back.
-    auto *sec = new QGroupBox("Secrets");
-    auto *sl = new QVBoxLayout(sec);
-    m_secretsNote = new QLabel("Encrypted on the server and never shown again. Deploy jobs in "
-                               "<code>.forge/jobs.toml</code> get each one as an environment variable "
-                               "(see the Deploys tab).");
-    m_secretsNote->setWordWrap(true);
-    m_secretsNote->setTextFormat(Qt::RichText);
-    sl->addWidget(m_secretsNote);
-    m_secrets = new QTreeWidget;
-    m_secrets->setHeaderLabels({"Name", "Updated"});
-    m_secrets->setRootIsDecorated(false);
-    m_secrets->setUniformRowHeights(true);
-    m_secrets->setMinimumHeight(90);
-    m_secrets->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_secrets->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    sl->addWidget(m_secrets);
-    auto *addRow = new QHBoxLayout;
-    m_secretName = new QLineEdit;
-    m_secretName->setPlaceholderText("NAME, e.g. FLY_API_TOKEN");
-    addRow->addWidget(m_secretName, 1);
-    m_secretValue = new QLineEdit;
-    m_secretValue->setPlaceholderText("value");
-    m_secretValue->setEchoMode(QLineEdit::Password);
-    addRow->addWidget(m_secretValue, 2);
-    m_secretSave = new QPushButton("Save secret");
-    m_secretSave->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
-    addRow->addWidget(m_secretSave);
-    m_secretDelete = new QPushButton("Delete");
-    m_secretDelete->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
-    m_secretDelete->setEnabled(false);
-    m_secretDelete->setToolTip("Delete the selected secret");
-    addRow->addWidget(m_secretDelete);
-    sl->addLayout(addRow);
-    lay->addWidget(sec);
-    connect(m_secretSave, &QPushButton::clicked, this, &ForgeWindow::saveSecret);
-    connect(m_secretValue, &QLineEdit::returnPressed, this, &ForgeWindow::saveSecret);
-    connect(m_secretDelete, &QPushButton::clicked, this, &ForgeWindow::deleteSecret);
-    connect(m_secrets, &QTreeWidget::itemSelectionChanged, this, [this] {
-        const auto sel = m_secrets->selectedItems();
-        const bool real = !sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty();
-        m_secretDelete->setEnabled(real);
-        if (real)
-            m_secretName->setText(sel.first()->data(0, PathRole).toString());  // to replace its value
-    });
+    // The owner's user secrets show too (dimmed): this repo's jobs get them unless it has its own.
+    m_repoSecrets = new SecretsPanel(m_api, "Secrets",
+        "Encrypted on the server and never shown again. Deploy jobs in <code>.forge/jobs.toml</code> get each one "
+        "as an environment variable (see the Deploys tab), along with your "
+        "<a href=\"#settings\">user secrets</a>; a repo secret of the same name wins.");
+    connect(m_repoSecrets, &SecretsPanel::statusText, this, &ForgeWindow::status);
+    connect(m_repoSecrets->noteLabel(), &QLabel::linkActivated, this, [this] { showUserSettings(); });
+    lay->addWidget(m_repoSecrets);
 
     lay->addWidget(danger);
     lay->addStretch(1);
@@ -1028,7 +1023,7 @@ void ForgeWindow::fillSettings(const QJsonObject &info)
         m_runBranch->setCurrentText(def);
     m_runNow->setEnabled(!branches.isEmpty());
     if (m_signedIn) {
-        loadSecrets();
+        m_repoSecrets->load();
         if (m_tabs->currentIndex() == 3)
             loadRuns();
     }
@@ -1088,87 +1083,18 @@ void ForgeWindow::deleteRepo()
     });
 }
 
-void ForgeWindow::loadSecrets()
+void ForgeWindow::showUserSettings()
 {
-    const QString repo = m_repo;
-    if (repo.isEmpty())
-        return;
-    m_api->get(repoPath(repo) + "/secrets", {}, this, [this, repo](const QJsonObject &body, const QString &error) {
-        if (repo != m_repo)
-            return;
-        m_secrets->clear();
-        if (!error.isEmpty()) {
-            (new QTreeWidgetItem(m_secrets))->setText(0, "Couldn't load secrets: " + error);
-            return;
-        }
-        const bool enabled = body.value("enabled").toBool();
-        m_secretName->setEnabled(enabled);
-        m_secretValue->setEnabled(enabled);
-        m_secretSave->setEnabled(enabled);
-        if (!enabled) {
-            (new QTreeWidgetItem(m_secrets))->setText(0, "Secrets are off: the server needs "
-                                                       + body.value("key_env").toString() + " set.");
-            return;
-        }
-        const QJsonArray list = body.value("secrets").toArray();
-        if (list.isEmpty())
-            (new QTreeWidgetItem(m_secrets))->setText(0, "No secrets yet");
-        for (const auto &v : list) {
-            const QJsonObject s = v.toObject();
-            auto *it = new QTreeWidgetItem(m_secrets);
-            it->setText(0, s.value("name").toString());
-            it->setFont(0, QFontDatabase::systemFont(QFontDatabase::FixedFont));
-            it->setData(0, PathRole, s.value("name").toString());
-            const QDateTime when = QDateTime::fromString(s.value("updated").toString(), Qt::ISODate);
-            it->setText(1, QLocale().toString(when.toLocalTime(), QLocale::ShortFormat));
-        }
-    });
-}
-
-void ForgeWindow::saveSecret()
-{
-    const QString repo = m_repo;
-    const QString name = m_secretName->text().trimmed();
-    if (repo.isEmpty())
-        return;
-    if (name.isEmpty())
-        return status("Type a name for the secret, e.g. FLY_API_TOKEN.");
-    if (m_secretValue->text().isEmpty())
-        return status("Type the secret's value.");
-    QJsonObject body;
-    body["value"] = m_secretValue->text();
-    m_secretSave->setEnabled(false);
-    status("Saving secret " + name + "…");
-    m_api->send("PUT", repoPath(repo) + "/secrets/" + QString::fromLatin1(QUrl::toPercentEncoding(name)), body, this,
-                [this, name](const QJsonObject &, const QString &error) {
-        m_secretSave->setEnabled(true);
-        if (!error.isEmpty())
-            return status("Could not save " + name + ": " + error, true);
-        m_secretValue->clear();  // never kept around in the page
-        m_secretName->clear();
-        status("Saved secret " + name + ".");
-        loadSecrets();
-    });
-}
-
-void ForgeWindow::deleteSecret()
-{
-    const auto sel = m_secrets->selectedItems();
-    if (m_repo.isEmpty() || sel.isEmpty())
-        return;
-    const QString name = sel.first()->data(0, PathRole).toString();
-    if (name.isEmpty())
-        return;
-    m_secretDelete->setEnabled(false);
-    status("Deleting secret " + name + "…");
-    m_api->send("DELETE", repoPath(m_repo) + "/secrets/" + QString::fromLatin1(QUrl::toPercentEncoding(name)), {},
-                this, [this, name](const QJsonObject &, const QString &error) {
-        if (!error.isEmpty())
-            return status("Could not delete " + name + ": " + error, true);
-        m_secretName->clear();
-        status("Deleted secret " + name + ".");
-        loadSecrets();
-    });
+    m_repo.clear();
+    m_pendingPath.clear();
+    {
+        const QSignalBlocker block(m_repos);
+        m_repos->setCurrentRow(-1);  // so clicking any repo (even the one that was open) opens it again
+    }
+    m_api->setLocationHash("settings");
+    m_main->setCurrentIndex(3);
+    m_userSecrets->load();
+    status("Your settings");
 }
 
 QWidget *ForgeWindow::buildDeploys()
@@ -1179,7 +1105,7 @@ QWidget *ForgeWindow::buildDeploys()
     m_runsNote = new QLabel(
         "Every push runs the jobs in <code>.forge/jobs.toml</code> whose <code>branches</code> match (default: the "
         "default branch). A job is a shell script (<code>run</code>) in a checkout of the commit, or an HTTP request "
-        "(<code>post</code>, for deploy hooks). Repo secrets are environment variables, and "
+        "(<code>post</code>, for deploy hooks). Repo and user secrets are environment variables, and "
         "<code>${NAME}</code> in a post's URL, headers or body; they are masked in the output.");
     m_runsNote->setWordWrap(true);
     m_runsNote->setTextFormat(Qt::RichText);

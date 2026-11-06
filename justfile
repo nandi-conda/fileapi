@@ -152,6 +152,11 @@ secrets-key: login
 depot-token repo project="" url=fileapi_url:
     {{python}} -m fileapi.depot_setup --url "{{url}}" "{{repo}}" "{{project}}"
 
+# Your Depot user token as a user secret (DEPOT_TOKEN) that every repo you own gets; with a repo, also sets
+# that repo's DEPOT_PROJECT_ID (finding or creating the Depot project)
+depot-user-token repo="" project="" url=fileapi_url:
+    {{python}} -m fileapi.depot_setup --user --url "{{url}}" "{{repo}}" "{{project}}"
+
 # First deploy: creates the app, then sets DATABASE_URL (which redeploys with Postgres)
 launch: login
     #!/usr/bin/env bash

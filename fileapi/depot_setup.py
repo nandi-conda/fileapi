@@ -6,6 +6,10 @@
 4. Signs in to fileapi in the browser (the same sign-in and token cache as git-credential-fileapi).
 5. Stores DEPOT_TOKEN and DEPOT_PROJECT_ID as the repo's secrets, so `depot = true` in .forge/jobs.toml works.
 
+With --user (`just depot-user-token [repo]`), DEPOT_TOKEN is your Depot user token instead, stored once as a
+user secret that every repo you own gets: it can build in any Depot project you can see. A repo given too
+just gets its DEPOT_PROJECT_ID (the project is found or created as above); no project token is made.
+
 Standard library only, like git_credential.py, so it runs with any python3.
 """
 
@@ -139,21 +143,38 @@ def resolve_repo(base: str, token: str, repo: str) -> str:
     raise AssertionError
 
 
+def find_project(cli: str, wanted: str) -> dict:
+    project = next((p for p in list_projects(cli) if wanted in (p["id"], p["name"])), None)
+    if project is None:
+        say(f"Creating Depot project {wanted!r} ...")
+        depot(cli, "projects", "create", wanted, capture=False)
+        project = next((p for p in list_projects(cli) if p["name"] == wanted), None)
+        if project is None:
+            fail(f"Created {wanted!r} but can't find it in `depot projects list`")
+    say(f"Depot project: {project['name']} ({project['id']})")
+    return project
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("repo", help="forge repo name (or owner/name)")
+    ap.add_argument("repo", nargs="?", default="", help="forge repo name (or owner/name); optional with --user")
     ap.add_argument("project", nargs="?", default="", help="Depot project name or ID (default: the repo's name; "
                                                           "created if missing)")
+    ap.add_argument("--user", action="store_true", help="store your Depot user token as a user secret that all "
+                                                        "your repos get, instead of a project token on one repo")
     ap.add_argument("--url", default=DEFAULT_URL, help=f"fileapi server (default {DEFAULT_URL})")
     args = ap.parse_args(argv)
     base = args.url.rstrip("/").removesuffix("/mcp")
+    if not args.repo and not args.user:
+        ap.error("give a repo, or --user for a token all your repos share")
 
     # fileapi first: a typo in the repo name shouldn't leave a stray Depot project and token behind.
     entry = git_credential.token_for(base)
     if not entry:
         fail(f"Couldn't sign in to {base}")
-    full = resolve_repo(base, entry["access_token"], args.repo)
-    secrets_info = fileapi(base, entry["access_token"], "GET", f"/api/forge/repos/{full}/secrets")
+    tok = entry["access_token"]
+    full = resolve_repo(base, tok, args.repo) if args.repo else ""
+    secrets_info = fileapi(base, tok, "GET", f"/api/forge/repos/{full}/secrets" if full else "/api/forge/user/secrets")
     if not secrets_info.get("enabled", True):
         fail(f"Secrets are off on {base}: run `just secrets-key` (sets FILEAPI_SECRETS_KEY) and deploy first")
 
@@ -164,30 +185,35 @@ def main(argv: list[str] | None = None) -> int:
     if not user_token:
         fail("`depot login token` printed no token")
 
-    wanted = args.project or full.split("/")[-1]
-    projects = list_projects(cli)
-    project = next((p for p in projects if wanted in (p["id"], p["name"])), None)
-    if project is None:
-        say(f"Creating Depot project {wanted!r} ...")
-        depot(cli, "projects", "create", wanted, capture=False)
-        project = next((p for p in list_projects(cli) if p["name"] == wanted), None)
-        if project is None:
-            fail(f"Created {wanted!r} but can't find it in `depot projects list`")
-    say(f"Depot project: {project['name']} ({project['id']})")
+    if args.user:
+        fileapi(base, tok, "PUT", "/api/forge/user/secrets/DEPOT_TOKEN", {"value": user_token})
+        say("Stored your Depot user token as the user secret DEPOT_TOKEN: every repo you own gets it "
+            "(a repo's own DEPOT_TOKEN secret still wins).")
+        if full:
+            project = find_project(cli, args.project or full.split("/")[-1])
+            fileapi(base, tok, "PUT", f"/api/forge/repos/{full}/secrets/DEPOT_PROJECT_ID", {"value": project["id"]})
+            say(f"Stored DEPOT_PROJECT_ID on {full}.")
+        else:
+            say("Each repo still needs its project: `project = \"<id>\"` in its depot job, a DEPOT_PROJECT_ID "
+                "secret, or run this again with the repo name.")
+        say("Add a job to .forge/jobs.toml and push:\n\n  [[job]]\n  name = \"image\"\n  depot = true\n")
+        return 0
 
+    project = find_project(cli, args.project or full.split("/")[-1])
     try:
         made = depot_api("depot.core.v1.ProjectService/CreateToken",
                          {"projectId": project["id"], "description": f"fileapi forge {full}"}, user_token)
         token, what = made.get("secret", ""), f"project token {made.get('tokenId', '')}".strip()
     except RuntimeError as e:
         fail(f"Depot wouldn't create a project token ({e}). Create one by hand: depot.dev > project "
-             f"{project['name']} > Settings > Project tokens, then set it as the repo's DEPOT_TOKEN secret.")
+             f"{project['name']} > Settings > Project tokens, then set it as the repo's DEPOT_TOKEN secret, "
+             f"or run `just depot-user-token {args.repo}` to use your user token for all repos.")
         raise
     if not token:
         fail("Depot's CreateToken answer had no secret in it")
 
     for name, value in (("DEPOT_TOKEN", token), ("DEPOT_PROJECT_ID", project["id"])):
-        fileapi(base, entry["access_token"], "PUT", f"/api/forge/repos/{full}/secrets/{name}", {"value": value})
+        fileapi(base, tok, "PUT", f"/api/forge/repos/{full}/secrets/{name}", {"value": value})
     say(f"Stored DEPOT_TOKEN ({what}) and DEPOT_PROJECT_ID on {full}.")
     say("Add a job to .forge/jobs.toml and push:\n\n  [[job]]\n  name = \"image\"\n  depot = true\n")
     return 0

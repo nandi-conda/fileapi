@@ -5,9 +5,11 @@
 #include <QUrlQuery>
 
 class Api;
+class QAction;
 class CodeHighlighter;
 class CodeView;
 class NavPanel;
+class SecretsPanel;
 class QSplitter;
 class QCheckBox;
 class QComboBox;
@@ -42,10 +44,9 @@ private:
     void fillSettings(const QJsonObject &info);
     void saveSettings();
     void deleteRepo();
-    // Repo secrets (write-only, in Settings) and deploy job runs (the Deploys tab).
-    void loadSecrets();
-    void saveSecret();
-    void deleteSecret();
+    // Deploy job runs (the Deploys tab). Secrets are SecretsPanels: the repo's in its Settings tab, the
+    // user's (every repo they own gets those) on the user settings page.
+    void showUserSettings();
     QWidget *buildDeploys();
     void loadRuns();
     void showRun(const QString &id);
@@ -110,12 +111,10 @@ private:
     QPushButton *m_save;
     QLineEdit *m_confirmDelete;
     QPushButton *m_delete;
-    QTreeWidget *m_secrets;
-    QLineEdit *m_secretName;
-    QLineEdit *m_secretValue;
-    QPushButton *m_secretSave;
-    QPushButton *m_secretDelete;
-    QLabel *m_secretsNote;
+    SecretsPanel *m_repoSecrets;
+    SecretsPanel *m_userSecrets;
+    QPushButton *m_userSettingsBtn;
+    QAction *m_userSettingsAct;
     QWidget *m_deploys;
     QTreeWidget *m_runs;
     QPlainTextEdit *m_runOutput;

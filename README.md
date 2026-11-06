@@ -135,6 +135,8 @@ just ui   # downloads Qt 6.8 (host + wasm), emsdk 3.1.56, cmake and ninja into u
 
 Each repo can hold **secrets** (env-var names like `FLY_API_TOKEN`), set in the web UI (**Settings → Secrets**), over the API, or with the `set_repo_secret` MCP tool. They are encrypted with AES-256-GCM under `FILEAPI_SECRETS_KEY` before they're stored, and write-only: you can list, replace and delete them, never read them back. Without `FILEAPI_SECRETS_KEY` secrets are off (the rest of the forge works); `just secrets-key` generates one and sets it locally and on FastAPI Cloud.
 
+**User secrets** work the same way but belong to you, not a repo: every repo you own gets them in its jobs, so a token like `DEPOT_TOKEN` or `FLY_API_TOKEN` is set once. Manage them on the web UI's **Settings** page (top bar), over the API, or with the `set_user_secret` / `list_user_secrets` / `delete_user_secret` MCP tools. A repo secret with the same name overrides the user secret for that repo; the repo's Secrets list shows the user secrets it inherits, dimmed, and struck through where overridden.
+
 A repo opts in to **auto-deploy** by committing `.forge/jobs.toml`. Every push (git, `push_bundle` or `commit_files`) reads it from the pushed commit and runs the jobs whose `branches` match, in the background on the server:
 
 ```toml
@@ -176,13 +178,16 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }  # r
 args = ["--no-cache"]            # any other `depot build` flags
 ```
 
-`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
+`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). For all your repos at once, `just depot-user-token [repo]` stores your Depot user token (`depot login token`, which can build in any project you can see) as the user secret `DEPOT_TOKEN`; with a repo it also sets that repo's `DEPOT_PROJECT_ID`. Each repo still needs its project: `project` in the job, a `DEPOT_PROJECT_ID` secret, or one run of that command per repo. By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
 
 | Endpoint (signed in) | Does |
 | --- | --- |
-| `GET /api/forge/repos/<owner>/<repo>/secrets` | Secret names and update times (`enabled: false` without the key) |
+| `GET /api/forge/repos/<owner>/<repo>/secrets` | Secret names and update times (`enabled: false` without the key), plus `inherited`: your user secrets with `overridden` |
 | `PUT /api/forge/repos/<owner>/<repo>/secrets/<NAME>` | `{"value": "..."}` create or replace |
 | `DELETE /api/forge/repos/<owner>/<repo>/secrets/<NAME>` | Delete |
+| `GET /api/forge/user/secrets` | Your user secrets (every repo you own gets them) |
+| `PUT /api/forge/user/secrets/<NAME>` | `{"value": "..."}` create or replace |
+| `DELETE /api/forge/user/secrets/<NAME>` | Delete |
 | `GET /api/forge/repos/<owner>/<repo>/runs[/<id>]` | Recent runs, or one with its output |
 | `POST /api/forge/repos/<owner>/<repo>/runs` | `{"ref"?: branch, "job"?: name}` run now |
 

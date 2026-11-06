@@ -1029,6 +1029,54 @@ def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
         assert client.get(f"{base2}/runs", headers=AUTH).json()["runs"] == []
 
 
+def test_user_secrets_apply_to_every_repo(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge, jobs = client.app.state.forge, client.app.state.jobs
+        forge.create("nandi.uk", "one")
+        forge.create("nandi.uk", "two")
+        forge.create("someone", "else")
+        user = "/api/forge/user/secrets"
+
+        assert client.get(user).status_code == 401
+        assert client.put(f"{user}/X", json={"value": "v"}).status_code == 401
+        r = client.put(f"{user}/SHARED_TOKEN", json={"value": "user-wide-1"}, headers=AUTH)
+        assert r.status_code == 201 and "value" not in r.json()
+        assert client.put(f"{user}/SHARED_TOKEN", json={"value": "user-wide-2"}, headers=AUTH).status_code == 200
+        assert client.put(f"{user}/REGION", json={"value": "ams-user"}, headers=AUTH).status_code == 201
+        assert client.put(f"{user}/FORGE_X", json={"value": "v"}, headers=AUTH).status_code == 400
+        listed = client.get(user, headers=AUTH).json()
+        assert listed["enabled"] and listed["owner"] == "nandi.uk"
+        assert [s["name"] for s in listed["secrets"]] == ["REGION", "SHARED_TOKEN"] and "user-wide" not in str(listed)
+        raw = jobs.kv.get("forge_user_secrets_" + "nandi.uk".encode().hex())
+        assert raw and "user-wide" not in str(raw)
+
+        # Repo two overrides REGION; the repo listing shows what it inherits.
+        assert client.put("/api/forge/repos/nandi.uk/two/secrets/REGION", json={"value": "fra-repo"},
+                          headers=AUTH).status_code == 201
+        inh = client.get("/api/forge/repos/nandi.uk/two/secrets", headers=AUTH).json()["inherited"]
+        assert [(s["name"], s["overridden"]) for s in inh] == [("REGION", True), ("SHARED_TOKEN", False)]
+
+        secrets = jobs.secrets
+        assert secrets.values("nandi.uk/one") == {"SHARED_TOKEN": "user-wide-2", "REGION": "ams-user"}
+        assert secrets.values("nandi.uk/two") == {"SHARED_TOKEN": "user-wide-2", "REGION": "fra-repo"}
+        assert secrets.values("someone/else") == {}  # another owner's repo doesn't get them
+
+        # A job sees the merged set, masked in its output.
+        job = '[[job]]\nname = "show"\nrun = "echo tok=$SHARED_TOKEN region=${REGION}"\n'
+        forge.commit_files("nandi.uk/two", "main", {".forge/jobs.toml": job}, "jobs")
+        jobs.wait()
+        run = client.get("/api/forge/repos/nandi.uk/two/runs", headers=AUTH).json()["runs"][0]
+        out = client.get(f"/api/forge/repos/nandi.uk/two/runs/{run['id']}", headers=AUTH).json()["output"]
+        assert run["status"] == "success" and "tok=*** region=***" in out and "user-wide" not in out
+
+        # Deleting a repo leaves the user secrets alone.
+        assert client.delete("/api/forge/repos/nandi.uk/one", headers=AUTH).status_code == 204
+        assert len(client.get(user, headers=AUTH).json()["secrets"]) == 2
+        assert client.delete(f"{user}/REGION", headers=AUTH).status_code == 204
+        assert client.delete(f"{user}/REGION", headers=AUTH).status_code == 404
+        assert secrets.values("nandi.uk/two")["REGION"] == "fra-repo"
+
+
 FAKE_DEPOT = """#!/bin/sh
 # Stands in for the Depot CLI: records its arguments and environment, writes build metadata.
 printf '%s\\n' "$@" > "$FAKE_DEPOT_LOG"
@@ -1166,6 +1214,13 @@ async def test_git_push_runs_deploy_job(server_url, tmp_path):
         r = await c.call_tool("run_deploy", {"repo": "site"})
         assert not r.is_error and "ship" in text(r)
         assert not (await c.call_tool("delete_repo_secret", {"repo": "site", "name": "API_KEY"})).is_error
+        r = await c.call_tool("set_user_secret", {"name": "ALL_REPOS", "value": "every-where"})
+        assert not r.is_error and "Added" in text(r)
+        assert "ALL_REPOS" in text(await c.call_tool("list_user_secrets", {}))
+        listing = text(await c.call_tool("list_repo_secrets", {"repo": "site"}))
+        assert "ALL_REPOS" in listing and "every-where" not in listing
+        assert not (await c.call_tool("delete_user_secret", {"name": "ALL_REPOS"})).is_error
+        assert "no user secrets" in text(await c.call_tool("list_user_secrets", {}))
 
 
 def test_depot_token_setup(tmp_path, monkeypatch):
@@ -1212,3 +1267,15 @@ esac
     assert api[0][1]["projectId"] == "old1"
     with pytest.raises(SystemExit):
         depot_setup.main(["nope"])
+    # --user: the Depot user token becomes a user secret; a repo given too gets only its project ID.
+    calls.clear()
+    api.clear()
+    assert depot_setup.main(["--user"]) == 0
+    assert calls[-1] == ("PUT", "/api/forge/user/secrets/DEPOT_TOKEN", {"value": "user-tok-9"}) and api == []
+    calls.clear()
+    assert depot_setup.main(["--user", "site", "old1"]) == 0
+    assert ("PUT", "/api/forge/user/secrets/DEPOT_TOKEN", {"value": "user-tok-9"}) in calls
+    assert ("PUT", "/api/forge/repos/nandi.uk/site/secrets/DEPOT_PROJECT_ID", {"value": "old1"}) in calls
+    assert not any(p.endswith("/secrets/DEPOT_TOKEN") and "/repos/" in p for _, p, _ in calls) and api == []
+    with pytest.raises(SystemExit):
+        depot_setup.main([])
