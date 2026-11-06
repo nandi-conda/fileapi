@@ -422,6 +422,57 @@ async def test_git_forge_end_to_end(server_url, tmp_path):
     assert git("ls-remote", remote, check=False).returncode != 0
 
 
+@pytest.mark.anyio
+async def test_git_big_push_in_one_go(server_url, tmp_path):
+    """A push far bigger than the spool and insert batches goes through in one request and clones back intact."""
+    async with connect(server_url, TOKEN) as c:
+        assert not (await c.call_tool("create_repo", {"name": "big"})).is_error
+    remote = server_url.replace("://", f"://x:{TOKEN}@") + "/git/nandi.uk/big.git"
+    work = tmp_path / "work"
+    git("init", "-q", "-b", "main", str(work))
+    for i in range(3):  # incompressible blobs, like the committed .wasm.gz files that broke the mirror
+        (work / f"blob{i}.bin").write_bytes(os.urandom(12 * 1024 * 1024))
+        (work / "log.txt").write_text(f"commit {i}\n")
+        git("add", ".", cwd=work)
+        git("commit", "-q", "-m", f"c{i}", cwd=work)
+    git("push", remote, "main", cwd=work)
+    git("clone", "-q", remote, str(tmp_path / "back"))
+    for i in range(3):
+        assert (tmp_path / "back" / f"blob{i}.bin").read_bytes() == (work / f"blob{i}.bin").read_bytes()
+    assert git("fsck", cwd=tmp_path / "back").returncode == 0
+
+
+@pytest.mark.anyio
+async def test_git_stream_keeps_slow_pushes_alive():
+    """While a push is stored, side-band clients get progress lines, so proxies don't time the request out."""
+    import anyio
+    from fileapi.forge import GitStream
+
+    class SlowForge:
+        def serve(self, repo, service, recv, write, progress=None):
+            got = b""
+            while chunk := recv(7):
+                got += chunk
+            progress(42)
+            time.sleep(0.3)
+            write(b"0009\x01done" + b"0000")
+            assert got.endswith(b"PACK...")
+
+    cmd = b"0" * 40 + b" " + b"1" * 40 + b" refs/heads/main\0report-status side-band-64k"
+    body = f"{len(cmd) + 4:04x}".encode() + cmd + b"0000PACK..."
+    for sideband in (True, False):
+        stream = GitStream(SlowForge(), "o/r", "git-receive-pack")
+        stream.KEEPALIVE = 0.05
+        payload = body if sideband else body.replace(b" side-band-64k", b"")
+        for i in range(0, len(payload), 5):
+            assert await stream.feed(payload[i:i + 5])
+        await stream.feed(None)
+        out = b"".join([part async for part in stream.response()])
+        assert out.endswith(b"0009\x01done0000")
+        assert (b"\x02fileapi: storing objects: 42" in out) is sideband
+        await anyio.sleep(0)
+
+
 def test_git_http_auth(tmp_path, backend):
     with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
         forge = client.app.state.forge

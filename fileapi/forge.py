@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import gzip
 import io
+import os
+import queue
 import re
 import shutil
 import threading
@@ -115,6 +117,170 @@ CREATE TABLE IF NOT EXISTS fileapi_git_refs (
 );
 """
 
+# Bounds on one INSERT batch while unpacking a push: a batch holds the inflated objects and their compressed
+# copies, so a count alone would let a run of multi-megabyte blobs balloon memory on a 500 MiB instance.
+_BATCH_OBJECTS = 1000
+_BATCH_BYTES = 8 * 1024 * 1024
+# Incoming packs are written here (FILEAPI_GIT_TMPDIR, else the system temp dir) once past 1 MiB.
+_SPOOL_MAX = 1024 * 1024
+
+# Per-thread hook the object store reports unpack progress to (number of objects stored so far).
+_progress = threading.local()
+
+
+def _report(stored: int) -> None:
+    cb = getattr(_progress, "cb", None)
+    if cb is not None:
+        cb(stored)
+
+
+_DONE = object()
+
+
+class GitStream:
+    """One git RPC run in a worker thread, fed the request body as it arrives and streaming its response.
+
+    The event loop calls feed() with body chunks (None at the end), then iterates response(). Both queues are
+    bounded, so memory stays at a few chunks however large the push or clone. While a push is being stored
+    (no output yet) and the client asked for side-band, response() sends progress lines every few seconds so
+    proxies in front of the app (Cloudflare drops a request after 100 s of silence) keep the connection open.
+    """
+
+    KEEPALIVE = 5.0
+
+    def __init__(self, forge: "Forge", repo: str, service: str, max_chunks: int = 32):
+        import asyncio
+
+        self._in: queue.Queue = queue.Queue(max_chunks)
+        self._out: queue.Queue = queue.Queue(max_chunks)
+        self._buf = b""
+        self._eof = False
+        self._stopped = threading.Event()  # the git side finished or failed: stop feeding it
+        self._gone = threading.Event()  # the HTTP side gave up: stop producing output
+        self._head = b""  # start of the request, to see which capabilities the client asked for
+        self.stored = 0
+        self.error: BaseException | None = None
+        self.service = service
+        self._task = asyncio.get_running_loop().run_in_executor(None, self._run, forge, repo, service)
+
+    # -- worker thread --------------------------------------------------------
+    def _run(self, forge: "Forge", repo: str, service: str) -> None:
+        try:
+            forge.serve(repo, service, self._recv, self._write, progress=self._progress)
+        except BaseException as e:  # noqa: BLE001 - reported in the response stream
+            self.error = e
+        finally:
+            self._stopped.set()
+            self._put(self._out, _DONE)
+
+    def _progress(self, stored: int) -> None:
+        self.stored = stored
+
+    def _recv(self, size: int) -> bytes:
+        while not self._buf and not self._eof:
+            try:
+                chunk = self._in.get(timeout=0.5)
+            except queue.Empty:
+                if self._gone.is_set():
+                    raise OSError("request aborted") from None
+                continue
+            if chunk is None:
+                self._eof = True
+            else:
+                self._buf = chunk
+        out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def _write(self, data: bytes) -> None:
+        if not self._put(self._out, bytes(data)):
+            raise OSError("client went away")
+
+    def _put(self, q: queue.Queue, item, *, until: threading.Event | None = None) -> bool:
+        stop = until or self._gone
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    # -- event loop -----------------------------------------------------------
+    async def feed(self, chunk: bytes | None) -> bool:
+        """Queue a body chunk (None = end of body). False once git has stopped reading."""
+        from starlette.concurrency import run_in_threadpool
+
+        if chunk is not None and len(self._head) < 4096:
+            self._head += chunk[: 4096 - len(self._head)]
+        try:
+            self._in.put_nowait(chunk)
+            return True
+        except queue.Full:
+            return await run_in_threadpool(self._put, self._in, chunk, until=self._stopped)
+
+    def abort(self) -> None:
+        """The request failed on the HTTP side: unblock and end the worker."""
+        self._gone.set()
+        try:
+            self._in.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def _sideband(self) -> bool:
+        """Whether the push's first command line asked for side-band-64k (so progress lines are allowed)."""
+        if self.service != "git-receive-pack" or len(self._head) < 4:
+            return False
+        try:
+            n = int(self._head[:4], 16)
+        except ValueError:
+            return False
+        line = self._head[4:n]
+        caps = line.split(b"\0", 1)[1].split() if b"\0" in line else []
+        return b"side-band-64k" in caps
+
+    @staticmethod
+    def _pkt(band: int, text: str) -> bytes:
+        data = bytes([band]) + text.encode()
+        return f"{len(data) + 4:04x}".encode() + data
+
+    async def response(self):
+        from starlette.concurrency import run_in_threadpool
+
+        def get():
+            try:
+                return self._out.get(timeout=self.KEEPALIVE)
+            except queue.Empty:
+                return None
+
+        keepalive = self._sideband()
+        started = progressed = False
+        try:
+            while True:
+                item = await run_in_threadpool(get)
+                if item is None:
+                    if keepalive and not started:
+                        progressed = True
+                        yield self._pkt(2, f"fileapi: storing objects: {self.stored}\r")
+                    continue
+                if item is _DONE:
+                    break
+                if progressed and not started:
+                    yield self._pkt(2, f"fileapi: storing objects: {self.stored}, done.\n")
+                started = True
+                yield item
+            await self._task
+            if self.error is not None:
+                import logging
+
+                logging.getLogger("fileapi.forge").error("git %s failed", self.service,
+                                                         exc_info=(type(self.error), self.error,
+                                                                   self.error.__traceback__))
+                if keepalive and not started:
+                    yield self._pkt(3, f"fileapi: {self.error}")
+        finally:
+            self._gone.set()
+
+
 # Objects never change once written, so caching them across requests (and repos) is always correct.
 _OBJ_CACHE: LRUSizeCache = LRUSizeCache(64 * 1024 * 1024, compute_size=lambda v: len(v[1]))
 _CACHE_LOCK = threading.Lock()
@@ -171,7 +337,8 @@ class PgObjectStore(MemoryObjectStore):
         self.add_objects([(obj, None)])
 
     def add_objects(self, objects, progress=None) -> None:
-        rows = [(self.repo_id, obj.sha().digest(), obj.type_num, zlib.compress(obj.as_raw_string()))
+        # Level 1: pushes are CPU-bound on small instances, and most of the bytes are already-compressed blobs.
+        rows = [(self.repo_id, obj.sha().digest(), obj.type_num, zlib.compress(obj.as_raw_string(), 1))
                 for obj, _ in objects]
         if not rows:
             return
@@ -185,7 +352,7 @@ class PgObjectStore(MemoryObjectStore):
     def add_pack(self):
         from tempfile import SpooledTemporaryFile
 
-        f = SpooledTemporaryFile(max_size=16 * 1024 * 1024, prefix="incoming-")
+        f = SpooledTemporaryFile(max_size=_SPOOL_MAX, prefix="incoming-", dir=os.environ.get("FILEAPI_GIT_TMPDIR"))
 
         def commit() -> None:
             size = f.tell()
@@ -195,13 +362,17 @@ class PgObjectStore(MemoryObjectStore):
                     p = PackData.from_file(f, self.object_format, size)
                     try:
                         p.check()
-                        batch = []
+                        batch, size, stored = [], 0, 0
                         for obj in PackInflater.for_pack_data(p, self.get_raw):
                             batch.append((obj, None))
-                            if len(batch) >= 500:
+                            size += obj.raw_length()
+                            if len(batch) >= _BATCH_OBJECTS or size >= _BATCH_BYTES:
                                 self.add_objects(batch)
-                                batch = []
+                                stored += len(batch)
+                                _report(stored)
+                                batch, size = [], 0
                         self.add_objects(batch)
+                        _report(stored + len(batch))
                     finally:
                         p.close()
             finally:
@@ -668,16 +839,29 @@ class Forge:
         return out.getvalue()
 
     def rpc(self, repo: str, service: str, body: bytes, content_encoding: str | None = None) -> bytes:
-        self.open(repo).close()
         if content_encoding == "gzip":
             body = gzip.decompress(body)
         out = io.BytesIO()
-        proto = ReceivableProtocol(io.BytesIO(body).read, out.write)
+        self.serve(repo, service, io.BytesIO(body).read, out.write)
+        return out.getvalue()
+
+    def serve(self, repo: str, service: str, recv, write, progress=None) -> None:
+        """Run one stateless git RPC, reading the request with recv(n) and writing the response with write().
+
+        Nothing here holds the whole request or pack in memory: pack data is spooled to a temp file and
+        stored in bounded batches, so pushes are limited by FILEAPI_GIT_MAX_PUSH rather than RAM.
+        progress(stored_objects) is called from this thread while a pushed pack is being stored.
+        """
+        self.open(repo).close()
+        proto = ReceivableProtocol(recv, write)
         before = self._heads(repo) if service == "git-receive-pack" and self.listeners else None
-        SERVICES[service](self._backend, [repo], proto, stateless_rpc=True).handle()
+        _progress.cb = progress
+        try:
+            SERVICES[service](self._backend, [repo], proto, stateless_rpc=True).handle()
+        finally:
+            _progress.cb = None
         if before is not None:
             self._emit_push(repo, before)
-        return out.getvalue()
 
     # -- browsing -------------------------------------------------------------
     @staticmethod

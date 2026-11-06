@@ -12,6 +12,7 @@ import base64
 import contextlib
 import gzip
 import os
+import zlib
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -21,10 +22,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response,
                                StreamingResponse)
 from pydantic import BaseModel
+from starlette.requests import ClientDisconnect
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .deploy import KEY_ENV, JOBS_FILE, Jobs, RepoSecrets, SecretsUnavailable, parse_key
-from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name, split_repo
+from .forge import SERVICES, DiskForgeStore, Forge, GitStream, PgForgeStore, RepoPasses, owner_name, split_repo
 from .lfs import DiskLfsStore, PgLfsStore, Spool, check_oid
 from .releases import DiskReleaseStore, PgReleaseStore, Releases
 from .mcp_server import build_mcp
@@ -355,15 +357,35 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
             raise HTTPException(404, "Unknown git service")
         if request.headers.get("content-type") != f"application/x-{service}-request":
             raise HTTPException(415, "Invalid Content-Type")
-        body = bytearray()
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > max_push:
-                raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
+        await run_in_threadpool(lambda: forge.open(full).close())  # 404 before any body is read
         if service == "git-receive-pack":
             learn_base(request)
-        data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
-        return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
+        # The body is handed to git as it arrives and the response streams back, so neither a big push nor a
+        # big clone sits in memory (FastAPI Cloud's Nano instances have 500 MiB). See GitStream.
+        stream = GitStream(forge, full, service)
+        gunzip = zlib.decompressobj(16 + zlib.MAX_WBITS) if request.headers.get("content-encoding") == "gzip" else None
+        received = 0
+        try:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > max_push:
+                    stream.abort()
+                    raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
+                if gunzip is not None:
+                    chunk = gunzip.decompress(chunk)
+                if chunk and not await stream.feed(chunk):
+                    break  # git stopped reading (it hit an error); its response says why
+            if gunzip is not None:
+                await stream.feed(gunzip.flush())
+        except ClientDisconnect:
+            stream.abort()
+            return Response(status_code=499)
+        except zlib.error:
+            stream.abort()
+            raise HTTPException(400, "Bad gzip request body")
+        await stream.feed(None)
+        return StreamingResponse(stream.response(), media_type=f"application/x-{service}-result",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # ---- Git LFS ----------------------------------------------------------
     # git-lfs derives its endpoint from the remote URL (<remote>.git/info/lfs) and authenticates the same

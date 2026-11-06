@@ -104,7 +104,7 @@ An MCP client that is signed in can move commits without anyone typing a token i
 - **`repo_remote_url` (any size):** the tool returns `https://x:fg_…@<host>/git/<handle>/<repo>.git`, a credential that works for that one repo and expires (1 to 1440 minutes). The client runs `git push <url> main` with it. Passes are HMAC-signed under a secret in the KV store (`forge_secret`), so they work across replicas; delete that record to revoke all of them.
 - **Bundles (small changes):** `git bundle create /tmp/p.bundle main ^origin/main`, base64 it, call `push_bundle`. For pulls, `fetch_bundle` with `have: [<sha of origin/main>]`, decode, `git fetch /tmp/f.bundle 'refs/heads/*:refs/remotes/origin/*'`. The bundle travels inside the tool call, so it costs model tokens; keep it to small pushes.
 
-Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
+Storage follows the file store. With `DATABASE_URL`, objects and refs are Postgres rows, so repos survive FastAPI Cloud deploys and every replica sees the same repos; ref updates are compare-and-swap, so concurrent pushes cannot clobber each other. Without it, repos are ordinary bare repos under `FILEAPI_GIT_ROOT`. Pushes are capped at `FILEAPI_GIT_MAX_PUSH` bytes. Requests stream through git rather than sitting in memory: the pushed pack is spooled to a temp file (`FILEAPI_GIT_TMPDIR`) and stored in batches of at most 8 MiB, so a whole-history push fits a 500 MiB Nano instance, and while it is stored the client sees `remote: fileapi: storing objects: N` every few seconds, which also keeps proxies from timing the request out. The forge is meant for small and medium repos: Postgres stores each object as its own row, so very large histories clone slowly.
 
 Access: the admin reaches every repo; public repos clone anonymously. Nobody else has access.
 
@@ -315,6 +315,7 @@ docker run -p 8000:8000 -v fileapi-data:/data -v fileapi-state:/state fileapi
 | `FILEAPI_STATE_DIR` | `./state` | Filesystem backend: OAuth clients and tokens. Must be outside `FILEAPI_ROOT` |
 | `FILEAPI_GIT_ROOT` | `./repos` | Filesystem backend: bare git repos. Must be outside `FILEAPI_ROOT` |
 | `FILEAPI_GIT_MAX_PUSH` | `209715200` | Max git push (request body) in bytes |
+| `FILEAPI_GIT_TMPDIR` | system temp dir | Where incoming packs are spooled while a push is stored |
 | `FILEAPI_ADMIN_DID` | `did:plc:ngokl2gnmpbvuvrfckja3g7p` | The only atproto account allowed in (`nandi.uk`) |
 | `FILEAPI_ADMIN_HANDLE` | `nandi.uk` | Login hint shown at the authorization server |
 | `FILEAPI_TOKEN` | unset | Optional static admin token for scripts/CI |

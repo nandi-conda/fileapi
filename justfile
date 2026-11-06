@@ -179,8 +179,8 @@ claude-add url=fileapi_url scope="user":
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
 
 # Mirror this repo (every GitHub branch and tag) to the forge as <handle>/fileapi. GitHub stays primary.
-# Signs in through git-credential-fileapi (run `just git-setup` once). Big gaps go up one commit at a time,
-# because one huge pack (the committed forge UI wasm) times out on the host.
+# Signs in through git-credential-fileapi (run `just git-setup` once). If one push of a branch fails, it
+# falls back to one commit at a time (kept as a safety net; the server now streams big pushes).
 forge-mirror url=fileapi_url repo="nandi.uk/fileapi":
     #!/usr/bin/env bash
     set -euo pipefail
