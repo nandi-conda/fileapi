@@ -155,6 +155,29 @@ body = '{"sha": "${FORGE_SHA}"}'
 
 Jobs get a clean environment (only `PATH` from the server, never `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. Set `FILEAPI_JOBS=off` to turn jobs off.
 
+#### Container builds on Depot
+
+A `depot` job builds a Docker image of the pushed commit on [Depot](https://depot.dev): the build runs on Depot's remote BuildKit builders (native amd64 and arm64, shared layer cache), so the server needs no Docker. The server downloads the Depot CLI the first time a job needs it (pinned to 2.103.9; `FILEAPI_DEPOT_CLI_VERSION` changes it, `FILEAPI_DEPOT_CLI` points at your own binary).
+
+```toml
+[[job]]
+name = "image"
+[job.depot]
+project = "abc123xyz"            # Depot project ID; default: the DEPOT_PROJECT_ID secret
+file = "Dockerfile"              # default: ./Dockerfile
+context = "."
+platforms = ["linux/amd64", "linux/arm64"]
+tags = ["ghcr.io/me/app:${FORGE_SHA}", "ghcr.io/me/app:latest"]
+push = true                      # push the tags (default false)
+save = false                     # keep it in the Depot registry (default: true unless push)
+build_args = { VERSION = "${FORGE_SHA}" }
+target = "runtime"
+login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }  # registry login for push
+args = ["--no-cache"]            # any other `depot build` flags
+```
+
+`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret: a project token (Depot → the project → **Settings → Project tokens**) or an organization token (**Organization settings → API tokens**). The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
+
 | Endpoint (signed in) | Does |
 | --- | --- |
 | `GET /api/forge/repos/<owner>/<repo>/secrets` | Secret names and update times (`enabled: false` without the key) |

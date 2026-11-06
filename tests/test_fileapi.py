@@ -1,3 +1,4 @@
+import base64
 import os
 import socket
 import subprocess
@@ -13,6 +14,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
 from fileapi.app import create_app
+from fileapi.deploy import parse_jobs
 from fileapi.storage import StorageError
 
 # Repo secrets are on in every test app (and the server processes they start) unless a test removes it.
@@ -1025,6 +1027,97 @@ def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
         forge.create("nandi.uk", "app2")
         assert client.get(f"{base2}/secrets", headers=AUTH).json()["secrets"] == []
         assert client.get(f"{base2}/runs", headers=AUTH).json()["runs"] == []
+
+
+FAKE_DEPOT = """#!/bin/sh
+# Stands in for the Depot CLI: records its arguments and environment, writes build metadata.
+printf '%s\\n' "$@" > "$FAKE_DEPOT_LOG"
+echo "token=$DEPOT_TOKEN project=$DEPOT_PROJECT_ID" >> "$FAKE_DEPOT_LOG"
+cat "$HOME/.docker/config.json" >> "$FAKE_DEPOT_LOG" 2>/dev/null
+meta=""; prev=""
+for a in "$@"; do [ "$prev" = "--metadata-file" ] && meta="$a"; prev="$a"; done
+echo "#1 [internal] load build definition from Dockerfile"
+echo "Build: https://depot.dev/orgs/org1/projects/proj9/builds/b123"
+test -f Dockerfile || { echo "no Dockerfile in $(pwd)"; exit 1; }
+if [ -n "$meta" ]; then
+  printf '{"depot.build": {"buildID": "b123", "projectID": "proj9"}, "containerimage.digest": "sha256:abc"}' > "$meta"
+fi
+"""
+
+
+def test_depot_build_job(tmp_path, monkeypatch):
+    fake = tmp_path / "depot"
+    fake.write_text(FAKE_DEPOT.replace("$FAKE_DEPOT_LOG", str(tmp_path / "depot.log")))
+    fake.chmod(0o755)
+    monkeypatch.setenv("FILEAPI_DEPOT_CLI", str(fake))
+    log = tmp_path / "depot.log"
+    with TestClient(app_for(tmp_path)) as client:
+        forge, jobs = client.app.state.forge, client.app.state.jobs
+        forge.create("nandi.uk", "img")
+        base = "/api/forge/repos/nandi.uk/img"
+        forge.commit_files("nandi.uk/img", "main", {"Dockerfile": "FROM alpine\n"}, "first")
+        toml = """
+[[job]]
+name = "image"
+[job.depot]
+platforms = ["linux/amd64", "linux/arm64"]
+tags = ["ghcr.io/me/img:${FORGE_SHA}"]
+push = true
+build_args = { VERSION = "${FORGE_SHA}" }
+login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
+"""
+        # No DEPOT_TOKEN secret: the run says exactly what's missing.
+        sha = forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": toml}, "jobs")["commit"]
+        jobs.wait()
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["kind"] == "depot" and run["status"] == "error" and "DEPOT_TOKEN" in run["error"]
+
+        for name, value in (("DEPOT_TOKEN", "depot-tok-1"), ("DEPOT_PROJECT_ID", "proj9"), ("GHCR_TOKEN", "ghcr-pw-1")):
+            assert client.put(f"{base}/secrets/{name}", json={"value": value}, headers=AUTH).status_code == 201
+        assert client.post(f"{base}/runs", json={}, headers=AUTH).status_code == 202
+        jobs.wait()
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["status"] == "success", run
+        assert run["depot"]["build_id"] == "b123" and run["depot"]["digest"] == "sha256:abc"
+        # The project ID came from a secret, so it's masked like any secret value.
+        assert run["depot"]["url"] == "https://depot.dev/orgs/org1/projects/***/builds/b123"
+        assert "image" not in run["depot"]  # pushed, not saved to the Depot registry
+        args = log.read_text()
+        assert args.startswith("build\n--metadata-file\n")
+        for want in ("--project\nproj9\n", "--platform\nlinux/amd64\n--platform\nlinux/arm64\n",
+                     f"--tag\nghcr.io/me/img:{sha}\n", f"--build-arg\nVERSION={sha}\n", "--push\n.\n",
+                     "token=depot-tok-1 project=proj9"):
+            assert want in args, (want, args)
+        assert "--save" not in args
+        assert base64.b64encode(b"me:ghcr-pw-1").decode() in args  # registry login for the push
+        out = client.get(f"{base}/runs/{run['id']}", headers=AUTH).json()["output"]
+        assert "$ depot build --project *** --progress plain" in out and "pushed ghcr.io/me/img:" in out
+        assert "depot-tok-1" not in out and "ghcr-pw-1" not in out
+
+        # Bare `depot = true`: ./Dockerfile, saved to the Depot registry.
+        forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": "[[job]]\nname='img'\ndepot = true\n"}, "b")
+        jobs.wait()
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["status"] == "success" and run["depot"]["image"] == "registry.depot.dev/***:b123"
+        # A project ID written in the jobs file isn't a secret, so it shows.
+        toml2 = "[[job]]\nname='img'\ndepot = { project = 'pub7' }\n"
+        forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": toml2}, "b2")
+        jobs.wait()
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["depot"]["image"] == "registry.depot.dev/pub7:b123" and "--project\npub7\n" in log.read_text()
+        assert "--save\n.\n" in log.read_text()
+
+        # Shell jobs that use depot get it on PATH.
+        forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": "[[job]]\nname='sh'\nrun='depot build .'\n"}, "c")
+        jobs.wait()
+        assert client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]["status"] == "success"
+
+        for bad, msg in (("depot = 3", "must be a table"), ("depot = { push = true }", "needs tags"),
+                         ("depot = { colour = 'red' }", "unknown depot setting"),
+                         ("depot = { context = '../x' }", "relative to the repo root"),
+                         ("depot = true\nrun = 'x'", "exactly one of")):
+            with pytest.raises(StorageError, match=msg):
+                parse_jobs(f"[[job]]\nname = 'x'\n{bad}\n")
 
 
 def test_secrets_need_the_key(tmp_path, monkeypatch):
