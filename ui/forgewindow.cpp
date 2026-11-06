@@ -461,6 +461,19 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         browse(QString(), Nav::Push);
         loadLog();
     });
+    connect(m_commitView, &CommitView::openPlace, this,
+            [this](const QString &ref, const QString &path, int line, int col, int end) {
+        // A definition or reference picked from the diff: the file as it is at that commit.
+        m_ref->setCurrentText(ref.left(12));
+        closeNav();
+        m_routing = true;
+        m_tabs->setCurrentIndex(0);
+        m_routing = false;
+        m_pendingLines = QStringLiteral("L%1").arg(line);
+        m_pendingSpan = end > col ? QJsonObject{{"line", line}, {"col", col}, {"end_col", end}} : QJsonObject();
+        browse(path, Nav::Push);
+        loadLog();
+    });
     m_commitStack->addWidget(m_commitView);
     m_tabs->addTab(m_commitStack, "Commits");
     // Releases: everyone who can see the repo can download; the owner makes them and uploads files.
