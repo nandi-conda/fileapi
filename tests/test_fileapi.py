@@ -15,6 +15,9 @@ from mcp.client.streamable_http import streamable_http_client
 from fileapi.app import create_app
 from fileapi.storage import StorageError
 
+# Repo secrets are on in every test app (and the server processes they start) unless a test removes it.
+os.environ.setdefault("FILEAPI_SECRETS_KEY", "q2Vz1fVv0Hc0dWl3mT1tYk4cQyB3hGvKkq8xR0b8m3E=")
+
 TOKEN = "test-static-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 FILE_TOOLS = ["append_file", "create_file", "delete_file", "edit_file", "list_files", "move_file", "read_file", "write_file"]
@@ -914,3 +917,159 @@ def test_helper_moves_big_files_to_lfs(server_url, tmp_path):
     run("git", "add", ".", cwd=other)
     run("git", "-c", "fileapi.lfsThreshold=4k", "commit", "-m", "x", cwd=other)
     assert not (other / ".gitattributes").exists()
+
+
+JOBS_TOML = """
+[[job]]
+name = "build"
+run = '''
+echo "deploying $FORGE_REPO $FORGE_BRANCH $FORGE_SHA"
+echo "token=$DEPLOY_TOKEN"
+test -f app.py && cat app.py
+test -z "$DATABASE_URL" && test -z "$FILEAPI_SECRETS_KEY" && echo "env is clean"
+'''
+
+[[job]]
+name = "hook"
+post = "https://deploy.example/hooks/${HOOK_ID}"
+headers = { Authorization = "Bearer ${DEPLOY_TOKEN}" }
+body = '{"sha": "${FORGE_SHA}"}'
+
+[[job]]
+name = "other-branch"
+branches = ["release/*"]
+run = "exit 3"
+"""
+
+
+def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge, jobs = client.app.state.forge, client.app.state.jobs
+        sent = []
+
+        def hook(request):
+            sent.append(request)
+            return httpx.Response(200, text="queued deploy for " + request.headers["authorization"])
+
+        jobs.http = httpx.Client(transport=httpx.MockTransport(hook))
+        forge.create("nandi.uk", "app")
+        base = "/api/forge/repos/nandi.uk/app"
+
+        # Admin only, even for listing names.
+        assert client.get(f"{base}/secrets").status_code == 401
+        assert client.put(f"{base}/secrets/X", json={"value": "v"}).status_code == 401
+        assert client.get(f"{base}/runs").status_code == 401
+        assert client.get("/api/forge/repos/nandi.uk/nope/secrets", headers=AUTH).status_code == 404
+
+        r = client.put(f"{base}/secrets/DEPLOY_TOKEN", json={"value": "s3cr3t-value"}, headers=AUTH)
+        assert r.status_code == 201 and r.json()["name"] == "DEPLOY_TOKEN" and "value" not in r.json()
+        assert client.put(f"{base}/secrets/DEPLOY_TOKEN", json={"value": "tok-12345"}, headers=AUTH).status_code == 200
+        assert client.put(f"{base}/secrets/HOOK_ID", json={"value": "srv-1"}, headers=AUTH).status_code == 201
+        for bad in ("1X", "has-dash", "FORGE_SHA"):
+            assert client.put(f"{base}/secrets/{bad}", json={"value": "v"}, headers=AUTH).status_code == 400
+        listed = client.get(f"{base}/secrets", headers=AUTH).json()
+        assert listed["enabled"] is True and [s["name"] for s in listed["secrets"]] == ["DEPLOY_TOKEN", "HOOK_ID"]
+        assert "tok-12345" not in str(listed)
+        # Encrypted at rest: the stored record doesn't contain the value.
+        raw = jobs.kv.get("forge_secrets_" + "nandi.uk/app".encode().hex())
+        assert raw and "tok-12345" not in str(raw)
+
+        # No jobs file: pushes run nothing, a manual run says why.
+        forge.commit_files("nandi.uk/app", "main", {"app.py": "print('hi')\n"}, "first")
+        assert client.get(f"{base}/runs", headers=AUTH).json()["runs"] == []
+        r = client.post(f"{base}/runs", json={}, headers=AUTH)
+        assert r.status_code == 404 and ".forge/jobs.toml" in r.json()["detail"]
+
+        # Committing the jobs file is a push: the main-branch jobs run.
+        sha = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": JOBS_TOML}, "add jobs")["commit"]
+        jobs.wait()
+        runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"]
+        assert sorted(r["job"] for r in runs) == ["build", "hook"]
+        assert all(r["status"] == "success" and r["sha"] == sha and r["trigger"] == "push" for r in runs), runs
+        build = next(r for r in runs if r["job"] == "build")
+        out = client.get(f"{base}/runs/{build['id']}", headers=AUTH).json()["output"]
+        assert f"deploying nandi.uk/app main {sha}" in out and "print('hi')" in out and "env is clean" in out
+        assert "token=***" in out and "tok-12345" not in out
+        hook_run = next(r for r in runs if r["job"] == "hook")
+        out = client.get(f"{base}/runs/{hook_run['id']}", headers=AUTH).json()["output"]
+        assert "HTTP 200" in out and "Bearer ***" in out and "tok-12345" not in out
+        assert str(sent[0].url) == "https://deploy.example/hooks/srv-1"
+        assert sent[0].headers["authorization"] == "Bearer tok-12345"
+        assert sent[0].content == f'{{"sha": "{sha}"}}'.encode()
+
+        # Branch filters, a failing job, manual runs by name.
+        forge.commit_files("nandi.uk/app", "release/1", {".forge/jobs.toml": JOBS_TOML}, "release")
+        jobs.wait()
+        runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"]
+        assert runs[0]["job"] == "other-branch" and runs[0]["status"] == "failed" and runs[0]["exit_code"] == 3
+        r = client.post(f"{base}/runs", json={"job": "build"}, headers=AUTH)
+        assert r.status_code == 202 and [x["job"] for x in r.json()["runs"]] == ["build"]
+        jobs.wait()
+        assert client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]["trigger"] == "manual"
+        assert client.post(f"{base}/runs", json={"ref": "nope"}, headers=AUTH).status_code == 404
+
+        # A bad jobs file fails the manual run with the parse error (and a push just skips it).
+        forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": "[[job]]\nname='x'\n"}, "broken")
+        r = client.post(f"{base}/runs", json={}, headers=AUTH)
+        assert r.status_code == 400 and "exactly one of run" in r.json()["detail"]
+
+        # Secrets and runs follow a rename, and go with a delete.
+        assert client.patch(base, json={"name": "app2"}, headers=AUTH).status_code == 200
+        base2 = "/api/forge/repos/nandi.uk/app2"
+        names = [s["name"] for s in client.get(f"{base2}/secrets", headers=AUTH).json()["secrets"]]
+        assert names == ["DEPLOY_TOKEN", "HOOK_ID"]
+        assert len(client.get(f"{base2}/runs", headers=AUTH).json()["runs"]) == 4
+        assert client.delete(f"{base2}/secrets/HOOK_ID", headers=AUTH).status_code == 204
+        assert client.delete(f"{base2}/secrets/HOOK_ID", headers=AUTH).status_code == 404
+        assert client.delete(base2, headers=AUTH).status_code == 204
+        forge.create("nandi.uk", "app2")
+        assert client.get(f"{base2}/secrets", headers=AUTH).json()["secrets"] == []
+        assert client.get(f"{base2}/runs", headers=AUTH).json()["runs"] == []
+
+
+def test_secrets_need_the_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("FILEAPI_SECRETS_KEY")
+    with TestClient(app_for(tmp_path)) as client:
+        client.app.state.forge.create("nandi.uk", "app")
+        base = "/api/forge/repos/nandi.uk/app"
+        assert client.get(f"{base}/secrets", headers=AUTH).json()["enabled"] is False
+        r = client.put(f"{base}/secrets/X", json={"value": "v"}, headers=AUTH)
+        assert r.status_code == 503 and "FILEAPI_SECRETS_KEY" in r.json()["detail"]
+    monkeypatch.setenv("FILEAPI_SECRETS_KEY", "too-short")
+    with pytest.raises(RuntimeError, match="FILEAPI_SECRETS_KEY"):
+        app_for(tmp_path)
+
+
+@pytest.mark.anyio
+async def test_git_push_runs_deploy_job(server_url, tmp_path):
+    async with connect(server_url, TOKEN) as c:
+        assert not (await c.call_tool("create_repo", {"name": "site"})).is_error
+        r = await c.call_tool("set_repo_secret", {"repo": "site", "name": "API_KEY", "value": "abcd-efgh"})
+        assert not r.is_error and "Added" in text(r)
+        assert "API_KEY" in text(await c.call_tool("list_repo_secrets", {"repo": "site"}))
+        assert "abcd-efgh" not in text(await c.call_tool("list_repo_secrets", {"repo": "site"}))
+        assert "No runs yet" in text(await c.call_tool("deploy_runs", {"repo": "site"}))
+
+    work = tmp_path / "work"
+    work.mkdir()
+    git("init", "-b", "main", cwd=work)
+    (work / ".forge").mkdir()
+    (work / ".forge" / "jobs.toml").write_text('[[job]]\nname = "ship"\nrun = "echo key=$API_KEY on $FORGE_BRANCH"\n')
+    git("add", ".", cwd=work)
+    git("commit", "-m", "jobs", cwd=work)
+    remote = server_url.replace("://", f"://x:{TOKEN}@") + "/git/nandi.uk/site.git"
+    git("push", remote, "main", cwd=work)
+
+    async with connect(server_url, TOKEN) as c:
+        for _ in range(100):
+            listing = text(await c.call_tool("deploy_runs", {"repo": "site"}))
+            if "success" in listing or "failed" in listing:
+                break
+            time.sleep(0.1)
+        assert "success" in listing and "ship" in listing and "push" in listing, listing
+        run_id = listing.split()[0]
+        out = text(await c.call_tool("deploy_runs", {"repo": "site", "run_id": run_id}))
+        assert "key=*** on main" in out and "abcd-efgh" not in out
+        r = await c.call_tool("run_deploy", {"repo": "site"})
+        assert not r.is_error and "ship" in text(r)
+        assert not (await c.call_tool("delete_repo_secret", {"repo": "site", "name": "API_KEY"})).is_error

@@ -13,6 +13,7 @@ dependencies = [
     "dulwich>=1.2.20",
     "httpx>=0.27",
     "pyjwt[crypto]>=2.10",
+    "cryptography>=42",  # repo secrets (AES-GCM), fileapi/deploy.py
     # code navigation in the forge web UI (fileapi/codenav.py)
     "tree-sitter>=0.25",
     "tree-sitter-python>=0.23",

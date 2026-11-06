@@ -131,6 +131,38 @@ The built app is committed in `fileapi/static/forge/` (the wasm gzipped, about 5
 just ui   # downloads Qt 6.8 (host + wasm), emsdk 3.1.56, cmake and ninja into ui/.toolchain/ on first run (~2 GB)
 ```
 
+### Secrets and deploy jobs
+
+Each repo can hold **secrets** (env-var names like `FLY_API_TOKEN`), set in the web UI (**Settings → Secrets**), over the API, or with the `set_repo_secret` MCP tool. They are encrypted with AES-256-GCM under `FILEAPI_SECRETS_KEY` before they're stored, and write-only: you can list, replace and delete them, never read them back. Without `FILEAPI_SECRETS_KEY` secrets are off (the rest of the forge works); `just secrets-key` generates one and sets it locally and on FastAPI Cloud.
+
+A repo opts in to **auto-deploy** by committing `.forge/jobs.toml`. Every push (git, `push_bundle` or `commit_files`) reads it from the pushed commit and runs the jobs whose `branches` match, in the background on the server:
+
+```toml
+[[job]]                        # a shell script (sh -e), run in a checkout of the pushed commit
+name = "deploy"
+branches = ["main"]            # default: the default branch. Globs work: ["release/*"], ["*"]
+timeout = 300                  # seconds (default 600, max 3600)
+run = """
+python scripts/deploy.py       # secrets are env vars, plus FORGE_REPO, FORGE_BRANCH, FORGE_SHA, FORGE_BEFORE...
+"""
+
+[[job]]                        # an HTTP POST: deploy hooks (Render, Vercel, Netlify, Coolify...), no curl needed
+name = "render"
+post = "${RENDER_DEPLOY_HOOK}"
+headers = { Authorization = "Bearer ${SOME_TOKEN}" }
+body = '{"sha": "${FORGE_SHA}"}'
+```
+
+Jobs get a clean environment (only `PATH` from the server, never `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. Set `FILEAPI_JOBS=off` to turn jobs off.
+
+| Endpoint (signed in) | Does |
+| --- | --- |
+| `GET /api/forge/repos/<owner>/<repo>/secrets` | Secret names and update times (`enabled: false` without the key) |
+| `PUT /api/forge/repos/<owner>/<repo>/secrets/<NAME>` | `{"value": "..."}` create or replace |
+| `DELETE /api/forge/repos/<owner>/<repo>/secrets/<NAME>` | Delete |
+| `GET /api/forge/repos/<owner>/<repo>/runs[/<id>]` | Recent runs, or one with its output |
+| `POST /api/forge/repos/<owner>/<repo>/runs` | `{"ref"?: branch, "job"?: name}` run now |
+
 ## REST API
 
 | Method & path | Does |

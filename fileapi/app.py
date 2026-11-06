@@ -21,6 +21,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTe
 from pydantic import BaseModel
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .deploy import KEY_ENV, JOBS_FILE, Jobs, RepoSecrets, SecretsUnavailable, parse_key
 from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name, split_repo
 from .lfs import DiskLfsStore, PgLfsStore, Spool, check_oid
 from .mcp_server import build_mcp
@@ -49,6 +50,15 @@ class RepoSettingsBody(BaseModel):
     default_branch: str | None = None
     public: bool | None = None
     name: str | None = None  # new repo name (it stays under the same owner)
+
+
+class SecretBody(BaseModel):
+    value: str
+
+
+class RunBody(BaseModel):
+    ref: str | None = None  # branch to run for (default: the default branch)
+    job: str | None = None  # one job by name, whatever its branches say
 
 
 class NewRepoBody(BaseModel):
@@ -115,6 +125,10 @@ def create_app(
     forge.store.init()
     lfs.init()
     passes = RepoPasses(kv)
+    # Repo secrets are encrypted under FILEAPI_SECRETS_KEY; without it they're off (the rest still works).
+    repo_secrets = RepoSecrets(kv, parse_key(os.environ.get(KEY_ENV)))
+    jobs_on = os.environ.get("FILEAPI_JOBS", "on").strip().lower() not in ("0", "off", "false", "no")
+    jobs = Jobs(forge, kv, repo_secrets, enabled=jobs_on, workers=int(os.environ.get("FILEAPI_JOB_WORKERS", 2)))
     # The admin is pinned by DID; the handle is only a login hint and display name.
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
     admin_handle = os.environ.get("FILEAPI_ADMIN_HANDLE") or (oauth.ADMIN_HANDLE if admin_did == oauth.ADMIN_DID else "")
@@ -128,7 +142,7 @@ def create_app(
     def owner_of(did: str | None) -> str | None:
         return owner if did and did == auth.admin_did else None
 
-    mcp = build_mcp(storage, public_url, forge, passes, owner)
+    mcp = build_mcp(storage, public_url, forge, passes, owner, jobs)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -147,6 +161,7 @@ def create_app(
     app.state.storage = storage
     app.state.auth = auth
     app.state.forge = forge
+    app.state.jobs = jobs
 
     @app.middleware("http")
     async def mcp_auth(request: Request, call_next):
@@ -171,7 +186,8 @@ def create_app(
 
     @app.exception_handler(StorageError)
     async def storage_error(_req: Request, exc: StorageError):
-        status = 404 if isinstance(exc, NotFound) else 409 if isinstance(exc, Conflict) else 400
+        status = (404 if isinstance(exc, NotFound) else 409 if isinstance(exc, Conflict)
+                  else 503 if isinstance(exc, SecretsUnavailable) else 400)
         return JSONResponse({"detail": str(exc)}, status_code=status)
 
     @app.get("/", include_in_schema=False)
@@ -510,6 +526,51 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         forge_admin(request)
         forge.delete(f"{project}/{repo}")
         return Response(status_code=204)
+
+    # Secrets (write-only: names and dates come back, never values) and deploy jobs. Admin only, runs too,
+    # since a job's output can say things about the deploy target.
+    def admin_repo(request: Request, project: str, repo: str) -> str:
+        forge_admin(request)
+        full = forge.canonical(f"{project}/{repo}")
+        forge.open(full).close()
+        return full
+
+    @app.get("/api/forge/repos/{project}/{repo}/secrets", tags=["forge"])
+    def forge_secrets(request: Request, project: str, repo: str):
+        full = admin_repo(request, project, repo)
+        return {"enabled": repo_secrets.enabled, "key_env": KEY_ENV, "secrets": repo_secrets.list(full)}
+
+    @app.put("/api/forge/repos/{project}/{repo}/secrets/{name}", tags=["forge"])
+    def forge_set_secret(request: Request, project: str, repo: str, name: str, body: SecretBody):
+        """Create or replace a secret. The value can't be read back; jobs get it as an env var."""
+        full = admin_repo(request, project, repo)
+        out = repo_secrets.set(full, name, body.value)
+        return JSONResponse({"name": out["name"], "updated": out["updated"]}, status_code=201 if out["created"] else 200)
+
+    @app.delete("/api/forge/repos/{project}/{repo}/secrets/{name}", tags=["forge"], status_code=204)
+    def forge_delete_secret(request: Request, project: str, repo: str, name: str):
+        repo_secrets.delete(admin_repo(request, project, repo), name)
+        return Response(status_code=204)
+
+    @app.get("/api/forge/repos/{project}/{repo}/runs", tags=["forge"])
+    def forge_runs(request: Request, project: str, repo: str, limit: int = Query(30, ge=1, le=30)):
+        full = admin_repo(request, project, repo)
+        return {"enabled": jobs.enabled, "jobs_file": JOBS_FILE, "runs": jobs.list_runs(full, limit)}
+
+    @app.get("/api/forge/repos/{project}/{repo}/runs/{run_id}", tags=["forge"])
+    def forge_run(request: Request, project: str, repo: str, run_id: str):
+        return jobs.get_run(admin_repo(request, project, repo), run_id)
+
+    @app.post("/api/forge/repos/{project}/{repo}/runs", tags=["forge"], status_code=202)
+    def forge_start_run(request: Request, project: str, repo: str, body: RunBody | None = None):
+        """Run the jobs for a branch's current commit now (all that match it, or one by name)."""
+        full = admin_repo(request, project, repo)
+        body = body or RunBody()
+        branch = (body.ref or forge.branches(full).get("default") or "main").strip()
+        heads = forge.branches(full).get("branches", {})
+        if branch not in heads:
+            raise NotFound(f"No such branch: {branch}")
+        return {"runs": jobs.start(full, branch, heads[branch], trigger="manual", job=body.job or None)}
 
     # ---- Web UI (Qt for WebAssembly build in fileapi/static/forge) --------
     ui_dir = Path(__file__).parent / "static" / "forge"

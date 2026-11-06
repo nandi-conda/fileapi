@@ -536,6 +536,38 @@ class Forge:
     def __init__(self, store):
         self.store = store
         self._backend = _Backend(self)
+        # Objects with on_push(repo, [(ref, old, new)]), on_rename(old, new), on_delete(repo): deploy jobs and
+        # repo secrets (fileapi.deploy) follow the repo through these. A listener's failure never fails the push.
+        self.listeners: list = []
+
+    def _emit(self, event: str, *args) -> None:
+        import logging
+
+        for listener in self.listeners:
+            fn = getattr(listener, event, None)
+            if fn is None:
+                continue
+            try:
+                fn(*args)
+            except Exception:  # noqa: BLE001
+                logging.getLogger("fileapi.forge").exception("forge listener %s failed", event)
+
+    def _heads(self, repo: str) -> dict[str, str]:
+        r = self.open(repo)
+        try:
+            return {k.decode(): v.decode() for k, v in r.refs.as_dict().items()
+                    if k.startswith((b"refs/heads/", b"refs/tags/"))}
+        finally:
+            r.close()
+
+    def _emit_push(self, repo: str, before: dict[str, str]) -> None:
+        if not self.listeners:
+            return
+        after = self._heads(repo)
+        updates = [(ref, before.get(ref), after.get(ref)) for ref in sorted(set(before) | set(after))
+                   if before.get(ref) != after.get(ref)]
+        if updates:
+            self._emit("on_push", repo, updates)
 
     # -- names ----------------------------------------------------------------
     def canonical(self, repo: str) -> str:
@@ -563,6 +595,7 @@ class Forge:
             except (Conflict, NotFound):  # another replica got there first, or a clash: leave it
                 continue
             self.store.set_alias(info.full_name, f"{owner}/{name}")
+            self._emit("on_rename", info.full_name, f"{owner}/{name}")
             taken.add(name)
             moved.append((info.full_name, f"{owner}/{name}"))
         return moved
@@ -592,6 +625,7 @@ class Forge:
         owner, name = self._parts(repo)
         self.store.delete(owner, name)
         self.store.drop_aliases(f"{owner}/{name}")
+        self._emit("on_delete", f"{owner}/{name}")
 
     def set_public(self, repo: str, public: bool) -> None:
         self.store.set_public(*self._parts(repo), public)
@@ -607,6 +641,7 @@ class Forge:
         if old != new:
             self.store.rename(*old, *new)
             self.store.set_alias("/".join(old), "/".join(new))  # old clone URLs keep working
+            self._emit("on_rename", "/".join(old), "/".join(new))
         return "/".join(new)
 
     def set_default_branch(self, repo: str, branch: str) -> None:
@@ -638,7 +673,10 @@ class Forge:
             body = gzip.decompress(body)
         out = io.BytesIO()
         proto = ReceivableProtocol(io.BytesIO(body).read, out.write)
+        before = self._heads(repo) if service == "git-receive-pack" and self.listeners else None
         SERVICES[service](self._backend, [repo], proto, stateless_rpc=True).handle()
+        if before is not None:
+            self._emit_push(repo, before)
         return out.getvalue()
 
     # -- browsing -------------------------------------------------------------
@@ -821,9 +859,10 @@ class Forge:
             ok = r.refs.set_if_equals(ref, old, c.id) if old else r.refs.add_if_new(ref, c.id)
             if not ok:
                 raise Conflict(f"Branch {branch} moved during the commit; retry")
-            return {"commit": c.id.decode(), "branch": branch, "parent": old.decode() if old else None}
         finally:
             r.close()
+        self._emit("on_push", self.canonical(repo), [(ref.decode(), old.decode() if old else None, c.id.decode())])
+        return {"commit": c.id.decode(), "branch": branch, "parent": old.decode() if old else None}
 
 
 def _apply_tree(r: BaseRepo, tree_id: bytes | None, changes: dict, new_objects: list) -> bytes | None:
@@ -936,9 +975,12 @@ def push_bundle(forge: Forge, repo: str, data: bytes, force: bool = False) -> li
                 continue
             results.append({"ref": name, "status": "forced" if forced else ("created" if old is None else "updated"),
                             "old": old.decode() if old else None, "sha": new.decode()})
-        return results
     finally:
         r.close()
+    moved = [(x["ref"], x["old"], x["sha"]) for x in results if x["status"] in ("created", "updated", "forced")]
+    if moved:
+        forge._emit("on_push", forge.canonical(repo), moved)
+    return results
 
 
 def fetch_bundle(forge: Forge, repo: str, refs: list[str] | None = None, have: list[str] | None = None) -> tuple[bytes, dict]:

@@ -132,6 +132,21 @@ cloud-db: neon-db login
     {{fastapi}} cloud env set DATABASE_URL "$url"
     echo "DATABASE_URL set on FastAPI Cloud."
 
+# Generate FILEAPI_SECRETS_KEY (encrypts repo secrets) into .env and set it on FastAPI Cloud. Keeps an existing one.
+secrets-key: login
+    #!/usr/bin/env bash
+    set -euo pipefail
+    touch .env
+    key=$(grep '^FILEAPI_SECRETS_KEY=' .env | cut -d= -f2- || true)
+    if [ -z "$key" ]; then
+        key=$({{python}} -c 'import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')
+        echo "FILEAPI_SECRETS_KEY=$key" >> .env
+        chmod 600 .env
+        echo "Generated FILEAPI_SECRETS_KEY in .env (back it up: without it, stored secrets can't be decrypted)."
+    fi
+    {{fastapi}} cloud env set FILEAPI_SECRETS_KEY "$key"
+    echo "FILEAPI_SECRETS_KEY set on FastAPI Cloud."
+
 # First deploy: creates the app, then sets DATABASE_URL (which redeploys with Postgres)
 launch: login
     #!/usr/bin/env bash

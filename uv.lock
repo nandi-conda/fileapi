@@ -703,6 +703,7 @@ name = "fileapi"
 version = "1.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "dulwich" },
     { name = "fastapi", extra = ["standard"] },
     { name = "httpx" },
@@ -729,6 +730,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=42" },
     { name = "dulwich", specifier = ">=1.2.20" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },

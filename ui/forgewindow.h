@@ -20,6 +20,7 @@ class QStackedWidget;
 class QTabWidget;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QTimer;
 
 class ForgeWindow : public QMainWindow {
     Q_OBJECT
@@ -41,6 +42,14 @@ private:
     void fillSettings(const QJsonObject &info);
     void saveSettings();
     void deleteRepo();
+    // Repo secrets (write-only, in Settings) and deploy job runs (the Deploys tab).
+    void loadSecrets();
+    void saveSecret();
+    void deleteSecret();
+    QWidget *buildDeploys();
+    void loadRuns();
+    void showRun(const QString &id);
+    void startRun();
     void createRepo();
     QString shortName(const QString &repo) const;
     void setBreadcrumb(const QString &path, bool isFile);
@@ -101,6 +110,20 @@ private:
     QPushButton *m_save;
     QLineEdit *m_confirmDelete;
     QPushButton *m_delete;
+    QTreeWidget *m_secrets;
+    QLineEdit *m_secretName;
+    QLineEdit *m_secretValue;
+    QPushButton *m_secretSave;
+    QPushButton *m_secretDelete;
+    QLabel *m_secretsNote;
+    QWidget *m_deploys;
+    QTreeWidget *m_runs;
+    QPlainTextEdit *m_runOutput;
+    QPushButton *m_runNow;
+    QComboBox *m_runBranch;
+    QLabel *m_runsNote;
+    QTimer *m_runsTimer;
+    QString m_runShown;  // id of the run whose output is showing
     QStackedWidget *m_main;
     QJsonObject m_lastError;  // {repo, status, error} of the error page, redrawn once we know who's signed in
     QLabel *m_errIcon;

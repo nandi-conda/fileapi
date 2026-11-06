@@ -53,6 +53,7 @@ def build_mcp(
     forge: Forge | None = None,
     passes: RepoPasses | None = None,
     owner: str = "admin",
+    jobs=None,
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
@@ -134,6 +135,8 @@ def build_mcp(
 
     if forge is not None:
         _register_forge_tools(mcp, forge, guard, public_url, passes, owner)
+        if jobs is not None:
+            _register_deploy_tools(mcp, forge, jobs, guard, owner)
 
     return mcp
 
@@ -339,3 +342,87 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
         full = guard(ctx, lambda: full_name(ctx, repo))
         guard(ctx, lambda: forge.delete(full))
         return f"Deleted {full}"
+
+
+def _register_deploy_tools(mcp: MCPServer, forge: Forge, jobs, guard, default_owner: str) -> None:
+    from .deploy import JOBS_FILE
+
+    secrets = jobs.secrets
+
+    def full_name(ctx: Context, repo: str) -> str:
+        full = forge.canonical(qualify(repo, _owner(ctx, default_owner)))
+        forge.open(full).close()
+        return full
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def list_repo_secrets(ctx: Context, repo: RepoArg) -> str:
+        """Names of a repo's secrets and when each was set. Values are write-only and never shown."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        if not secrets.enabled:
+            return "Secrets are turned off on this server: FILEAPI_SECRETS_KEY is not set."
+        rows = secrets.list(full)
+        if not rows:
+            return f"{full} has no secrets. Add one with set_repo_secret."
+        return "\n".join(f"{r['name']}  (set {r['updated']})" for r in rows)
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def set_repo_secret(
+        ctx: Context,
+        repo: RepoArg,
+        name: Annotated[str, Field(description="Env-var style name, e.g. FLY_API_TOKEN")],
+        value: Annotated[str, Field(description="The secret value. It is encrypted and can't be read back")],
+    ) -> str:
+        """Create or replace an encrypted repo secret. Deploy jobs (.forge/jobs.toml) get it as an env var."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        out = guard(ctx, lambda: secrets.set(full, name, value))
+        return f"{'Added' if out['created'] else 'Replaced'} secret {out['name']} on {full}."
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def delete_repo_secret(ctx: Context, repo: RepoArg, name: str) -> str:
+        """Delete a repo secret."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        guard(ctx, lambda: secrets.delete(full, name.strip()))
+        return f"Deleted secret {name.strip()} from {full}."
+
+    @mcp.tool(structured_output=False)
+    def run_deploy(
+        ctx: Context,
+        repo: RepoArg,
+        branch: Annotated[str, Field(description="Branch whose current commit to deploy; default: the default branch")] = "",
+        job: Annotated[str, Field(description="Run only this job from .forge/jobs.toml")] = "",
+    ) -> str:
+        """Run a repo's deploy jobs (.forge/jobs.toml) now, as a push would. Check progress with deploy_runs."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+
+        def go():
+            info = forge.branches(full)
+            b = branch.strip() or info.get("default") or "main"
+            if b not in info["branches"]:
+                from .storage import NotFound
+
+                raise NotFound(f"No such branch: {b}")
+            return jobs.start(full, b, info["branches"][b], trigger="manual", job=job.strip() or None)
+
+        runs = guard(ctx, go)
+        return "Started:\n" + "\n".join(f"{r['id']}  {r['job']}  {r['branch']}@{r['sha'][:12]}" for r in runs)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def deploy_runs(
+        ctx: Context,
+        repo: RepoArg,
+        run_id: Annotated[str, Field(description="Show this run's full output instead of the list")] = "",
+    ) -> str:
+        """Recent deploy job runs for a repo (newest first), or one run's output with secrets masked."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        if run_id.strip():
+            r = guard(ctx, lambda: jobs.get_run(full, run_id.strip()))
+            head = (f"{r['id']}  {r['job']}  {r['status']}  {r['branch']}@{r['sha'][:12]}  "
+                    f"trigger={r['trigger']}  started={r.get('started', '-')}  duration={r.get('duration', '-')}s")
+            if r.get("error"):
+                head += f"\nerror: {r['error']}"
+            return head + "\n\n" + (r.get("output") or "(no output)")
+        runs = guard(ctx, lambda: jobs.list_runs(full))
+        if not runs:
+            return f"No runs yet. Commit {JOBS_FILE} to {full} and push, or call run_deploy."
+        return "\n".join(f"{r['id']}  {r['status']:<8} {r['job']}  {r['branch']}@{r['sha'][:12]}  "
+                         f"{r.get('started') or r.get('queued')}  {r['trigger']}" for r in runs)

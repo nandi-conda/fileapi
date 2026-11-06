@@ -21,6 +21,8 @@
 #include <QPlainTextEdit>
 #include <QProxyStyle>
 #include <QRegularExpression>
+#include <QScrollBar>
+#include <QUrl>
 #include <QPushButton>
 #include <QShortcut>
 #include <QSignalBlocker>
@@ -288,6 +290,13 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_settings = buildSettings();
     m_tabs->addTab(m_settings, "Settings");
     m_tabs->setTabVisible(2, false);  // only the signed-in admin can change settings
+    m_deploys = buildDeploys();
+    m_tabs->addTab(m_deploys, "Deploys");
+    m_tabs->setTabVisible(3, false);
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
+        if (i == 3 && !m_repo.isEmpty())
+            loadRuns();
+    });
     lay->addWidget(m_tabs, 1);
     m_main->addWidget(repoView);
 
@@ -402,6 +411,7 @@ void ForgeWindow::loadMe()
         m_signIn->setToolTip(in ? QString() : "Only " + admin + " can sign in, to see private repos.");
         m_signedIn = in;
         m_tabs->setTabVisible(2, in);
+        m_tabs->setTabVisible(3, in);
         m_newRow->setVisible(in);
         m_newName->setToolTip(QStringLiteral("Creates %1/<name>").arg(m_owner));
         if (m_ownerPrefix)
@@ -480,6 +490,11 @@ void ForgeWindow::openRepo(const QString &repo)
     m_navPanel->setBackEnabled(false);
     closeNav();
     m_settings->setEnabled(false);
+    m_secrets->clear();
+    m_runs->clear();
+    m_runOutput->clear();
+    m_runShown.clear();
+    m_runBranch->clear();
     status("Loading " + repo + "…");
     m_api->get(repoPath(repo), {}, this, [this, repo](const QJsonObject &info, const QString &error) {
         if (repo != m_repo)
@@ -931,6 +946,53 @@ QWidget *ForgeWindow::buildSettings()
     m_delete->setEnabled(false);
     delRow->addWidget(m_delete);
     dl->addLayout(delRow);
+
+    // Secrets: write-only. The list shows names and dates; a value can be replaced but never read back.
+    auto *sec = new QGroupBox("Secrets");
+    auto *sl = new QVBoxLayout(sec);
+    m_secretsNote = new QLabel("Encrypted on the server and never shown again. Deploy jobs in "
+                               "<code>.forge/jobs.toml</code> get each one as an environment variable "
+                               "(see the Deploys tab).");
+    m_secretsNote->setWordWrap(true);
+    m_secretsNote->setTextFormat(Qt::RichText);
+    sl->addWidget(m_secretsNote);
+    m_secrets = new QTreeWidget;
+    m_secrets->setHeaderLabels({"Name", "Updated"});
+    m_secrets->setRootIsDecorated(false);
+    m_secrets->setUniformRowHeights(true);
+    m_secrets->setMinimumHeight(90);
+    m_secrets->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_secrets->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    sl->addWidget(m_secrets);
+    auto *addRow = new QHBoxLayout;
+    m_secretName = new QLineEdit;
+    m_secretName->setPlaceholderText("NAME, e.g. FLY_API_TOKEN");
+    addRow->addWidget(m_secretName, 1);
+    m_secretValue = new QLineEdit;
+    m_secretValue->setPlaceholderText("value");
+    m_secretValue->setEchoMode(QLineEdit::Password);
+    addRow->addWidget(m_secretValue, 2);
+    m_secretSave = new QPushButton("Save secret");
+    m_secretSave->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
+    addRow->addWidget(m_secretSave);
+    m_secretDelete = new QPushButton("Delete");
+    m_secretDelete->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    m_secretDelete->setEnabled(false);
+    m_secretDelete->setToolTip("Delete the selected secret");
+    addRow->addWidget(m_secretDelete);
+    sl->addLayout(addRow);
+    lay->addWidget(sec);
+    connect(m_secretSave, &QPushButton::clicked, this, &ForgeWindow::saveSecret);
+    connect(m_secretValue, &QLineEdit::returnPressed, this, &ForgeWindow::saveSecret);
+    connect(m_secretDelete, &QPushButton::clicked, this, &ForgeWindow::deleteSecret);
+    connect(m_secrets, &QTreeWidget::itemSelectionChanged, this, [this] {
+        const auto sel = m_secrets->selectedItems();
+        const bool real = !sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty();
+        m_secretDelete->setEnabled(real);
+        if (real)
+            m_secretName->setText(sel.first()->data(0, PathRole).toString());  // to replace its value
+    });
+
     lay->addWidget(danger);
     lay->addStretch(1);
     connect(m_confirmDelete, &QLineEdit::textChanged, this, [this](const QString &t) {
@@ -959,6 +1021,17 @@ void ForgeWindow::fillSettings(const QJsonObject &info)
     m_confirmDelete->clear();
     m_confirmDelete->setPlaceholderText(info.value("name").toString());
     m_settings->setEnabled(true);
+    m_runBranch->clear();
+    for (const QString &b : branches)
+        m_runBranch->addItem(b);
+    if (!def.isEmpty() && branches.contains(def))
+        m_runBranch->setCurrentText(def);
+    m_runNow->setEnabled(!branches.isEmpty());
+    if (m_signedIn) {
+        loadSecrets();
+        if (m_tabs->currentIndex() == 3)
+            loadRuns();
+    }
 }
 
 void ForgeWindow::saveSettings()
@@ -1012,6 +1085,260 @@ void ForgeWindow::deleteRepo()
         m_tabs->setCurrentIndex(0);
         loadRepos();
         status("Deleted " + repo + ".");
+    });
+}
+
+void ForgeWindow::loadSecrets()
+{
+    const QString repo = m_repo;
+    if (repo.isEmpty())
+        return;
+    m_api->get(repoPath(repo) + "/secrets", {}, this, [this, repo](const QJsonObject &body, const QString &error) {
+        if (repo != m_repo)
+            return;
+        m_secrets->clear();
+        if (!error.isEmpty()) {
+            (new QTreeWidgetItem(m_secrets))->setText(0, "Couldn't load secrets: " + error);
+            return;
+        }
+        const bool enabled = body.value("enabled").toBool();
+        m_secretName->setEnabled(enabled);
+        m_secretValue->setEnabled(enabled);
+        m_secretSave->setEnabled(enabled);
+        if (!enabled) {
+            (new QTreeWidgetItem(m_secrets))->setText(0, "Secrets are off: the server needs "
+                                                       + body.value("key_env").toString() + " set.");
+            return;
+        }
+        const QJsonArray list = body.value("secrets").toArray();
+        if (list.isEmpty())
+            (new QTreeWidgetItem(m_secrets))->setText(0, "No secrets yet");
+        for (const auto &v : list) {
+            const QJsonObject s = v.toObject();
+            auto *it = new QTreeWidgetItem(m_secrets);
+            it->setText(0, s.value("name").toString());
+            it->setFont(0, QFontDatabase::systemFont(QFontDatabase::FixedFont));
+            it->setData(0, PathRole, s.value("name").toString());
+            const QDateTime when = QDateTime::fromString(s.value("updated").toString(), Qt::ISODate);
+            it->setText(1, QLocale().toString(when.toLocalTime(), QLocale::ShortFormat));
+        }
+    });
+}
+
+void ForgeWindow::saveSecret()
+{
+    const QString repo = m_repo;
+    const QString name = m_secretName->text().trimmed();
+    if (repo.isEmpty())
+        return;
+    if (name.isEmpty())
+        return status("Type a name for the secret, e.g. FLY_API_TOKEN.");
+    if (m_secretValue->text().isEmpty())
+        return status("Type the secret's value.");
+    QJsonObject body;
+    body["value"] = m_secretValue->text();
+    m_secretSave->setEnabled(false);
+    status("Saving secret " + name + "…");
+    m_api->send("PUT", repoPath(repo) + "/secrets/" + QString::fromLatin1(QUrl::toPercentEncoding(name)), body, this,
+                [this, name](const QJsonObject &, const QString &error) {
+        m_secretSave->setEnabled(true);
+        if (!error.isEmpty())
+            return status("Could not save " + name + ": " + error, true);
+        m_secretValue->clear();  // never kept around in the page
+        m_secretName->clear();
+        status("Saved secret " + name + ".");
+        loadSecrets();
+    });
+}
+
+void ForgeWindow::deleteSecret()
+{
+    const auto sel = m_secrets->selectedItems();
+    if (m_repo.isEmpty() || sel.isEmpty())
+        return;
+    const QString name = sel.first()->data(0, PathRole).toString();
+    if (name.isEmpty())
+        return;
+    m_secretDelete->setEnabled(false);
+    status("Deleting secret " + name + "…");
+    m_api->send("DELETE", repoPath(m_repo) + "/secrets/" + QString::fromLatin1(QUrl::toPercentEncoding(name)), {},
+                this, [this, name](const QJsonObject &, const QString &error) {
+        if (!error.isEmpty())
+            return status("Could not delete " + name + ": " + error, true);
+        m_secretName->clear();
+        status("Deleted secret " + name + ".");
+        loadSecrets();
+    });
+}
+
+QWidget *ForgeWindow::buildDeploys()
+{
+    auto *page = new QWidget;
+    auto *lay = new QVBoxLayout(page);
+    lay->setContentsMargins(8, 8, 8, 8);
+    m_runsNote = new QLabel(
+        "Every push runs the jobs in <code>.forge/jobs.toml</code> whose <code>branches</code> match (default: the "
+        "default branch). A job is a shell script (<code>run</code>) in a checkout of the commit, or an HTTP request "
+        "(<code>post</code>, for deploy hooks). Repo secrets are environment variables, and "
+        "<code>${NAME}</code> in a post's URL, headers or body; they are masked in the output.");
+    m_runsNote->setWordWrap(true);
+    m_runsNote->setTextFormat(Qt::RichText);
+    lay->addWidget(m_runsNote);
+    auto *row = new QHBoxLayout;
+    row->addWidget(new QLabel("Branch:"));
+    m_runBranch = new QComboBox;
+    m_runBranch->setMinimumWidth(140);
+    row->addWidget(m_runBranch);
+    m_runNow = new QPushButton("Run now");
+    m_runNow->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    m_runNow->setToolTip("Run the jobs for this branch's latest commit, as a push would");
+    row->addWidget(m_runNow);
+    row->addStretch(1);
+    auto *refresh = new QPushButton("Refresh");
+    refresh->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    row->addWidget(refresh);
+    lay->addLayout(row);
+    auto *split = new QSplitter(Qt::Vertical);
+    m_runs = new QTreeWidget;
+    m_runs->setHeaderLabels({"Status", "Job", "Branch", "Commit", "Started", "Time", "Trigger"});
+    m_runs->setRootIsDecorated(false);
+    m_runs->setUniformRowHeights(true);
+    m_runs->header()->setStretchLastSection(false);
+    for (int i = 0; i < 7; ++i)
+        m_runs->header()->setSectionResizeMode(i, i == 1 ? QHeaderView::Stretch : QHeaderView::ResizeToContents);
+    split->addWidget(m_runs);
+    m_runOutput = new QPlainTextEdit;
+    m_runOutput->setReadOnly(true);
+    m_runOutput->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    m_runOutput->setPlaceholderText("Select a run to see its output.");
+    m_runOutput->setLineWrapMode(QPlainTextEdit::NoWrap);
+    split->addWidget(m_runOutput);
+    split->setStretchFactor(0, 1);
+    split->setStretchFactor(1, 2);
+    lay->addWidget(split, 1);
+    connect(m_runNow, &QPushButton::clicked, this, &ForgeWindow::startRun);
+    connect(refresh, &QPushButton::clicked, this, &ForgeWindow::loadRuns);
+    connect(m_runs, &QTreeWidget::itemSelectionChanged, this, [this] {
+        const auto sel = m_runs->selectedItems();
+        if (!sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty())
+            showRun(sel.first()->data(0, PathRole).toString());
+    });
+    // While a run is queued or going, poll so its status and output appear without clicking Refresh.
+    m_runsTimer = new QTimer(this);
+    m_runsTimer->setInterval(2500);
+    m_runsTimer->setSingleShot(true);
+    connect(m_runsTimer, &QTimer::timeout, this, [this] {
+        if (m_tabs->currentIndex() == 3 && !m_repo.isEmpty())
+            loadRuns();
+    });
+    return page;
+}
+
+void ForgeWindow::loadRuns()
+{
+    const QString repo = m_repo;
+    if (repo.isEmpty() || !m_signedIn)
+        return;
+    m_api->get(repoPath(repo) + "/runs", {}, this, [this, repo](const QJsonObject &body, const QString &error) {
+        if (repo != m_repo)
+            return;
+        const QString keep = m_runShown;
+        const QSignalBlocker block(m_runs);
+        m_runs->clear();
+        if (!error.isEmpty()) {
+            (new QTreeWidgetItem(m_runs))->setText(1, "Couldn't load runs: " + error);
+            return;
+        }
+        if (!body.value("enabled").toBool(true)) {
+            (new QTreeWidgetItem(m_runs))->setText(1, "Deploy jobs are turned off on this server (FILEAPI_JOBS)");
+            m_runNow->setEnabled(false);
+            return;
+        }
+        const QJsonArray runs = body.value("runs").toArray();
+        if (runs.isEmpty())
+            (new QTreeWidgetItem(m_runs))->setText(1, "No runs yet. Commit " + body.value("jobs_file").toString()
+                                                         + " and push.");
+        bool active = false;
+        for (const auto &v : runs) {
+            const QJsonObject r = v.toObject();
+            const QString st = r.value("status").toString();
+            active = active || st == "queued" || st == "running";
+            auto *it = new QTreeWidgetItem(m_runs);
+            it->setText(0, st);
+            QStyle::StandardPixmap icon = QStyle::SP_MessageBoxInformation;
+            if (st == "success")
+                icon = QStyle::SP_DialogApplyButton;
+            else if (st == "failed" || st == "error" || st == "timeout" || st == "lost")
+                icon = QStyle::SP_MessageBoxCritical;
+            else if (st == "running" || st == "queued")
+                icon = QStyle::SP_BrowserReload;
+            it->setIcon(0, style()->standardIcon(icon));
+            it->setText(1, r.value("job").toString());
+            it->setText(2, r.value("branch").toString());
+            it->setText(3, r.value("sha").toString().left(10));
+            it->setFont(3, QFontDatabase::systemFont(QFontDatabase::FixedFont));
+            const QString started = r.value("started").toString(r.value("queued").toString());
+            it->setText(4, QLocale().toString(QDateTime::fromString(started, Qt::ISODate).toLocalTime(),
+                                              QLocale::ShortFormat));
+            if (r.contains("duration"))
+                it->setText(5, QString::number(r.value("duration").toDouble(), 'f', 1) + " s");
+            it->setText(6, r.value("trigger").toString());
+            it->setData(0, PathRole, r.value("id").toString());
+            if (r.value("id").toString() == keep)
+                it->setSelected(true);
+        }
+        m_tabs->setTabText(3, active ? "Deploys (running)" : "Deploys");
+        if (!keep.isEmpty())
+            showRun(keep);  // refresh the output of the run being watched
+        if (active)
+            m_runsTimer->start();
+    });
+}
+
+void ForgeWindow::showRun(const QString &id)
+{
+    const QString repo = m_repo;
+    m_runShown = id;
+    m_api->get(repoPath(repo) + "/runs/" + id, {}, this, [this, repo, id](const QJsonObject &r, const QString &error) {
+        if (repo != m_repo || id != m_runShown)
+            return;
+        if (!error.isEmpty())
+            return m_runOutput->setPlainText("Couldn't load this run: " + error);
+        QString text = QStringLiteral("%1 · %2 · %3@%4\n").arg(r.value("job").toString(), r.value("status").toString(),
+                                                                r.value("branch").toString(),
+                                                                r.value("sha").toString().left(12));
+        if (r.contains("exit_code") && !r.value("exit_code").isNull())
+            text += QStringLiteral("exit code %1\n").arg(r.value("exit_code").toInt());
+        if (r.contains("error"))
+            text += "error: " + r.value("error").toString() + "\n";
+        text += "\n" + r.value("output").toString();
+        auto *bar = m_runOutput->verticalScrollBar();
+        const bool atEnd = bar->value() >= bar->maximum() - 4;
+        m_runOutput->setPlainText(text);
+        if (atEnd)
+            bar->setValue(bar->maximum());  // follow a running job's output
+    });
+}
+
+void ForgeWindow::startRun()
+{
+    const QString repo = m_repo;
+    const QString branch = m_runBranch->currentText();
+    if (repo.isEmpty() || branch.isEmpty())
+        return;
+    QJsonObject body;
+    body["ref"] = branch;
+    m_runNow->setEnabled(false);
+    status("Starting deploy jobs for " + branch + "…");
+    m_api->send("POST", repoPath(repo) + "/runs", body, this, [this, branch](const QJsonObject &res, const QString &error) {
+        m_runNow->setEnabled(true);
+        if (!error.isEmpty())
+            return status("Could not start: " + error, true);
+        const QJsonArray runs = res.value("runs").toArray();
+        status(QStringLiteral("Started %1 job(s) for %2.").arg(runs.size()).arg(branch));
+        if (!runs.isEmpty())
+            m_runShown = runs.first().toObject().value("id").toString();
+        loadRuns();
     });
 }
 
