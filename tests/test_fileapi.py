@@ -2202,3 +2202,15 @@ def test_upstream_pull_mirror(tmp_path, backend):
                      ("[upstream]\nurl='x'\ncolour='red'\n", "unknown upstream setting")):
         with pytest.raises(StorageError, match=msg):
             parse_upstream(bad)
+
+
+def test_forge_url_survives_restart(tmp_path, backend):
+    """Without FILEAPI_PUBLIC_URL the server learns its address from a signed-in request and keeps it, so a job
+    a fresh server starts on its own (an [upstream] pull) still gets FORGE_URL."""
+    db = backend.get("DATABASE_URL", "")
+    with TestClient(app_for(tmp_path, database_url=db), base_url="https://forge.example") as client:
+        client.app.state.forge.create("nandi.uk", "app")
+        client.post("/api/forge/repos/nandi.uk/app/runs", json={}, headers=AUTH)
+        assert client.app.state.jobs.base_url == "https://forge.example"
+    with TestClient(app_for(tmp_path, database_url=db)) as client:
+        assert client.app.state.jobs.base_url == "https://forge.example"

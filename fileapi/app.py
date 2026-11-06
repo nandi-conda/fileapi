@@ -189,7 +189,9 @@ def create_app(
     jobs.passes = passes
     # Pull mirrors: repos whose jobs.toml has [upstream] follow that host's branches and deploy when they move.
     upstream = Upstream(forge, repo_secrets)
-    jobs.base_url = public_url.rstrip("/") if public_url else None  # else learned from requests (see below)
+    # Else learned from requests (see learn_base) and remembered in the KV, so a job a server starts before any
+    # signed-in request reaches it (an [upstream] pull right after a deploy, say) still gets FORGE_URL.
+    jobs.base_url = public_url.rstrip("/") if public_url else ((kv.get("forge_base_url") or {}).get("url") or None)
     # The admin is pinned by DID; the handle is only a login hint and display name.
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
     admin_handle = os.environ.get("FILEAPI_ADMIN_HANDLE") or (oauth.ADMIN_HANDLE if admin_did == oauth.ADMIN_DID else "")
@@ -257,7 +259,13 @@ def create_app(
         """Jobs need this server's public URL (FORGE_URL); without FILEAPI_PUBLIC_URL, take it from a
         signed-in request (a push, a run), which came in through the public address."""
         if not public_url:
-            jobs.base_url = oauth.base_url(request, None)
+            base = oauth.base_url(request, None)
+            if base and base != jobs.base_url:
+                jobs.base_url = base
+                try:
+                    kv.put("forge_base_url", {"url": base})
+                except Exception:  # noqa: BLE001 - only a cache
+                    pass
 
     @app.middleware("http")
     async def mcp_auth(request: Request, call_next):
