@@ -1711,3 +1711,57 @@ def test_finish_self_deploy(tmp_path):
         assert got["status"] == "success" and "is live" in got["output"]
         assert not jobs.finish_self_deploy(run["id"], "a" * 40)  # already recorded
         assert not jobs.finish_self_deploy("nope", None)
+
+
+def test_forge_gc_collects_unreachable_objects(tmp_path, backend):
+    from fileapi.storage import StorageError
+
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("o", "r")
+        if not backend:
+            with pytest.raises(StorageError):
+                forge.gc("o/r")
+            return
+        forge.commit_files("o/r", "main", {"a.txt": "one\n", "keep/b.txt": "b\n"}, "first")
+        first = forge.log("o/r")[0]["sha"]
+        forge.commit_files("o/r", "main", {"a.txt": "two\n" * 1000}, "second")
+        forge.commit_files("o/r", "topic", {"t.txt": "topic\n"}, "on a branch")
+        r = forge.open("o/r")
+        try:  # force-push main back to the first commit: the second commit, its tree and blob are orphaned
+            r.refs.set_if_equals(b"refs/heads/main", r.refs[b"refs/heads/main"], first.encode())
+        finally:
+            r.close()
+
+        assert forge.gc("o/r")["collectable"] == 0  # everything is younger than the grace period
+        dry = forge.gc("o/r", grace=0)
+        assert dry["unreachable"] == 3 and dry["collectable"] == 3 and dry["deleted"] == 0
+        done = forge.gc("o/r", apply=True, grace=0)
+        assert done["deleted"] == 3 and done["deleted_bytes"] == dry["collectable_bytes"] > 0
+        assert forge.gc("o/r", grace=0)["unreachable"] == 0
+        # Both branches are intact.
+        assert forge.browse("o/r", "a.txt")["content"] == "one\n"
+        assert forge.browse("o/r", "t.txt", ref="topic")["content"] == "topic\n"
+        usage = forge.usage()
+        assert usage["database_bytes"] > 0 and usage["repos"][0]["repo"] == "o/r"
+
+        # A push that re-sends an old orphaned object refreshes it, so gc leaves it for the grace period.
+        from dulwich.objects import Blob
+
+        blob = Blob.from_string(b"orphan\n")
+        r = forge.open("o/r")
+        try:
+            r.object_store.add_object(blob)
+        finally:
+            r.close()
+        import psycopg
+
+        with psycopg.connect(backend["DATABASE_URL"], autocommit=True) as c:
+            c.execute("UPDATE fileapi_git_objects SET created = now() - interval '1 day' WHERE sha = %s",
+                      (blob.sha().digest(),))
+        r = forge.open("o/r")
+        try:
+            r.object_store.add_object(blob)
+        finally:
+            r.close()
+        assert forge.gc("o/r", grace=3600)["collectable"] == 0

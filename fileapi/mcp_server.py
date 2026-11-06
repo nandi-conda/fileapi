@@ -339,6 +339,37 @@ def _register_forge_tools(mcp: MCPServer, forge: Forge, guard, public_url: str |
             return f"{full} is now public. Anyone can run: git clone {url}\nPushing still needs a credential: use repo_remote_url."
         return f"{full} is now private. Cloning needs a credential: use repo_remote_url."
 
+    def _mb(n: int) -> str:
+        return f"{n / 1048576:.1f} MB"
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def storage_usage(ctx: Context) -> str:
+        """How much of the database each table and each repo's git objects use (Postgres backend)."""
+        u = guard(ctx, forge.usage)
+        lines = [f"Database: {_mb(u['database_bytes'])}", "", "Tables (incl. indexes and TOAST):"]
+        lines += [f"  {t['table']}: {_mb(t['bytes'])} ({t['live_rows']} rows, {t['dead_rows']} dead)"
+                  for t in u["tables"] if t["bytes"] >= 65536]
+        lines += ["", "Git objects per repo (compressed bytes stored):"]
+        lines += [f"  {r['repo']}: {_mb(r['stored_bytes'])} in {r['objects']} objects" for r in u["repos"]]
+        return "\n".join(lines)
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def gc_repo(
+        ctx: Context,
+        repo: RepoArg,
+        apply: Annotated[bool, Field(description="false (default): only report what would go. true: delete it")] = False,
+    ) -> str:
+        """Find git objects no branch or tag can reach any more (left by force-pushes, deleted branches and
+        failed pushes) and, with apply=true, delete them. Objects from the last hour are always kept."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        r = guard(ctx, lambda: forge.gc(full, apply=apply))
+        head = (f"{r['repo']}: {r['objects']} objects, {_mb(r['stored_bytes'])}. Unreachable: {r['unreachable']} "
+                f"({_mb(r['unreachable_bytes'])}), {r['collectable']} old enough to collect "
+                f"({_mb(r['collectable_bytes'])}).")
+        if apply:
+            return head + f"\nDeleted {r['deleted']} objects ({_mb(r['deleted_bytes'])})."
+        return head + "\nNothing deleted: call again with apply=true to delete them."
+
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
     def delete_repo(ctx: Context, repo: RepoArg) -> str:
         """Permanently delete a repo and all its history."""
