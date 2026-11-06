@@ -152,12 +152,22 @@ claude-add url=fileapi_url scope="user":
     claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp"
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
 
-# Install the git credential helper to ~/.local/bin and use it for this server: plain `git clone` then signs in in the browser
+# Install the git credential helper (and git-lfs, from pixi, if there isn't one) to ~/.local/bin and use it for this server
 git-setup url=fileapi_url:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v python3 >/dev/null || { echo "git-credential-fileapi needs python3 on PATH." >&2; exit 1; }
     mkdir -p ~/.local/bin
     install -m 755 fileapi/git_credential.py ~/.local/bin/git-credential-fileapi
+    # git runs git-lfs from PATH (outside pixi too), so put pixi's copy (a static binary) where git finds it.
+    # A git-lfs from the system package manager wins; one we installed before gets updated.
+    pixi_lfs=$({{run}} sh -c 'command -v git-lfs')
+    current=$(command -v git-lfs || true)
+    if [ -z "$current" ] || [ "$current" = "$HOME/.local/bin/git-lfs" ]; then
+        install -m 755 "$pixi_lfs" ~/.local/bin/git-lfs
+        echo "Installed $(~/.local/bin/git-lfs version | cut -d' ' -f1) to ~/.local/bin/git-lfs (from pixi)."
+    else
+        echo "Using git-lfs at $current."
+    fi
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "Add ~/.local/bin to PATH so git can find git-credential-fileapi." >&2;; esac
     ~/.local/bin/git-credential-fileapi setup "{{url}}"

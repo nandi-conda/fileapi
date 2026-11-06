@@ -52,6 +52,7 @@ platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 [tool.pixi.dependencies]
 python = "3.13.*"
 nodejs = ">=20"
+git-lfs = ">=3.4"
 
 [tool.pixi.pypi-dependencies]
 fileapi = { path = ".", editable = true }

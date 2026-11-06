@@ -436,7 +436,7 @@ def setup_lfs() -> None:
     if _have_lfs():
         _git("lfs", "install", "--skip-repo")
     else:
-        _log("git-lfs isn't installed; install it (https://git-lfs.com) and run setup again so files over "
+        _log("git-lfs isn't on PATH; install it (https://git-lfs.com, or `just git-setup` from a fileapi checkout) and run setup again so files over "
              f"{_human(lfs_threshold())} go to Git LFS automatically.")
     # New clones and `git init` copy hooks from init.templateDir. Use ours unless one is set already.
     template = _git("config", "--global", "--get", "init.templateDir").stdout.strip()
