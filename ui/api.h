@@ -26,6 +26,9 @@ public:
     void get(const QString &path, const QUrlQuery &query, QObject *context, Callback done);
     // PATCH/DELETE/... <base>/api/forge/<path> with an optional JSON body.
     void send(const QByteArray &method, const QString &path, const QJsonObject &body, QObject *context, Callback done);
+    // PUT <base>/api/forge/<path>?<query> with raw bytes (file uploads).
+    void put(const QString &path, const QUrlQuery &query, const QByteArray &data, const QByteArray &contentType,
+             QObject *context, Callback done);
 
     // Hand-offs to the page's JavaScript (index.html), which runs the OAuth sign-in.
     void signIn();

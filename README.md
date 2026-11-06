@@ -189,7 +189,54 @@ args = ["--no-cache"]            # any other `depot build` flags
 | `PUT /api/forge/user/secrets/<NAME>` | `{"value": "..."}` create or replace |
 | `DELETE /api/forge/user/secrets/<NAME>` | Delete |
 | `GET /api/forge/repos/<owner>/<repo>/runs[/<id>]` | Recent runs, or one with its output |
-| `POST /api/forge/repos/<owner>/<repo>/runs` | `{"ref"?: branch, "job"?: name}` run now |
+| `POST /api/forge/repos/<owner>/<repo>/runs` | `{"ref"?: branch, "tag"?: tag, "job"?: name}` run now |
+
+### Releases
+
+Each repo can have releases: a tag (e.g. `v1.2.0`; it doesn't have to exist in git), a title, Markdown notes
+and uploaded files. They show in the web UI's **Releases** tab, where the owner can make, edit, publish and
+delete them and upload files. Anyone who can see the repo can download: public repos anonymously, private
+ones signed in or through the signed `download_url` (valid an hour) the API hands out. Drafts are only
+visible to you; `latest` in a URL is the newest release that isn't a draft or prerelease.
+
+Files are stored with the repo (Postgres chunks, or `<repo>.git/releases/` on disk), so they follow renames
+and go with deletes. Up to `FILEAPI_RELEASE_MAX_ASSET` bytes each (default 2 GiB). Uploads can come in
+pieces (`offset`, `final=false`), which keeps each request small however big the file; mind the Postgres
+plan's storage quota.
+
+```sh
+# curl: the body is the file (Bearer = your access token, or a repo pass / FORGE_TOKEN)
+curl -H "Authorization: Bearer $TOKEN" -T dist/app.tar.gz \
+  "https://<host>/api/forge/repos/<owner>/<repo>/releases/v1.2.0/assets/app.tar.gz?create=true"
+# the client (`just git-setup` installs it as fileapi-release): splits big files, signs in in the browser
+fileapi-release upload --create v1.2.0 dist/*
+fileapi-release create v1.3.0 --notes-file CHANGES.md --draft
+fileapi-release download latest -o ./bin
+```
+
+From CI: a job with `tags` runs when a matching tag is pushed, and every job gets `FORGE_TOKEN`,
+`FORGE_URL`, `FORGE_API` and `forge-release` on PATH:
+
+```toml
+[[job]]
+name = "release"
+tags = ["v*"]
+run = "make dist && forge-release upload --create $FORGE_TAG dist/*"
+```
+
+MCP: `list_releases`, `create_release`, `update_release`, `delete_release`, `upload_release_asset` (small
+files, base64 or text), `delete_release_asset`, and `release_upload_url` (a short-lived credential plus
+curl commands for big files).
+
+| Endpoint | |
+|---|---|
+| `GET /api/forge/repos/<owner>/<repo>/releases[/<tag>]` | Releases (newest first), or one; `latest` works |
+| `POST /api/forge/repos/<owner>/<repo>/releases` | `{"tag", "name"?, "notes"?, "ref"?, "prerelease"?, "draft"?}` |
+| `PATCH /api/forge/repos/<owner>/<repo>/releases/<tag>` | Change `tag`, `name`, `notes`, `prerelease`, `draft` |
+| `DELETE /api/forge/repos/<owner>/<repo>/releases/<tag>` | Delete it and its files |
+| `PUT .../releases/<tag>/assets/<name>?offset=&final=&sha256=&create=` | Upload (raw body) |
+| `GET .../releases/<tag>/assets/<name>` | Download |
+| `DELETE .../releases/<tag>/assets/<name>` | Delete one file |
 
 ## REST API
 

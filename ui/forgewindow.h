@@ -10,6 +10,7 @@ class CodeHighlighter;
 class CodeView;
 class NavPanel;
 class SecretsPanel;
+class ReleasesPanel;
 class QBoxLayout;
 class QFormLayout;
 class QSplitter;
@@ -121,6 +122,7 @@ private:
     QLineEdit *m_confirmDelete;
     QPushButton *m_delete;
     SecretsPanel *m_repoSecrets;
+    ReleasesPanel *m_releases;
     SecretsPanel *m_userSecrets;
     QPushButton *m_userSettingsBtn;
     QAction *m_userSettingsAct;

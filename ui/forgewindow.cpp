@@ -5,6 +5,7 @@
 #include "highlighter.h"
 #include "navpanel.h"
 #include "secretspanel.h"
+#include "releasespanel.h"
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -315,6 +316,19 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         loadLog();
     });
     m_tabs->addTab(m_commits, "Commits");
+    // Releases: everyone who can see the repo can download; the owner makes them and uploads files.
+    m_releases = new ReleasesPanel(m_api);
+    connect(m_releases, &ReleasesPanel::statusText, this, [this](const QString &t, bool e) { status(t, e); });
+    auto *releasesScroll = new QScrollArea;  // a phone's stacked buttons can run past the screen
+    releasesScroll->setWidget(m_releases);
+    releasesScroll->setWidgetResizable(true);
+    releasesScroll->setFrameShape(QFrame::NoFrame);
+    touchScroll(releasesScroll);
+    m_tabs->addTab(releasesScroll, "Releases");
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
+        if (i == 2 && !m_repo.isEmpty() && !m_releases->loaded())
+            m_releases->load();
+    });
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
         if (i == 1 && !m_repo.isEmpty() && m_ref->count() > 0
             && (m_commits->topLevelItemCount() == 0 || m_commitsBadge == "error"))
@@ -328,12 +342,12 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     settingsScroll->setFrameShape(QFrame::NoFrame);
     touchScroll(settingsScroll);
     m_tabs->addTab(settingsScroll, "Settings");
-    m_tabs->setTabVisible(2, false);  // only the signed-in admin can change settings
+    m_tabs->setTabVisible(3, false);  // only the signed-in admin can change settings
     m_deploys = buildDeploys();
     m_tabs->addTab(m_deploys, "Deploys");
-    m_tabs->setTabVisible(3, false);
+    m_tabs->setTabVisible(4, false);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
-        if (i == 3 && !m_repo.isEmpty())
+        if (i == 4 && !m_repo.isEmpty())
             loadRuns();
     });
     lay->addWidget(m_tabs, 1);
@@ -493,6 +507,7 @@ void ForgeWindow::setCompact(bool compact)
     for (int c : {2, 3, 4, 6})              // branch, commit, started, trigger
         m_runs->setColumnHidden(c, compact);
     m_repoSecrets->setCompact(compact);
+    m_releases->setCompact(compact);
     m_userSecrets->setCompact(compact);
     m_settingsForm->setRowWrapPolicy(compact ? QFormLayout::WrapAllRows : QFormLayout::DontWrapRows);
     m_errButtons->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
@@ -510,7 +525,7 @@ void ForgeWindow::setCompact(bool compact)
     m_title->setFixedHeight(QFontMetrics(tf).lineSpacing() + 4);
     m_tabs->tabBar()->setUsesScrollButtons(true);  // never wider than the screen, whatever the labels
     setTabBadge(1, m_commitsBadge);
-    setTabBadge(3, m_deploysBadge);
+    setTabBadge(4, m_deploysBadge);
     const QFontMetrics fm = m_tabs->fontMetrics();
     // Wide enough for "Commits (100)", so the tabs don't shift when the commit count arrives; on a phone
     // the four tabs have to share the width instead.
@@ -588,8 +603,10 @@ void ForgeWindow::loadMe()
         m_signIn->setText(in ? "Sign out" : "Sign in");
         m_signIn->setToolTip(in ? QString() : "Only " + admin + " can sign in, to see private repos.");
         m_signedIn = in;
-        m_tabs->setTabVisible(2, in);
         m_tabs->setTabVisible(3, in);
+        m_tabs->setTabVisible(4, in);
+        if (m_releases->loaded())
+            m_releases->load();  // signing in shows drafts and the edit buttons
         m_newRow->setVisible(in);
         m_userSettingsAct->setVisible(in);
         if (in && m_api->locationHash() == "settings")
@@ -675,6 +692,9 @@ void ForgeWindow::openRepo(const QString &repo)
     closeNav();
     m_settings->setEnabled(false);
     m_repoSecrets->setPath(repoPath(repo) + "/secrets");
+    m_releases->setRepo(repo);
+    if (m_tabs->currentIndex() == 2)
+        m_releases->load();
     m_runs->clear();
     m_runOutput->clear();
     m_runShown.clear();
@@ -1192,7 +1212,7 @@ void ForgeWindow::fillSettings(const QJsonObject &info)
     m_runNow->setEnabled(!branches.isEmpty());
     if (m_signedIn) {
         m_repoSecrets->load();
-        if (m_tabs->currentIndex() == 3)
+        if (m_tabs->currentIndex() == 4)
             loadRuns();
     }
 }
@@ -1330,7 +1350,7 @@ QWidget *ForgeWindow::buildDeploys()
     m_runsTimer->setInterval(2500);
     m_runsTimer->setSingleShot(true);
     connect(m_runsTimer, &QTimer::timeout, this, [this] {
-        if (m_tabs->currentIndex() == 3 && !m_repo.isEmpty())
+        if (m_tabs->currentIndex() == 4 && !m_repo.isEmpty())
             loadRuns();
     });
     return page;
@@ -1376,7 +1396,8 @@ void ForgeWindow::loadRuns()
                 icon = QStyle::SP_BrowserReload;
             it->setIcon(0, style()->standardIcon(icon));
             it->setText(1, r.value("job").toString());
-            it->setText(2, r.value("branch").toString());
+            it->setText(2, r.value("tag").toString().isEmpty() ? r.value("branch").toString()
+                                                               : "tag " + r.value("tag").toString());
             it->setText(3, r.value("sha").toString().left(10));
             it->setFont(3, QFontDatabase::systemFont(QFontDatabase::FixedFont));
             const QString started = r.value("started").toString(r.value("queued").toString());
@@ -1389,7 +1410,7 @@ void ForgeWindow::loadRuns()
             if (r.value("id").toString() == keep)
                 it->setSelected(true);
         }
-        setTabBadge(3, active ? "running" : QString());
+        setTabBadge(4, active ? "running" : QString());
         if (!keep.isEmpty())
             showRun(keep);  // refresh the output of the run being watched
         if (active)

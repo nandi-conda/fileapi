@@ -63,6 +63,14 @@ void Api::send(const QByteArray &method, const QString &path, const QJsonObject 
     finish(m_net.sendCustomRequest(req, method, data), context, done);
 }
 
+void Api::put(const QString &path, const QUrlQuery &query, const QByteArray &data, const QByteArray &contentType,
+              QObject *context, Callback done)
+{
+    QNetworkRequest req = request(path, query);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, contentType);
+    finish(m_net.put(req, data), context, done);
+}
+
 void Api::finish(QNetworkReply *reply, QObject *context, Callback done)
 {
     connect(reply, &QNetworkReply::finished, context, [reply, done]() {
