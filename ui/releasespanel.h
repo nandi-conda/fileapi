@@ -28,10 +28,14 @@ public:
     void load();
     bool loaded() const { return m_loaded; }
     void setCompact(bool compact);
+    // The release the page URL names (or the user picked); empty = none picked, the newest shows.
+    void selectTag(const QString &tag);
+    QString pickedTag() const { return m_picked; }
 
 signals:
     void statusText(const QString &text, bool error);
     void countChanged(int releases);
+    void tagPicked(const QString &tag);  // the user selected a release in the list
 
 private:
     void fillList(const QString &select);
@@ -42,6 +46,7 @@ private:
     void upload();
     void sendPiece(const QString &tag, const QString &name, const QByteArray &data, qint64 offset);
     void downloadAsset();
+    void copyText(const QString &text, const QString &what);
     void deleteAsset();
     void deleteRelease();
     void publish();
@@ -55,6 +60,7 @@ private:
     qint64 m_maxAsset = 0;
     QJsonArray m_releases;
     QString m_shownTag;
+    QString m_picked;
     bool m_uploading = false;
 
     QLabel *m_note;
@@ -69,6 +75,8 @@ private:
     QTreeWidget *m_assets;
     QBoxLayout *m_assetButtons;
     QPushButton *m_download;
+    QPushButton *m_copyAsset;
+    QPushButton *m_copyRelease;
     QPushButton *m_upload;
     QPushButton *m_deleteAsset;
     QBoxLayout *m_releaseButtons;

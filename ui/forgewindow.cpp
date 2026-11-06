@@ -46,6 +46,23 @@
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+#include <QPointer>
+
+#ifdef Q_OS_WASM
+#include <emscripten/bind.h>
+#include <emscripten/val.h>
+
+namespace {
+QPointer<ForgeWindow> g_window;  // gets the browser's popstate (back/forward, a link typed in)
+void forgeRouteChanged()
+{
+    if (g_window)
+        QMetaObject::invokeMethod(g_window.data(), [] { if (g_window) g_window->routeChanged(); }, Qt::QueuedConnection);
+}
+}  // namespace
+
+EMSCRIPTEN_BINDINGS(forgeui) { emscripten::function("forgeRouteChanged", &forgeRouteChanged); }
+#endif
 
 namespace {
 constexpr int PathRole = Qt::UserRole;
@@ -68,6 +85,32 @@ QString splitLines(QString &hash)
         return {};
     hash.chop(m.capturedLength());
     return m.captured(1);
+}
+
+// The repo tabs by index, as they appear in the URL (#<owner>/<repo>/-/<name>); Files has none.
+const QStringList TabNames = {QString(), "commits", "releases", "settings", "deploys"};
+
+// Splits a trailing "?ref=<ref>" off a location hash (after splitLines); returns the ref or "".
+QString splitRef(QString &hash)
+{
+    const int at = hash.lastIndexOf(QStringLiteral("?ref="));
+    if (at < 0)
+        return {};
+    const QString ref = hash.mid(at + 5);
+    hash.truncate(at);
+    return ref;
+}
+
+// "L12" / "L12-L20" / "L12-20" -> first and last line (0 when there is none).
+QPair<int, int> parseLines(const QString &lines)
+{
+    if (lines.isEmpty())
+        return {0, 0};
+    const QStringList ends = lines.split('-');
+    const int first = ends.value(0).mid(1).toInt();
+    const QString lastStr = ends.value(1);
+    const int last = lastStr.isEmpty() ? first : lastStr.mid(lastStr.startsWith('L') ? 1 : 0).toInt();
+    return {first, last};
 }
 
 // The server counts columns in code points; QString indexes are UTF-16 units. They differ only after
@@ -105,7 +148,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_backAction = bar->addAction(style()->standardIcon(QStyle::SP_ArrowBack), "Repositories");
     m_backAction->setToolTip("Back to repositories");
     m_backAction->setVisible(false);
-    connect(m_backAction, &QAction::triggered, this, [this] { closeRepo(); });
+    connect(m_backAction, &QAction::triggered, this, [this] { closeRepo(Nav::Push); });
     auto *brand = new QLabel("<b>fileapi</b> forge");
     brand->setContentsMargins(8, 0, 16, 0);
     bar->addWidget(brand);
@@ -212,7 +255,12 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     lay->addLayout(m_headRow);
     connect(m_ref, &QComboBox::textActivated, this, [this] {
         closeNav();
-        browse(QString());
+        if (m_tabs->currentIndex() == 0)
+            browse(QString(), Nav::Push);
+        else {
+            browse(QString(), Nav::Replace);
+            updateHash(Nav::Push);  // e.g. #<repo>/-/commits?ref=<branch>
+        }
         loadLog();
     });
 
@@ -311,14 +359,21 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     touchScroll(m_commits);
     connect(m_commits, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *it) {
         m_ref->setCurrentText(it->data(0, ShaRole).toString().left(12));
+        m_routing = true;  // one history entry for the whole move, made by browse
         m_tabs->setCurrentIndex(0);
-        browse(QString());
+        m_routing = false;
+        browse(QString(), Nav::Push);
         loadLog();
+    });
+    connect(m_commits, &QTreeWidget::itemSelectionChanged, this, [this] {
+        m_pendingCommit.clear();
+        updateHash(Nav::Replace);  // #<repo>/-/commits/<sha>: a link to the selected commit
     });
     m_tabs->addTab(m_commits, "Commits");
     // Releases: everyone who can see the repo can download; the owner makes them and uploads files.
     m_releases = new ReleasesPanel(m_api);
     connect(m_releases, &ReleasesPanel::statusText, this, [this](const QString &t, bool e) { status(t, e); });
+    connect(m_releases, &ReleasesPanel::tagPicked, this, [this] { updateHash(Nav::Push); });
     auto *releasesScroll = new QScrollArea;  // a phone's stacked buttons can run past the screen
     releasesScroll->setWidget(m_releases);
     releasesScroll->setWidgetResizable(true);
@@ -349,6 +404,12 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
         if (i == 4 && !m_repo.isEmpty())
             loadRuns();
+    });
+    // Every tab has its own URL, and switching tabs is a step Back undoes. (When code switches tabs
+    // with m_routing set, it updates the URL itself.)
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this] {
+        if (!m_routing && !m_repo.isEmpty() && m_main->currentIndex() == 1)
+            updateHash(Nav::Push);
     });
     lay->addWidget(m_tabs, 1);
     m_main->addWidget(repoView);
@@ -392,9 +453,9 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     connect(m_errRetry, &QPushButton::clicked, this, [this] {
         const QString repo = m_repo;
         m_repo.clear();
-        openRepo(repo);
+        openRepo(repo, Nav::Replace);
     });
-    connect(errBack, &QPushButton::clicked, this, [this] { closeRepo(); });
+    connect(errBack, &QPushButton::clicked, this, [this] { closeRepo(Nav::Push); });
     m_main->addWidget(errPage);
 
     // ---- user settings (page 3): things that apply to every repo the signed-in account owns
@@ -432,15 +493,26 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
 
     if (screen())
         setCompact(screen()->geometry().width() < CompactWidth);  // before the first paint, so it doesn't jump
+#ifdef Q_OS_WASM
+    g_window = this;
+    emscripten::val::global("window").call<void>("addEventListener", std::string("popstate"),
+                                                 emscripten::val::module_property("forgeRouteChanged"));
+#endif
     loadMe();
     loadRepos();
 }
 
-void ForgeWindow::closeRepo()
+void ForgeWindow::routeChanged()
+{
+    applyRoute(m_api->locationHash());
+}
+
+void ForgeWindow::closeRepo(Nav nav)
 {
     m_repo.clear();
     m_pendingPath.clear();
-    m_api->setLocationHash(QString());
+    m_hasPendingTab = false;
+    m_api->setLocationHash(QString(), nav == Nav::Push);
     const QSignalBlocker block(m_repos);
     m_repos->setCurrentRow(-1);
     m_main->setCurrentIndex(0);
@@ -603,14 +675,17 @@ void ForgeWindow::loadMe()
         m_signIn->setText(in ? "Sign out" : "Sign in");
         m_signIn->setToolTip(in ? QString() : "Only " + admin + " can sign in, to see private repos.");
         m_signedIn = in;
+        m_meKnown = true;
         m_tabs->setTabVisible(3, in);
         m_tabs->setTabVisible(4, in);
+        if (m_hasPendingTab && m_main->currentIndex() == 1 && !m_info.isEmpty())
+            applyPendingTab();  // a link to Settings or Deploys waited to learn whether those exist
         if (m_releases->loaded())
             m_releases->load();  // signing in shows drafts and the edit buttons
         m_newRow->setVisible(in);
         m_userSettingsAct->setVisible(in);
         if (in && m_api->locationHash() == "settings")
-            showUserSettings();
+            showUserSettings(Nav::Replace);
         m_newName->setToolTip(QStringLiteral("Creates %1/<name>").arg(m_owner));
         if (m_ownerPrefix)
             m_ownerPrefix->setText(m_owner + " /");
@@ -643,38 +718,153 @@ void ForgeWindow::loadRepos()
             m_repos->addItem(it);
         }
         status(repos.isEmpty() ? "No repositories you can see yet." : QStringLiteral("%1 repositories").arg(repos.size()));
-        // Restore #<owner>/<repo>[/path] from the page URL.
+        // Restore the view the page URL names. A repo that's already open (the list reloaded after
+        // sign-in) is just reselected: its view is what the URL says already.
         QString hash = m_api->locationHash();
-        const QString lines = splitLines(hash);
         const QStringList parts = hash.split('/', Qt::SkipEmptyParts);
-        if (parts.size() >= 2) {
-            const QString repo = parts[0] + "/" + parts[1];
-            bool found = false;
-            for (int i = 0; i < m_repos->count() && !found; ++i)
-                if (m_repos->item(i)->data(PathRole).toString() == repo) {
-                    found = true;
-                    if (repo == m_repo) {  // already open (the list reloaded after sign-in): just reselect
-                        const QSignalBlocker block(m_repos);
-                        m_repos->setCurrentRow(i);
-                        break;
-                    }
-                    m_pendingPath = parts.mid(2).join('/');
-                    m_pendingLines = lines;
+        const QString repo = parts.size() >= 2 ? parts[0] + "/" + parts[1].section('?', 0, 0).section('#', 0, 0)
+                                               : QString();
+        if (!repo.isEmpty() && repo == m_repo) {
+            const QSignalBlocker block(m_repos);
+            for (int i = 0; i < m_repos->count(); ++i)
+                if (m_repos->item(i)->data(PathRole).toString() == repo)
                     m_repos->setCurrentRow(i);
-                }
-            // An old link (from before repos moved under their owner, or before a rename): the server
-            // resolves the old name, and openRepo switches to the current one.
-            if (!found && repo != m_repo) {
-                m_pendingPath = parts.mid(2).join('/');
-                m_pendingLines = lines;
-                openRepo(repo);
-            }
+        } else if (!repo.isEmpty()) {
+            applyRoute(hash);
         }
     });
 }
 
-void ForgeWindow::openRepo(const QString &repo)
+QString ForgeWindow::defaultRef() const
 {
+    const QString def = m_info.value("default").toString();
+    return def.isEmpty() ? m_ref->itemText(0) : def;
+}
+
+void ForgeWindow::applyRoute(QString hash)
+{
+    if (hash == "settings") {
+        if (m_signedIn && m_main->currentIndex() != 3)
+            showUserSettings(Nav::Replace);
+        return;  // not signed in (yet): loadMe opens it once it knows
+    }
+    const QString lines = splitLines(hash);
+    const QString routeRef = splitRef(hash);
+    const QStringList parts = hash.split('/', Qt::SkipEmptyParts);
+    if (parts.size() < 2) {
+        if (m_main->currentIndex() != 0)
+            closeRepo(Nav::Replace);
+        return;
+    }
+    const QString repo = parts[0] + "/" + parts[1];
+    QStringList rest = parts.mid(2);
+    int tab = 0;
+    QString item;
+    if (rest.value(0) == "-" && rest.size() >= 2) {
+        tab = std::max(0, int(TabNames.indexOf(rest[1].toLower())));
+        item = rest.mid(2).join('/');
+        rest.clear();
+    }
+    const QString path = rest.join('/');
+    m_hasPendingTab = true;
+    m_pendingTab = tab;
+    m_pendingItem = item;
+
+    if (repo != m_repo || m_main->currentIndex() != 1) {
+        m_pendingPath = path;
+        m_pendingLines = lines;
+        m_pendingRef = routeRef;
+        {
+            const QSignalBlocker block(m_repos);
+            m_repos->setCurrentRow(-1);
+            for (int i = 0; i < m_repos->count(); ++i)
+                if (m_repos->item(i)->data(PathRole).toString() == repo)
+                    m_repos->setCurrentRow(i);
+        }
+        // An old name (from before repos moved under their owner, or before a rename) opens too: the
+        // server resolves it, and openRepo switches to the current one.
+        openRepo(repo, Nav::Replace);
+        return;
+    }
+    if (m_info.isEmpty())
+        return;  // still loading: the pending view applies once it has
+
+    // The repo is open: change only what differs.
+    const QString wantRef = routeRef.isEmpty() ? defaultRef() : routeRef;
+    const bool refChanged = m_ref->count() > 0 && wantRef != ref();
+    if (refChanged) {
+        m_ref->setCurrentText(wantRef);
+        closeNav();
+        loadLog();
+    }
+    applyPendingTab();
+    if (tab == 0) {
+        const auto [first, last] = parseLines(lines);
+        if (refChanged || path != m_path) {
+            m_pendingLines = lines;
+            browse(path, Nav::Replace);
+        } else if (m_filesStack->currentIndex() == 1
+                   && (first != m_viewer->markedFirst() || std::max(first, last) != m_viewer->markedLast())) {
+            m_viewer->setMarkedLines(first, last, first > 0);
+        }
+    } else if (refChanged) {
+        browse(QString(), Nav::Replace);
+    }
+}
+
+void ForgeWindow::applyPendingTab()
+{
+    int tab = m_pendingTab;
+    if ((tab == 3 || tab == 4) && !m_tabs->isTabVisible(tab)) {
+        if (!m_meKnown)
+            return;  // loadMe calls back once it knows whether these tabs exist
+        tab = 0;     // not signed in: there's no such tab
+    }
+    m_hasPendingTab = false;
+    const QString item = std::exchange(m_pendingItem, QString());
+    if (tab == 1) {
+        m_pendingCommit = item;
+        selectPendingCommit();
+    } else if (tab == 2) {
+        if (item != m_releases->pickedTag())
+            m_releases->selectTag(item);
+    } else if (tab == 4 && item != m_runShown) {
+        m_runShown = item;
+        m_runOutput->clear();
+        if (m_tabs->currentIndex() == 4)
+            loadRuns();  // otherwise the tab switch below loads them
+    }
+    m_routing = true;
+    m_tabs->setCurrentIndex(tab);
+    m_routing = false;
+    updateHash(Nav::Replace);
+}
+
+void ForgeWindow::selectPendingCommit()
+{
+    if (m_pendingCommit.isEmpty()) {
+        const QSignalBlocker block(m_commits);
+        m_commits->clearSelection();
+        return;
+    }
+    for (int i = 0; i < m_commits->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *it = m_commits->topLevelItem(i);
+        if (it->data(0, ShaRole).toString().startsWith(m_pendingCommit)) {
+            const QSignalBlocker block(m_commits);
+            m_commits->setCurrentItem(it);
+            m_commits->scrollToItem(it, QAbstractItemView::PositionAtCenter);
+            return;  // keep m_pendingCommit, so the URL keeps naming it until something else is picked
+        }
+    }
+}
+
+void ForgeWindow::openRepo(const QString &repo, Nav nav)
+{
+    if (nav == Nav::Push) {  // picked from the list: not where some URL pointed
+        m_hasPendingTab = false;
+        m_pendingRef.clear();
+        m_pendingCommit.clear();
+    }
     m_repo = repo;
     m_main->setCurrentIndex(1);
     m_title->setText(repo);
@@ -683,8 +873,12 @@ void ForgeWindow::openRepo(const QString &repo)
     m_crumbs->setText(QStringLiteral("<b>%1</b>").arg(repo.section('/', 1).toHtmlEscaped()));
     m_clone->clear();
     m_ref->clear();
+    m_path.clear();
     m_entries->clear();
-    m_commits->clear();
+    {
+        const QSignalBlocker block(m_commits);  // its selection handler would rewrite the URL mid-switch
+        m_commits->clear();
+    }
     setTabBadge(1, QString());
     m_info = {};
     m_backStack.clear();
@@ -700,7 +894,7 @@ void ForgeWindow::openRepo(const QString &repo)
     m_runShown.clear();
     m_runBranch->clear();
     status("Loading " + repo + "…");
-    m_api->get(repoPath(repo), {}, this, [this, repo](const QJsonObject &info, const QString &error) {
+    m_api->get(repoPath(repo), {}, this, [this, repo, nav](const QJsonObject &info, const QString &error) {
         if (repo != m_repo)
             return;
         if (!error.isEmpty())
@@ -730,14 +924,22 @@ void ForgeWindow::openRepo(const QString &repo)
                 m_ref->addItem(b);
         for (const QString &t : tags.keys())
             m_ref->addItem(t);
+        if (const QString r = std::exchange(m_pendingRef, QString()); !r.isEmpty())
+            m_ref->setCurrentText(r);
+        if (m_hasPendingTab)
+            applyPendingTab();
         if (branches.isEmpty()) {
             m_filesStack->setCurrentIndex(0);
             m_crumbs->setText("<i>Nothing has been pushed yet.</i>");
+            m_pendingPath.clear();
+            updateHash(nav);
             return status("Empty repository");
         }
         const QString path = m_pendingPath;
         m_pendingPath.clear();
-        browse(path);
+        if (m_tabs->currentIndex() != 0)
+            updateHash(nav);  // the tab's URL; browse below only rewrites it
+        browse(path, m_tabs->currentIndex() == 0 ? nav : Nav::Replace);
         loadLog();
     });
 }
@@ -759,14 +961,14 @@ void ForgeWindow::setBreadcrumb(const QString &path, bool isFile)
     m_crumbs->setText(html);
 }
 
-void ForgeWindow::browse(const QString &path)
+void ForgeWindow::browse(const QString &path, Nav nav)
 {
     const QString repo = m_repo;
     QUrlQuery q;
     q.addQueryItem("ref", ref());
     q.addQueryItem("path", path);
     status("Loading…");
-    m_api->get(repoPath(repo) + "/tree", q, this, [this, repo](const QJsonObject &body, const QString &error) {
+    m_api->get(repoPath(repo) + "/tree", q, this, [this, repo, nav](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
         if (!error.isEmpty())
@@ -778,7 +980,7 @@ void ForgeWindow::browse(const QString &path)
         m_viewer->setMarkedLines(0, 0, false);  // line marks belong to the file they were made in
         if (!isFile)
             m_pendingLines.clear();
-        updateHash();
+        updateHash(nav);
         status(QStringLiteral("%1 @ %2").arg(ref(), body.value("commit").toString().left(12)));
         if (isFile)
             return showFile(body);
@@ -1030,12 +1232,12 @@ void ForgeWindow::openPlace(const QString &path, int line, int col, int endCol, 
             m_viewer->revealSpan(line, toUtf16(text, col), toUtf16(text, endCol));
         else
             m_viewer->setMarkedLines(line, line, true);
-        updateHash();
+        updateHash(remember ? Nav::Push : Nav::Replace);
         return;
     }
     m_pendingLines = QStringLiteral("L%1").arg(line);
     m_pendingSpan = endCol > col ? QJsonObject{{"line", line}, {"col", col}, {"end_col", endCol}} : QJsonObject();
-    browse(path);
+    browse(path, remember ? Nav::Push : Nav::Replace);
 }
 
 void ForgeWindow::goBack()
@@ -1064,6 +1266,7 @@ void ForgeWindow::loadLog()
     m_api->get(repoPath(repo) + "/commits", q, this, [this, repo](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
+        const QSignalBlocker block(m_commits);
         m_commits->clear();
         if (!error.isEmpty()) {
             qWarning("forge: loading commits for %s failed: %s", qPrintable(repo), qPrintable(error));
@@ -1090,19 +1293,49 @@ void ForgeWindow::loadLog()
             it->setFont(3, QFontDatabase::systemFont(QFontDatabase::FixedFont));
             it->setData(0, ShaRole, c.value("sha").toString());
         }
+        selectPendingCommit();
         setTabBadge(1, QString::number(commits.size()));
     });
 }
 
-void ForgeWindow::updateHash()
+QString ForgeWindow::currentHash() const
 {
-    QString hash = m_repo + (m_path.isEmpty() ? "" : "/" + m_path);
-    if (m_filesStack->currentIndex() == 1 && m_viewer->markedFirst() > 0) {
+    if (m_main->currentIndex() == 3)
+        return "settings";
+    if (m_repo.isEmpty() || m_main->currentIndex() != 1)
+        return {};
+    const int tab = m_tabs->currentIndex();
+    QString hash = m_repo;
+    QString item;
+    if (tab == 0)
+        hash += m_path.isEmpty() ? "" : "/" + m_path;
+    else
+        hash += "/-/" + TabNames.value(tab);
+    if (tab == 1) {
+        const auto sel = m_commits->selectedItems();
+        item = !sel.isEmpty() ? sel.first()->data(0, ShaRole).toString().left(12) : m_pendingCommit;
+    } else if (tab == 2) {
+        item = m_releases->pickedTag();
+    } else if (tab == 4) {
+        item = m_runShown;
+    }
+    if (!item.isEmpty())
+        hash += "/" + item;
+    if ((tab == 0 || tab == 1) && !m_info.isEmpty() && ref() != defaultRef())
+        hash += "?ref=" + ref();
+    if (tab == 0 && m_filesStack->currentIndex() == 1 && m_viewer->markedFirst() > 0) {
         hash += QStringLiteral("#L%1").arg(m_viewer->markedFirst());
         if (m_viewer->markedLast() > m_viewer->markedFirst())
             hash += QStringLiteral("-L%1").arg(m_viewer->markedLast());
     }
-    m_api->setLocationHash(hash);
+    return hash;
+}
+
+void ForgeWindow::updateHash(Nav nav)
+{
+    if (m_main->currentIndex() == 2)
+        return;  // the error page keeps the link that failed, so Try again and sign-in can retry it
+    m_api->setLocationHash(currentHash(), nav == Nav::Push);
 }
 
 QWidget *ForgeWindow::buildSettings()
@@ -1242,8 +1475,8 @@ void ForgeWindow::saveSettings()
         if (!error.isEmpty())
             return status("Could not save settings: " + error, true);
         const QString now = info.value("repo").toString();
-        m_pendingPath = m_path;
-        m_api->setLocationHash(now + (m_path.isEmpty() ? "" : "/" + m_path));
+        m_pendingPath.clear();
+        m_api->setLocationHash(now + "/-/settings");
         m_repo.clear();  // reopen (as the new name, if renamed) once the list reloads
         loadRepos();
         status("Settings saved.");
@@ -1263,7 +1496,7 @@ void ForgeWindow::deleteRepo()
             return status("Could not delete " + repo + ": " + error, true);
         }
         m_repo.clear();
-        m_api->setLocationHash(QString());
+        m_api->setLocationHash(QString(), true);
         m_main->setCurrentIndex(0);
         m_tabs->setCurrentIndex(0);
         loadRepos();
@@ -1271,15 +1504,16 @@ void ForgeWindow::deleteRepo()
     });
 }
 
-void ForgeWindow::showUserSettings()
+void ForgeWindow::showUserSettings(Nav nav)
 {
     m_repo.clear();
     m_pendingPath.clear();
+    m_hasPendingTab = false;
     {
         const QSignalBlocker block(m_repos);
         m_repos->setCurrentRow(-1);  // so clicking any repo (even the one that was open) opens it again
     }
-    m_api->setLocationHash("settings");
+    m_api->setLocationHash("settings", nav == Nav::Push);
     m_main->setCurrentIndex(3);
     m_userSecrets->load();
     status("Your settings");
@@ -1342,8 +1576,10 @@ QWidget *ForgeWindow::buildDeploys()
     connect(refresh, &QPushButton::clicked, this, &ForgeWindow::loadRuns);
     connect(m_runs, &QTreeWidget::itemSelectionChanged, this, [this] {
         const auto sel = m_runs->selectedItems();
-        if (!sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty())
+        if (!sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty()) {
             showRun(sel.first()->data(0, PathRole).toString());
+            updateHash(Nav::Push);  // #<repo>/-/deploys/<run>
+        }
     });
     // While a run is queued or going, poll so its status and output appear without clicking Refresh.
     m_runsTimer = new QTimer(this);
@@ -1461,6 +1697,7 @@ void ForgeWindow::startRun()
         status(QStringLiteral("Started %1 job(s) for %2.").arg(runs.size()).arg(branch));
         if (!runs.isEmpty())
             m_runShown = runs.first().toObject().value("id").toString();
+        updateHash(Nav::Replace);
         loadRuns();
     });
 }
@@ -1487,7 +1724,7 @@ void ForgeWindow::createRepo()
         m_newName->clear();
         const QString repo = info.value("repo").toString();
         m_pendingPath.clear();
-        m_api->setLocationHash(repo);
+        m_api->setLocationHash(repo, true);
         m_repo.clear();
         loadRepos();  // selects it from the hash
         status("Created " + repo + ". Push to " + info.value("clone_url").toString());

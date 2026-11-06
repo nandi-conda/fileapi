@@ -2,7 +2,9 @@
 #include "api.h"
 #include "appstyle.h"
 
+#include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QFileDialog>
@@ -113,6 +115,11 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_download->setIcon(style()->standardIcon(QStyle::SP_ArrowDown));
     m_download->setEnabled(false);
     m_assetButtons->addWidget(m_download);
+    m_copyAsset = new QPushButton("Copy file link");
+    m_copyAsset->setIcon(style()->standardIcon(QStyle::SP_FileLinkIcon));
+    m_copyAsset->setToolTip("Copy this file's download URL");
+    m_copyAsset->setEnabled(false);
+    m_assetButtons->addWidget(m_copyAsset);
     m_upload = new QPushButton("Upload file…");
     m_upload->setIcon(style()->standardIcon(QStyle::SP_ArrowUp));
     m_assetButtons->addWidget(m_upload);
@@ -123,6 +130,10 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_assetButtons->addStretch(1);
     vl->addLayout(m_assetButtons);
     m_releaseButtons = new QBoxLayout(QBoxLayout::LeftToRight);
+    m_copyRelease = new QPushButton("Copy release link");
+    m_copyRelease->setIcon(style()->standardIcon(QStyle::SP_FileLinkIcon));
+    m_copyRelease->setToolTip("Copy a link to this release's page");
+    m_releaseButtons->addWidget(m_copyRelease);
     m_edit = new QPushButton("Edit");
     m_edit->setIcon(style()->standardIcon(QStyle::SP_FileDialogContentsView));
     m_releaseButtons->addWidget(m_edit);
@@ -192,15 +203,28 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
         for (const auto &v : m_releases)
             if (v.toObject().value("tag").toString() == tag)
                 showRelease(v.toObject());
+        m_picked = tag;
+        emit tagPicked(tag);
     });
     connect(m_assets, &QTreeWidget::itemSelectionChanged, this, [this] {
         const bool any = !m_assets->selectedItems().isEmpty()
                          && !m_assets->selectedItems().first()->data(0, TagRole).toString().isEmpty();
         m_download->setEnabled(any);
+        m_copyAsset->setEnabled(any);
         m_deleteAsset->setEnabled(any && m_canEdit);
     });
     connect(m_assets, &QTreeWidget::itemActivated, this, [this] { downloadAsset(); });
     connect(m_download, &QPushButton::clicked, this, &ReleasesPanel::downloadAsset);
+    connect(m_copyAsset, &QPushButton::clicked, this, [this] {
+        const auto sel = m_assets->selectedItems();
+        const QString url = sel.isEmpty() ? QString() : sel.first()->data(0, TagRole + 1).toString();
+        if (url.isEmpty())
+            return emit statusText("That file is still uploading.", false);
+        copyText(url, url.contains("?dl=") ? "download link (private repo: it works for an hour)" : "download link");
+    });
+    connect(m_copyRelease, &QPushButton::clicked, this, [this] {
+        copyText(m_api->baseUrl() + "/forge/#" + m_repo + "/-/releases/" + m_shownTag, "link to " + m_shownTag);
+    });
     connect(m_upload, &QPushButton::clicked, this, &ReleasesPanel::upload);
     connect(m_deleteAsset, &QPushButton::clicked, this, &ReleasesPanel::deleteAsset);
     connect(m_edit, &QPushButton::clicked, this, [this] { openEditor(current()); });
@@ -236,12 +260,21 @@ void ReleasesPanel::setRepo(const QString &repo)
     m_loaded = false;
     m_releases = {};
     m_shownTag.clear();
+    m_picked.clear();
     m_list->clear();
     m_assets->clear();
     m_right->setCurrentIndex(0);
     m_right->setVisible(false);
     m_new->setVisible(false);
     m_note->setText(QString());
+}
+
+void ReleasesPanel::selectTag(const QString &tag)
+{
+    m_picked = tag;
+    m_shownTag = tag;
+    if (m_loaded && m_right->currentIndex() == 0)
+        fillList(tag);
 }
 
 QJsonObject ReleasesPanel::current() const
@@ -366,11 +399,13 @@ void ReleasesPanel::showRelease(const QJsonObject &rel)
         it->setIcon(0, style()->standardIcon(QStyle::SP_FileIcon));
         it->setText(1, humanSize(a.value("size").toInteger()));
         it->setText(2, QString::number(a.value("downloads").toInteger()));
-        it->setToolTip(0, "sha256 " + a.value("sha256").toString());
+        it->setToolTip(0, (ready ? a.value("download_url").toString().section('?', 0, 0) + "\n" : QString())
+                              + "sha256 " + a.value("sha256").toString());
         it->setData(0, TagRole, a.value("name").toString());
         it->setData(0, TagRole + 1, ready ? a.value("download_url").toString() : QString());
     }
     m_download->setEnabled(false);
+    m_copyAsset->setEnabled(false);
     m_deleteAsset->setEnabled(false);
     for (QPushButton *b : {m_upload, m_edit, m_deleteRelease})
         b->setVisible(m_canEdit);
@@ -467,6 +502,12 @@ void ReleasesPanel::sendPiece(const QString &tag, const QString &name, const QBy
         if (repo == m_repo)
             load();
     });
+}
+
+void ReleasesPanel::copyText(const QString &text, const QString &what)
+{
+    QApplication::clipboard()->setText(text);
+    emit statusText("Copied " + what + ": " + text, false);
 }
 
 void ReleasesPanel::downloadAsset()

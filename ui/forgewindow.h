@@ -32,6 +32,9 @@ class ForgeWindow : public QMainWindow {
 public:
     explicit ForgeWindow(QWidget *parent = nullptr);
 
+    // The page URL changed under us (browser back/forward, or a link typed in): show what it names.
+    void routeChanged();
+
 protected:
     void changeEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
@@ -41,13 +44,24 @@ private:
     // that stack instead of sitting side by side, and fewer table columns.
     void setCompact(bool compact);
     void updatePanes();
-    void closeRepo();
+    // How a view change updates the page URL: a new history entry (the user went somewhere, so Back
+    // returns), or rewriting the current one (restoring from the URL, or a detail like a selected line).
+    enum class Nav { Push, Replace };
+    void closeRepo(Nav nav = Nav::Push);
     void setTabBadge(int tab, const QString &badge);
     void syncHighlightTheme();
     void loadMe();
     void loadRepos();
-    void openRepo(const QString &repo);
-    void browse(const QString &path);
+    void openRepo(const QString &repo, Nav nav = Nav::Push);
+    void browse(const QString &path, Nav nav = Nav::Push);
+    // URL routing. The hash is #<owner>/<repo>[/<path>][?ref=<ref>][#L12[-L20]] for the Files tab,
+    // #<owner>/<repo>/-/<tab>[/<item>][?ref=<ref>] for the others (commits/<sha>, releases/<tag>,
+    // settings, deploys/<run>), and #settings for the user settings page.
+    void applyRoute(QString hash);
+    void applyPendingTab();
+    QString currentHash() const;
+    QString defaultRef() const;
+    void selectPendingCommit();
     void loadLog();
     void showFile(const QJsonObject &file);
     QWidget *buildSettings();
@@ -56,7 +70,7 @@ private:
     void deleteRepo();
     // Deploy job runs (the Deploys tab). Secrets are SecretsPanels: the repo's in its Settings tab, the
     // user's (every repo they own gets those) on the user settings page.
-    void showUserSettings();
+    void showUserSettings(Nav nav = Nav::Push);
     QWidget *buildDeploys();
     void loadRuns();
     void showRun(const QString &id);
@@ -64,7 +78,7 @@ private:
     void createRepo();
     QString shortName(const QString &repo) const;
     void setBreadcrumb(const QString &path, bool isFile);
-    void updateHash();
+    void updateHash(Nav nav = Nav::Replace);
     void status(const QString &text, bool error = false);
     void showRepoError(const QString &repo, int httpStatus, const QString &error);
     QString ref() const;
@@ -83,6 +97,13 @@ private:
     QString m_path;       // current path inside the repo
     QString m_pendingPath;
     QString m_pendingLines;  // "L12" or "L12-L20" from the page URL, applied once that file opens
+    QString m_pendingRef;    // ref from the page URL, applied once the repo opens
+    bool m_hasPendingTab = false;  // the page URL names a tab, switched to once the repo (and who's signed in) is known
+    int m_pendingTab = 0;
+    QString m_pendingItem;   // that tab's commit sha / release tag / run id
+    QString m_pendingCommit; // commit to select once the Commits list loads
+    bool m_routing = false;  // switching tabs to match the URL: don't add history entries
+    bool m_meKnown = false;  // /me has answered (Settings and Deploys tabs exist only when signed in)
     bool m_signedIn = false;
     QJsonObject m_info;   // last /repos/<p>/<r> response
     struct Place { QString path; int line; };

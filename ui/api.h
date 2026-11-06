@@ -34,9 +34,11 @@ public:
     void signIn();
     void signOut();
 
-    // The #<project>/<repo> part of the page URL, so links to a repo can be shared.
+    // The #<owner>/<repo>... part of the page URL, so links to a repo and its tabs can be shared.
     QString locationHash() const;
-    void setLocationHash(const QString &hash);
+    // push = a new browser history entry (Back returns to the old one), else the current one is rewritten.
+    // Does nothing when the URL already says this.
+    void setLocationHash(const QString &hash, bool push = false);
 
 private:
     QNetworkRequest request(const QString &path, const QUrlQuery &query = {}) const;

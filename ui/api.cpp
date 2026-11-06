@@ -113,12 +113,19 @@ QString Api::locationHash() const
 #endif
 }
 
-void Api::setLocationHash(const QString &hash)
+void Api::setLocationHash(const QString &hash, bool push)
 {
 #ifdef Q_OS_WASM
-    val history = val::global("history");
-    history.call<void>("replaceState", val::null(), std::string(""), std::string(("#" + hash).toStdString()));
+    if (hash == locationHash())
+        return;
+    val location = val::global("location");
+    // No hash at all for the repo list, rather than a bare "#".
+    const std::string url = hash.isEmpty()
+        ? location["pathname"].as<std::string>() + location["search"].as<std::string>()
+        : ("#" + hash).toStdString();
+    val::global("history").call<void>(push ? "pushState" : "replaceState", val::null(), std::string(""), url);
 #else
     Q_UNUSED(hash);
+    Q_UNUSED(push);
 #endif
 }
