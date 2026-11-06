@@ -28,6 +28,8 @@ public:
     // F12 / Shift+F12 at the text cursor.
     std::function<void(int line, int col, bool references)> onNavKey;
     void setNavEnabled(bool on);
+    // Off on touch screens: there is no hovering, and a tap already opens the definitions panel.
+    void setHoverEnabled(bool on) { m_hover = on; }
     // Underlines the symbol's occurrences in this file: {line, col, endCol} triples.
     struct Span { int line, col, endCol; };
     void setSymbolMarks(const QList<Span> &spans);
@@ -57,6 +59,7 @@ private:
     int m_last = 0;
     int m_anchor = 0;  // line a shift-click extends from
     bool m_nav = false;
+    bool m_hover = true;
     QPoint m_pressPos;
     bool m_pressed = false;
     QList<Span> m_symbols;

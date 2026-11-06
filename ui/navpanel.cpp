@@ -1,4 +1,5 @@
 #include "navpanel.h"
+#include "appstyle.h"
 
 #include <QFontDatabase>
 #include <QHBoxLayout>
@@ -99,6 +100,13 @@ void NavPanel::setResult(const QJsonObject &r)
         sub += "<br><i>Not defined in this repository (a builtin or a library?).</i>";
     else if (defs.size() > 1)
         sub += "<br><i>Matched by name: pick the right one.</i>";
+    // The doc is a hover tooltip on the rows; a touch screen has no hover, so show its gist here.
+    if (isTouchUi() && !defs.isEmpty()) {
+        const QJsonObject d = defs.first().toObject();
+        const QString doc = d.value("doc").toString().section('\n', 0, 0).trimmed();  // its first line
+        if (!doc.isEmpty())
+            sub += "<br><i>" + (doc.left(120) + (doc.size() > 120 ? "…" : "")).toHtmlEscaped() + "</i>";
+    }
     m_sub->setText(sub);
 
     const QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);

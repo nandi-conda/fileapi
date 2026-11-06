@@ -115,7 +115,7 @@ void CodeView::mouseReleaseEvent(QMouseEvent *event)
 void CodeView::mouseMoveEvent(QMouseEvent *event)
 {
     QPlainTextEdit::mouseMoveEvent(event);
-    if (!m_nav || (event->buttons() & Qt::LeftButton))
+    if (!m_nav || !m_hover || (event->buttons() & Qt::LeftButton))
         return;
     const QPoint pos = event->position().toPoint();
     int line, col;

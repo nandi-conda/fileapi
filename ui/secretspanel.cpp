@@ -1,4 +1,5 @@
 #include "secretspanel.h"
+#include "appstyle.h"
 #include "api.h"
 
 #include <QBrush>
@@ -42,8 +43,10 @@ SecretsPanel::SecretsPanel(Api *api, const QString &title, const QString &note, 
     m_list->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_list->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_list->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    touchScroll(m_list);
     sl->addWidget(m_list);
-    auto *addRow = new QHBoxLayout;
+    m_addRow = new QBoxLayout(QBoxLayout::LeftToRight);
+    auto *addRow = m_addRow;
     m_name = new QLineEdit;
     m_name->setPlaceholderText("NAME, e.g. FLY_API_TOKEN");
     addRow->addWidget(m_name, 1);
@@ -53,12 +56,14 @@ SecretsPanel::SecretsPanel(Api *api, const QString &title, const QString &note, 
     addRow->addWidget(m_value, 2);
     m_save = new QPushButton("Save secret");
     m_save->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
-    addRow->addWidget(m_save);
+    auto *buttons = new QHBoxLayout;
+    buttons->addWidget(m_save, 1);
     m_delete = new QPushButton("Delete");
     m_delete->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
     m_delete->setEnabled(false);
     m_delete->setToolTip("Delete the selected secret");
-    addRow->addWidget(m_delete);
+    buttons->addWidget(m_delete, 1);
+    addRow->addLayout(buttons);
     sl->addLayout(addRow);
 
     connect(m_save, &QPushButton::clicked, this, &SecretsPanel::save);
@@ -71,6 +76,11 @@ SecretsPanel::SecretsPanel(Api *api, const QString &title, const QString &note, 
         if (!sel.isEmpty() && !sel.first()->data(0, Qt::UserRole + 1).toString().isEmpty())
             m_name->setText(sel.first()->data(0, Qt::UserRole + 1).toString());  // to replace (or override) it
     });
+}
+
+void SecretsPanel::setCompact(bool compact)
+{
+    m_addRow->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
 }
 
 void SecretsPanel::setPath(const QString &path)

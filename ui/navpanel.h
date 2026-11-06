@@ -25,6 +25,7 @@ public:
     std::function<void()> onClose;
     std::function<void()> onBack;
     void setBackEnabled(bool on);
+    QTreeWidget *view() const { return m_tree; }
 
 private:
     QLabel *m_title;
