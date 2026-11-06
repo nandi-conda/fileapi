@@ -491,17 +491,24 @@ void CodeHighlighter::highlightBlock(const QString &text)
 {
     if (m_rules.isEmpty() && m_spans.isEmpty())
         return;
+    setCurrentBlockState(highlightLine(text, std::max(0, previousBlockState()),
+                                       [this](int start, int length, const QTextCharFormat &f) { setFormat(start, length, f); }));
+}
+
+int CodeHighlighter::highlightLine(const QString &text, int prevState, const FormatFn &setFormat) const
+{
+    if (m_rules.isEmpty() && m_spans.isEmpty())
+        return 0;
     const int len = int(text.size());
     int pos = 0;
 
     // Continue a construct left open by the previous line.
-    if (const int prev = previousBlockState(); prev > 0 && prev <= m_spans.size()) {
+    if (const int prev = prevState; prev > 0 && prev <= m_spans.size()) {
         const Span &s = m_spans[prev - 1];
         const auto end = s.end.match(text);
         if (!end.hasMatch()) {
             setFormat(0, len, m_formats[s.kind]);
-            setCurrentBlockState(prev);
-            return;
+            return prev;
         }
         setFormat(0, int(end.capturedEnd()), m_formats[s.kind]);
         pos = int(end.capturedEnd());
@@ -543,8 +550,7 @@ void CodeHighlighter::highlightBlock(const QString &text)
             const auto end = s.end.match(text, bodyFrom);
             if (!end.hasMatch()) {
                 setFormat(best, len - best, m_formats[s.kind]);
-                setCurrentBlockState(bestSpan + 1);
-                return;
+                return bestSpan + 1;
             }
             setFormat(best, int(end.capturedEnd()) - best, m_formats[s.kind]);
             pos = std::max(int(end.capturedEnd()), best + 1);
@@ -558,5 +564,5 @@ void CodeHighlighter::highlightBlock(const QString &text)
             break;
         }
     }
-    setCurrentBlockState(0);
+    return 0;
 }

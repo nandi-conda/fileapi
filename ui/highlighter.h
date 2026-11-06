@@ -5,6 +5,8 @@
 #include <QTextCharFormat>
 #include <QVector>
 
+#include <functional>
+
 // Small rule-based syntax highlighter for the file viewer. The language comes from the file name
 // (extension or well-known names like Makefile); colours follow the viewer's palette, so it works in
 // dark and light mode. Deliberately tiny: no external syntax definitions, so the wasm stays small.
@@ -16,6 +18,12 @@ public:
     QString setFileName(const QString &fileName);
     // Re-picks the colours (call when the palette changes between dark and light).
     void setDark(bool dark);
+
+    // Highlights one line that isn't in this highlighter's own document (the diff view keeps one
+    // highlighter per language and feeds it each file's lines). `prevState` is what the previous line
+    // returned (0 at the start); formats go to `apply`. Returns this line's state.
+    using FormatFn = std::function<void(int start, int length, const QTextCharFormat &format)>;
+    int highlightLine(const QString &text, int prevState, const FormatFn &apply) const;
 
 protected:
     void highlightBlock(const QString &text) override;
