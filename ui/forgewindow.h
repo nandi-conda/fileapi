@@ -10,6 +10,8 @@ class CodeHighlighter;
 class CodeView;
 class NavPanel;
 class SecretsPanel;
+class QBoxLayout;
+class QFormLayout;
 class QSplitter;
 class QCheckBox;
 class QComboBox;
@@ -31,8 +33,15 @@ public:
 
 protected:
     void changeEvent(QEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
+    // Phone-width layout: one pane at a time (repo list, or the open repo with a back button), rows
+    // that stack instead of sitting side by side, and fewer table columns.
+    void setCompact(bool compact);
+    void updatePanes();
+    void closeRepo();
+    void setTabBadge(int tab, const QString &badge);
     void syncHighlightTheme();
     void loadMe();
     void loadRepos();
@@ -131,4 +140,23 @@ private:
     QPushButton *m_errSignIn;
     QPushButton *m_errRetry;
     QLabel *m_status;
+
+    bool m_compact = false;
+    QSplitter *m_split;
+    QWidget *m_left;
+    QAction *m_whoAction;
+    QAction *m_backAction;
+    QBoxLayout *m_headRow;
+    QBoxLayout *m_crumbRow;
+    QBoxLayout *m_errButtons;
+    QFormLayout *m_settingsForm;
+    QLabel *m_branchLabel;
+    QWidget *m_cloneRow;
+    QLabel *m_runBranchLabel;
+    QPushButton *m_runRefresh;
+    class QHBoxLayout *m_titleRow;
+    class QHBoxLayout *m_branchRow;
+    QBoxLayout *m_repoLayout;
+    QString m_commitsBadge;  // tab labels' extras: "40" / "error", and "running"
+    QString m_deploysBadge;
 };

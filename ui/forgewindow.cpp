@@ -1,10 +1,13 @@
 #include "forgewindow.h"
 #include "api.h"
+#include "appstyle.h"
 #include "codeview.h"
 #include "highlighter.h"
 #include "navpanel.h"
 #include "secretspanel.h"
 
+#include <QAbstractItemView>
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
@@ -20,8 +23,11 @@
 #include <QListWidget>
 #include <QLocale>
 #include <QPlainTextEdit>
-#include <QProxyStyle>
 #include <QRegularExpression>
+#include <QResizeEvent>
+#include <QScrollArea>
+#include <QScreen>
+#include <QScroller>
 #include <QScrollBar>
 #include <QUrl>
 #include <QPushButton>
@@ -33,7 +39,6 @@
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QStyle>
-#include <QStyleFactory>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTimer>
@@ -83,17 +88,9 @@ int toCodePoints(const QString &text, int utf16)
     return n;
 }
 
-// Opens items on a single click, like links on the web (Enter still works too).
-class SingleClickStyle : public QProxyStyle {
-public:
-    using QProxyStyle::QProxyStyle;
-    int styleHint(StyleHint hint, const QStyleOption *opt, const QWidget *w, QStyleHintReturn *ret) const override
-    {
-        if (hint == SH_ItemView_ActivateItemOnSingleClick)
-            return 1;
-        return QProxyStyle::styleHint(hint, opt, w, ret);
-    }
-};
+// Below this width (in CSS px) the window switches to the phone layout.
+constexpr int CompactWidth = 720;
+
 }  // namespace
 
 ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(this))
@@ -103,6 +100,11 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     // ---- top bar
     auto *bar = addToolBar("Account");
     bar->setMovable(false);
+    // Phone layout only: back from an open repo to the list of repos.
+    m_backAction = bar->addAction(style()->standardIcon(QStyle::SP_ArrowBack), "Repositories");
+    m_backAction->setToolTip("Back to repositories");
+    m_backAction->setVisible(false);
+    connect(m_backAction, &QAction::triggered, this, [this] { closeRepo(); });
     auto *brand = new QLabel("<b>fileapi</b> forge");
     brand->setContentsMargins(8, 0, 16, 0);
     bar->addWidget(brand);
@@ -111,7 +113,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     bar->addWidget(spacer);
     m_who = new QLabel;
     m_who->setContentsMargins(0, 0, 8, 0);
-    bar->addWidget(m_who);
+    m_whoAction = bar->addWidget(m_who);
     m_userSettingsBtn = new QPushButton("Settings");
     m_userSettingsBtn->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
     m_userSettingsBtn->setToolTip("Your settings: secrets for all your repos");
@@ -125,12 +127,15 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     });
 
     // ---- repo list
-    auto *split = new QSplitter;
-    auto *left = new QWidget;
+    m_split = new QSplitter;
+    auto *split = m_split;
+    m_left = new QWidget;
+    auto *left = m_left;
     auto *leftLay = new QVBoxLayout(left);
     leftLay->setContentsMargins(8, 8, 0, 8);
     leftLay->addWidget(new QLabel("<b>Repositories</b>"));
     m_repos = new QListWidget;
+    touchScroll(m_repos);
     leftLay->addWidget(m_repos);
     // New repo: only a name is needed; it is created under the signed-in handle.
     m_newRow = new QWidget;
@@ -160,6 +165,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
 
     auto *repoView = new QWidget;
     auto *lay = new QVBoxLayout(repoView);
+    m_repoLayout = lay;
     lay->setContentsMargins(8, 8, 8, 8);
     m_title = new QLabel;
     QFont tf = m_title->font();
@@ -171,25 +177,38 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     // always takes exactly one line (cut off when long, full text in the tooltip), even when empty.
     m_title->setFixedHeight(QFontMetrics(tf).lineSpacing() + 4);
     m_title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-    lay->addWidget(m_title);
+    m_titleRow = new QHBoxLayout;
+    m_titleRow->addWidget(m_title, 1);
+    lay->addLayout(m_titleRow);
     m_desc = new QLabel;
     m_desc->setWordWrap(false);
     m_desc->setFixedHeight(m_desc->fontMetrics().lineSpacing() + 2);
     m_desc->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     lay->addWidget(m_desc);
 
-    auto *row = new QHBoxLayout;
-    row->addWidget(new QLabel("Branch:"));
+    // Branch and clone URL side by side; stacked in the phone layout.
+    m_headRow = new QBoxLayout(QBoxLayout::LeftToRight);
+    m_branchRow = new QHBoxLayout;
+    auto *branchRow = m_branchRow;
+    m_branchLabel = new QLabel("Branch:");
+    branchRow->addWidget(m_branchLabel);
     m_ref = new QComboBox;
     m_ref->setMinimumWidth(160);
     m_ref->setEditable(true);  // also accepts a commit sha or tag typed in
-    row->addWidget(m_ref);
-    row->addSpacing(16);
-    row->addWidget(new QLabel("Clone:"));
+    branchRow->addWidget(m_ref, 1);
+    m_headRow->addLayout(branchRow);
+    m_headRow->addSpacing(16);
+    m_cloneRow = new QWidget;
+    auto *cloneRow = new QHBoxLayout(m_cloneRow);
+    cloneRow->setContentsMargins(0, 0, 0, 0);
+    auto *cloneLabel = new QLabel("Clone:");
+    cloneLabel->setMinimumWidth(m_branchLabel->sizeHint().width());
+    cloneRow->addWidget(cloneLabel);
     m_clone = new QLineEdit;
     m_clone->setReadOnly(true);
-    row->addWidget(m_clone, 1);
-    lay->addLayout(row);
+    cloneRow->addWidget(m_clone, 1);
+    m_headRow->addWidget(m_cloneRow, 1);
+    lay->addLayout(m_headRow);
     connect(m_ref, &QComboBox::textActivated, this, [this] {
         closeNav();
         browse(QString());
@@ -209,7 +228,8 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_crumbs->setFixedHeight(m_crumbs->fontMetrics().lineSpacing() + 6);
     m_crumbs->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     connect(m_crumbs, &QLabel::linkActivated, this, [this](const QString &link) { browse(link.mid(1)); });
-    auto *crumbRow = new QHBoxLayout;
+    m_crumbRow = new QBoxLayout(QBoxLayout::LeftToRight);
+    auto *crumbRow = m_crumbRow;
     crumbRow->addWidget(m_crumbs, 1);
     // The open file's outline: jump to any class/function in it.
     m_outline = new QComboBox;
@@ -231,11 +251,8 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_entries->setHeaderLabels({"Name", "Size"});
     m_entries->setRootIsDecorated(false);
     m_entries->setUniformRowHeights(true);
-    {
-        auto *single = new SingleClickStyle(QStyleFactory::create("Fusion"));
-        single->setParent(m_entries);
-        m_entries->setStyle(single);
-    }
+    m_entries->setProperty("singleClick", true);  // opens on a single click, like links on the web
+    touchScroll(m_entries);
     m_entries->setCursor(Qt::PointingHandCursor);
     m_entries->header()->setStretchLastSection(false);
     m_entries->header()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -250,6 +267,13 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_highlighter = new CodeHighlighter(m_viewer->document());
+    if (isTouchUi()) {
+        // A finger drag scrolls the code instead of selecting it, and there's no hover to wait for.
+        m_viewer->setTextInteractionFlags(Qt::TextSelectableByKeyboard);
+        m_viewer->setHoverEnabled(false);
+        m_viewer->setCursorWidth(0);  // no caret: there's nothing to type
+        touchScroll(m_viewer);
+    }
     m_viewer->onWordClicked = [this](int line, int col, bool jump) { lookupSymbol(line, col, jump); };
     m_viewer->onWordHover = [this](int line, int col, const QPoint &at) { hoverSymbol(line, col, at); };
     m_viewer->onNavKey = [this](int line, int col, bool refs) { lookupSymbol(line, col, !refs); };
@@ -257,6 +281,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_fileSplit->addWidget(m_viewer);
     m_navPanel = new NavPanel;
     m_navPanel->setVisible(false);
+    touchScroll(m_navPanel->view());
     m_navPanel->onOpen = [this](const QString &path, int line, int col, int end) { openPlace(path, line, col, end); };
     m_navPanel->onClose = [this] { closeNav(); };
     m_navPanel->onBack = [this] { goBack(); };
@@ -282,6 +307,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     for (int i = 1; i < 4; ++i)
         m_commits->header()->setSectionResizeMode(i, QHeaderView::ResizeToContents);
     m_commits->setToolTip("Double-click a commit to browse the files as they were then.");
+    touchScroll(m_commits);
     connect(m_commits, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *it) {
         m_ref->setCurrentText(it->data(0, ShaRole).toString().left(12));
         m_tabs->setCurrentIndex(0);
@@ -291,11 +317,17 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_tabs->addTab(m_commits, "Commits");
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int i) {
         if (i == 1 && !m_repo.isEmpty() && m_ref->count() > 0
-            && (m_commits->topLevelItemCount() == 0 || m_tabs->tabText(1).endsWith("(error)")))
+            && (m_commits->topLevelItemCount() == 0 || m_commitsBadge == "error"))
             loadLog();
     });
     m_settings = buildSettings();
-    m_tabs->addTab(m_settings, "Settings");
+    // Scrolls when the screen is shorter than the page (phones, or with the on-screen keyboard up).
+    auto *settingsScroll = new QScrollArea;
+    settingsScroll->setWidget(m_settings);
+    settingsScroll->setWidgetResizable(true);
+    settingsScroll->setFrameShape(QFrame::NoFrame);
+    touchScroll(settingsScroll);
+    m_tabs->addTab(settingsScroll, "Settings");
     m_tabs->setTabVisible(2, false);  // only the signed-in admin can change settings
     m_deploys = buildDeploys();
     m_tabs->addTab(m_deploys, "Deploys");
@@ -328,7 +360,8 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_errText->setTextInteractionFlags(Qt::TextSelectableByMouse);
     el->addWidget(m_errText);
     el->addSpacing(12);
-    auto *eb = new QHBoxLayout;
+    m_errButtons = new QBoxLayout(QBoxLayout::LeftToRight);
+    auto *eb = m_errButtons;
     eb->addStretch(1);
     m_errSignIn = new QPushButton("Sign in");
     eb->addWidget(m_errSignIn);
@@ -347,15 +380,7 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
         m_repo.clear();
         openRepo(repo);
     });
-    connect(errBack, &QPushButton::clicked, this, [this] {
-        m_repo.clear();
-        m_pendingPath.clear();
-        m_api->setLocationHash(QString());
-        const QSignalBlocker block(m_repos);
-        m_repos->setCurrentRow(-1);
-        m_main->setCurrentIndex(0);
-        status(QStringLiteral("%1 repositories").arg(m_repos->count()));
-    });
+    connect(errBack, &QPushButton::clicked, this, [this] { closeRepo(); });
     m_main->addWidget(errPage);
 
     // ---- user settings (page 3): things that apply to every repo the signed-in account owns
@@ -384,10 +409,135 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     setCentralWidget(split);
 
     m_status = new QLabel;
+    m_status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);  // long messages never widen the window
     statusBar()->addWidget(m_status, 1);
+    statusBar()->setSizeGripEnabled(false);
+    connect(m_main, &QStackedWidget::currentChanged, this, [this] { updatePanes(); });
+    if (isTouchUi())
+        m_commits->setToolTip(QString());
 
+    if (screen())
+        setCompact(screen()->geometry().width() < CompactWidth);  // before the first paint, so it doesn't jump
     loadMe();
     loadRepos();
+}
+
+void ForgeWindow::closeRepo()
+{
+    m_repo.clear();
+    m_pendingPath.clear();
+    m_api->setLocationHash(QString());
+    const QSignalBlocker block(m_repos);
+    m_repos->setCurrentRow(-1);
+    m_main->setCurrentIndex(0);
+    status(QStringLiteral("%1 repositories").arg(m_repos->count()));
+}
+
+void ForgeWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    // The window fills the page (the browser viewport, which is the "screen"), unless the desktop layout's
+    // minimum width pushed it wider: decide by the screen, then fit the window back onto it.
+    const QRect screenRect = screen() ? screen()->geometry() : QRect(QPoint(), event->size());
+    setCompact(std::min(event->size().width(), screenRect.width()) < CompactWidth);
+    if (event->size().width() > screenRect.width())
+        QTimer::singleShot(0, this, [this] {
+            if (!screen() || width() <= screen()->geometry().width())
+                return;
+            // Let the phone layout's smaller minimum size take effect first, or the window can't shrink.
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+            if (layout())
+                layout()->activate();
+            setGeometry(screen()->geometry());
+        });
+}
+
+void ForgeWindow::updatePanes()
+{
+    // Phone layout: the repo list fills the screen until a repo opens; then the repo does, with Back.
+    const bool listOnly = m_compact && m_main->currentIndex() == 0;
+    m_left->setVisible(!m_compact || listOnly);
+    m_main->setVisible(!listOnly);
+    m_backAction->setVisible(m_compact && !listOnly);
+}
+
+void ForgeWindow::setCompact(bool compact)
+{
+    if (compact == m_compact && m_split->property("laidOut").toBool())
+        return;
+    m_split->setProperty("laidOut", true);
+    m_compact = compact;
+    m_whoAction->setVisible(!compact);
+    m_userSettingsBtn->setText(compact ? QString() : "Settings");  // its icon alone on a phone  // "Signed in as …": the Sign in/out button says enough
+    m_left->layout()->setContentsMargins(8, 8, compact ? 8 : 0, 8);
+    m_headRow->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    m_headRow->itemAt(1)->spacerItem()->changeSize(compact ? 0 : 16, compact ? 0 : 0);
+    // Phone: the branch picker moves up beside the repo name, saving a row for the code.
+    m_ref->setMinimumWidth(compact ? 0 : 160);
+    m_ref->setMaximumWidth(compact ? 150 : QWIDGETSIZE_MAX);
+    if (compact && m_titleRow->indexOf(m_ref) < 0) {
+        m_branchRow->removeWidget(m_ref);
+        m_titleRow->addWidget(m_ref);
+    } else if (!compact && m_branchRow->indexOf(m_ref) < 0) {
+        m_titleRow->removeWidget(m_ref);
+        m_branchRow->addWidget(m_ref, 1);
+    }
+    m_branchLabel->setVisible(!compact);
+    m_crumbRow->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    m_outline->setMinimumWidth(compact ? 0 : 220);
+    m_outline->setMaximumWidth(compact ? QWIDGETSIZE_MAX : 360);
+    // Code and the definitions/references panel: side by side, or the panel under the code.
+    m_fileSplit->setOrientation(compact ? Qt::Vertical : Qt::Horizontal);
+    m_commits->setColumnHidden(1, compact);  // author
+    m_commits->setColumnHidden(3, compact);  // sha
+    for (int c : {2, 3, 4, 6})              // branch, commit, started, trigger
+        m_runs->setColumnHidden(c, compact);
+    m_repoSecrets->setCompact(compact);
+    m_userSecrets->setCompact(compact);
+    m_settingsForm->setRowWrapPolicy(compact ? QFormLayout::WrapAllRows : QFormLayout::DontWrapRows);
+    m_errButtons->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    m_runsNote->setVisible(!compact);
+    m_runBranch->setMinimumWidth(compact ? 80 : 140);
+    m_runBranchLabel->setVisible(!compact);
+    m_runRefresh->setText(compact ? QString() : "Refresh");  // the icon alone on a phone
+    m_cloneRow->setVisible(!compact);
+    m_desc->setVisible(!compact || m_path.isEmpty());  // a phone has no git to paste it into; Settings and desktop still show it
+    m_repoLayout->setContentsMargins(compact ? 4 : 8, compact ? 4 : 8, compact ? 4 : 8, compact ? 4 : 8);
+    QFont tf = font();
+    tf.setPointSizeF(tf.pointSizeF() * (compact ? 1.2 : 1.5));
+    tf.setBold(true);
+    m_title->setFont(tf);
+    m_title->setFixedHeight(QFontMetrics(tf).lineSpacing() + 4);
+    m_tabs->tabBar()->setUsesScrollButtons(true);  // never wider than the screen, whatever the labels
+    setTabBadge(1, m_commitsBadge);
+    setTabBadge(3, m_deploysBadge);
+    const QFontMetrics fm = m_tabs->fontMetrics();
+    // Wide enough for "Commits (100)", so the tabs don't shift when the commit count arrives; on a phone
+    // the four tabs have to share the width instead.
+    m_tabs->tabBar()->setStyleSheet(QStringLiteral("QTabBar::tab { min-width: %1px; }")
+                                        .arg(compact ? 0 : fm.horizontalAdvance("Commits (100)") + 8));
+    m_tabs->tabBar()->setExpanding(compact);
+    // Widgets on hidden tabs don't re-measure their rows on their own, and a stale (desktop-sized) minimum
+    // would keep the window wider than a phone: recompute every layout now.
+    for (QLayout *l : findChildren<QLayout *>())
+        l->invalidate();
+    // And whatever a page off screen would like, the window never gets wider than the phone: the stacks'
+    // other pages (and anything not yet re-measured) don't get to push it.
+    m_split->setSizePolicy(compact ? QSizePolicy::Ignored : QSizePolicy::Preferred, QSizePolicy::Preferred);
+    if (compact)
+        m_split->setSizes({0, 1});
+    else
+        m_split->setSizes({260, std::max(400, width() - 260)});
+    updatePanes();
+}
+
+void ForgeWindow::setTabBadge(int tab, const QString &badge)
+{
+    // "Commits (40)", "Deploys (running)"; on a phone only an error or a running deploy is worth the width.
+    (tab == 1 ? m_commitsBadge : m_deploysBadge) = badge;
+    const QString name = tab == 1 ? "Commits" : "Deploys";
+    const bool show = !badge.isEmpty() && (!m_compact || badge == "error" || badge == "running");
+    m_tabs->setTabText(tab, show ? QStringLiteral("%1 (%2)").arg(name, m_compact && badge == "running" ? "…" : badge) : name);
 }
 
 void ForgeWindow::status(const QString &text, bool error)
@@ -468,6 +618,9 @@ void ForgeWindow::loadRepos()
             const QString name = r.value("repo").toString();
             const bool pub = r.value("public").toBool();
             auto *it = new QListWidgetItem(shortName(name) + (pub ? "" : "  (private)"));
+            const QString desc = r.value("description").toString();
+            if (isTouchUi() && !desc.isEmpty())  // no hover tooltips on a phone: show it under the name
+                it->setText(it->text() + "\n" + desc);
             it->setData(PathRole, name);
             it->setToolTip(r.value("description").toString());
             m_repos->addItem(it);
@@ -515,7 +668,7 @@ void ForgeWindow::openRepo(const QString &repo)
     m_ref->clear();
     m_entries->clear();
     m_commits->clear();
-    m_tabs->setTabText(1, "Commits");
+    setTabBadge(1, QString());
     m_info = {};
     m_backStack.clear();
     m_navPanel->setBackEnabled(false);
@@ -600,6 +753,7 @@ void ForgeWindow::browse(const QString &path)
             return status(error, true);
         m_path = body.value("path").toString();
         const bool isFile = body.value("type").toString() == "file";
+        m_desc->setVisible(!m_compact || m_path.isEmpty());  // phone: room for code beats the description
         setBreadcrumb(m_path, isFile);
         m_viewer->setMarkedLines(0, 0, false);  // line marks belong to the file they were made in
         if (!isFile)
@@ -727,7 +881,8 @@ void ForgeWindow::loadOutline()
             m_outline->setItemData(m_outline->count() - 1, d.value("signature").toString(), Qt::ToolTipRole);
         }
         m_outline->setVisible(true);
-        status(m_status->text() + " · click a name to see its definition and references (Ctrl+click jumps)");
+        status(m_status->text() + (isTouchUi() ? " · tap a name for its definition and references"
+                                               : " · click a name to see its definition and references (Ctrl+click jumps)"));
     });
 }
 
@@ -735,6 +890,7 @@ void ForgeWindow::lookupSymbol(int line, int col, bool jump)
 {
     const QString repo = m_repo, path = m_path;
     const int seq = ++m_navSeq;
+    const bool panelWasHidden = !m_navPanel->isVisible();
     QToolTip::hideText();
     const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
     int s = col, e = col;
@@ -748,7 +904,7 @@ void ForgeWindow::lookupSymbol(int line, int col, bool jump)
     }
     status("Looking up " + text.mid(s, e - s) + "…");
     m_api->get(repoPath(repo) + "/symbol", symbolQuery(line, col), this,
-               [this, repo, path, seq, jump](const QJsonObject &r, const QString &error) {
+               [this, repo, path, seq, jump, panelWasHidden](const QJsonObject &r, const QString &error) {
         if (repo != m_repo || path != m_path || seq != m_navSeq)
             return;
         if (!error.isEmpty()) {
@@ -785,8 +941,12 @@ void ForgeWindow::lookupSymbol(int line, int col, bool jump)
         }
         m_navPanel->setVisible(true);
         m_navPanel->setResult(r);
-        if (m_fileSplit->sizes().value(1) < 120)
+        if (m_fileSplit->orientation() == Qt::Vertical) {  // phone: the panel takes the lower part of the screen
+            if (panelWasHidden || m_fileSplit->sizes().value(1) < 120)
+                m_fileSplit->setSizes({m_fileSplit->height() / 3, m_fileSplit->height() * 2 / 3});
+        } else if (m_fileSplit->sizes().value(1) < 120) {
             m_fileSplit->setSizes({std::max(300, m_fileSplit->width() * 2 / 3), std::max(240, m_fileSplit->width() / 3)});
+        }
         status(QStringLiteral("%1: %2 definition(s), %3 reference(s)")
                    .arg(name).arg(defs.size()).arg(r.value("reference_count").toInt(refs.size())));
     });
@@ -880,7 +1040,7 @@ void ForgeWindow::loadLog()
     QUrlQuery q;
     q.addQueryItem("ref", ref());
     q.addQueryItem("limit", "100");
-    m_tabs->setTabText(1, "Commits");
+    setTabBadge(1, QString());
     m_api->get(repoPath(repo) + "/commits", q, this, [this, repo](const QJsonObject &body, const QString &error) {
         if (repo != m_repo)
             return;
@@ -889,7 +1049,7 @@ void ForgeWindow::loadLog()
             qWarning("forge: loading commits for %s failed: %s", qPrintable(repo), qPrintable(error));
             auto *it = new QTreeWidgetItem(m_commits);
             it->setText(0, "Could not load commits: " + error + " (open this tab again to retry)");
-            m_tabs->setTabText(1, "Commits (error)");
+            setTabBadge(1, "error");
             return;
         }
         const QJsonArray commits = body.value("commits").toArray();
@@ -910,7 +1070,7 @@ void ForgeWindow::loadLog()
             it->setFont(3, QFontDatabase::systemFont(QFontDatabase::FixedFont));
             it->setData(0, ShaRole, c.value("sha").toString());
         }
-        m_tabs->setTabText(1, QStringLiteral("Commits (%1)").arg(commits.size()));
+        setTabBadge(1, QString::number(commits.size()));
     });
 }
 
@@ -933,6 +1093,7 @@ QWidget *ForgeWindow::buildSettings()
 
     auto *general = new QGroupBox("General");
     auto *form = new QFormLayout(general);
+    m_settingsForm = form;
     // Repos always belong to their owner (the signed-in handle); only the name part can change.
     auto *nameRow = new QHBoxLayout;
     m_ownerPrefix = new QLabel;
@@ -948,8 +1109,15 @@ QWidget *ForgeWindow::buildSettings()
     m_defaultBranch = new QComboBox;
     m_defaultBranch->setMinimumWidth(160);
     form->addRow("Default branch:", m_defaultBranch);
-    m_public = new QCheckBox("Public: anyone can browse and clone it without signing in");
-    form->addRow("Visibility:", m_public);
+    m_public = new QCheckBox("Public");
+    auto *visRow = new QVBoxLayout;
+    visRow->setSpacing(0);
+    visRow->addWidget(m_public);
+    auto *visHint = new QLabel("Anyone can browse and clone it without signing in.");
+    visHint->setWordWrap(true);
+    visHint->setEnabled(false);  // the dimmer "hint" colour
+    visRow->addWidget(visHint);
+    form->addRow("Visibility:", visRow);
     m_save = new QPushButton("Save changes");
     m_save->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
     auto *saveRow = new QHBoxLayout;
@@ -1111,7 +1279,8 @@ QWidget *ForgeWindow::buildDeploys()
     m_runsNote->setTextFormat(Qt::RichText);
     lay->addWidget(m_runsNote);
     auto *row = new QHBoxLayout;
-    row->addWidget(new QLabel("Branch:"));
+    m_runBranchLabel = new QLabel("Branch:");
+    row->addWidget(m_runBranchLabel);
     m_runBranch = new QComboBox;
     m_runBranch->setMinimumWidth(140);
     row->addWidget(m_runBranch);
@@ -1121,6 +1290,8 @@ QWidget *ForgeWindow::buildDeploys()
     row->addWidget(m_runNow);
     row->addStretch(1);
     auto *refresh = new QPushButton("Refresh");
+    m_runRefresh = refresh;
+    refresh->setToolTip("Refresh");
     refresh->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
     row->addWidget(refresh);
     lay->addLayout(row);
@@ -1132,12 +1303,17 @@ QWidget *ForgeWindow::buildDeploys()
     m_runs->header()->setStretchLastSection(false);
     for (int i = 0; i < 7; ++i)
         m_runs->header()->setSectionResizeMode(i, i == 1 ? QHeaderView::Stretch : QHeaderView::ResizeToContents);
+    touchScroll(m_runs);
     split->addWidget(m_runs);
     m_runOutput = new QPlainTextEdit;
     m_runOutput->setReadOnly(true);
     m_runOutput->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_runOutput->setPlaceholderText("Select a run to see its output.");
     m_runOutput->setLineWrapMode(QPlainTextEdit::NoWrap);
+    if (isTouchUi()) {
+        m_runOutput->setTextInteractionFlags(Qt::TextSelectableByKeyboard);
+        touchScroll(m_runOutput);
+    }
     split->addWidget(m_runOutput);
     split->setStretchFactor(0, 1);
     split->setStretchFactor(1, 2);
@@ -1213,7 +1389,7 @@ void ForgeWindow::loadRuns()
             if (r.value("id").toString() == keep)
                 it->setSelected(true);
         }
-        m_tabs->setTabText(3, active ? "Deploys (running)" : "Deploys");
+        setTabBadge(3, active ? "running" : QString());
         if (!keep.isEmpty())
             showRun(keep);  // refresh the output of the run being watched
         if (active)

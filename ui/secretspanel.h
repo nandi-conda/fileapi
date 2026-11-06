@@ -5,6 +5,7 @@
 #include <QGroupBox>
 
 class Api;
+class QBoxLayout;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -21,6 +22,8 @@ public:
     void load();
     void clear();
     QLabel *noteLabel() const { return m_note; }
+    // Phone layout: name, value and buttons stacked instead of in one row.
+    void setCompact(bool compact);
 
 signals:
     void statusText(const QString &text, bool error);
@@ -37,4 +40,5 @@ private:
     QLineEdit *m_value;
     QPushButton *m_save;
     QPushButton *m_delete;
+    QBoxLayout *m_addRow;
 };
