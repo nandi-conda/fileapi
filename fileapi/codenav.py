@@ -452,7 +452,7 @@ class _LRU:
 
 
 _MISSING = object()
-_files = _LRU(160 << 20, weigh=lambda v: 64 if v is None else sum(len(ln) for ln in v.lines) * 3 + 256)
+_files = _LRU(160 << 20, weigh=lambda v: 64 if v is None or v is _MISSING else sum(len(ln) for ln in v.lines) * 3 + 256)
 
 
 @dataclass

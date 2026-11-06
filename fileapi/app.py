@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import gzip
+import mimetypes
 import os
 import zlib
 import tempfile
@@ -560,6 +561,29 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     @app.get("/api/forge/repos/{project}/{repo}/tree", tags=["forge"])
     def forge_tree(request: Request, project: str, repo: str, ref: str = "HEAD", path: str = ""):
         return forge.browse(forge_repo(request, project, repo), path, ref)
+
+    # A file's bytes, for images in rendered READMEs. Served sandboxed and unsniffed so an HTML or SVG file
+    # opened directly can't run script on this origin.
+    @app.get("/api/forge/repos/{project}/{repo}/raw", tags=["forge"])
+    def forge_raw(request: Request, project: str, repo: str, path: str, ref: str = "HEAD"):
+        full = forge_repo(request, project, repo)
+        data, pointer = forge.raw(full, path, ref)
+        media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        headers = {"Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+                   "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=60"}
+        if pointer:
+            owner_name, name = full.split("/", 1)
+            if lfs.size(owner_name, name, pointer[0]) is None:
+                raise NotFound(f"LFS object missing: {path}")
+            return StreamingResponse(lfs.read(owner_name, name, pointer[0]), media_type=media,
+                                     headers={**headers, "Content-Length": str(pointer[1])})
+        return Response(data, media_type=media, headers=headers)
+
+    @app.get("/api/forge/repos/{project}/{repo}/markdown", tags=["forge"])
+    async def forge_markdown(request: Request, project: str, repo: str, path: str, ref: str = "HEAD"):
+        """A Markdown file as sanitized HTML (GitHub-flavoured; scripts, styles and event handlers removed)."""
+        full = forge_repo(request, project, repo)
+        return await run_in_threadpool(forge.markdown, full, path, ref)
 
     # Code navigation (fileapi/codenav.py): a file's outline, and what the identifier at line/col refers to.
     @app.get("/api/forge/repos/{project}/{repo}/symbols", tags=["forge"])

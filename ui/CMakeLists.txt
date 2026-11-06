@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Svg)
 
-qt_add_executable(forgeui main.cpp appstyle.cpp appstyle.h forgewindow.cpp forgewindow.h api.cpp api.h highlighter.cpp highlighter.h codeview.cpp codeview.h navpanel.cpp navpanel.h secretspanel.cpp secretspanel.h releasespanel.cpp releasespanel.h)
-target_link_libraries(forgeui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
+qt_add_executable(forgeui main.cpp appstyle.cpp appstyle.h forgewindow.cpp forgewindow.h api.cpp api.h highlighter.cpp highlighter.h codeview.cpp codeview.h navpanel.cpp navpanel.h secretspanel.cpp secretspanel.h releasespanel.cpp releasespanel.h markdownview.cpp markdownview.h)
+target_link_libraries(forgeui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Svg)  # Svg: the image plugin for SVG badges in READMEs
 
 if(EMSCRIPTEN)
     # Smaller output; the app has no need for exceptions or a big initial heap.

@@ -3,6 +3,7 @@
 #include "appstyle.h"
 #include "codeview.h"
 #include "highlighter.h"
+#include "markdownview.h"
 #include "navpanel.h"
 #include "secretspanel.h"
 #include "releasespanel.h"
@@ -45,6 +46,9 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
+#include <QButtonGroup>
+#include <QFrame>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QPointer>
@@ -281,6 +285,27 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_crumbRow = new QBoxLayout(QBoxLayout::LeftToRight);
     auto *crumbRow = m_crumbRow;
     crumbRow->addWidget(m_crumbs, 1);
+    // Markdown files: the rendered page or its source, like GitHub's Preview / Code.
+    m_viewToggle = new QWidget;
+    auto *toggleRow = new QHBoxLayout(m_viewToggle);
+    toggleRow->setContentsMargins(0, 0, 0, 0);
+    toggleRow->setSpacing(0);
+    m_previewBtn = new QToolButton;
+    m_previewBtn->setText("Preview");
+    m_codeBtn = new QToolButton;
+    m_codeBtn->setText("Code");
+    auto *toggleGroup = new QButtonGroup(m_viewToggle);
+    for (QToolButton *b : {m_previewBtn, m_codeBtn}) {
+        b->setCheckable(true);
+        b->setAutoRaise(false);
+        b->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        toggleGroup->addButton(b);
+        toggleRow->addWidget(b);
+    }
+    m_viewToggle->setVisible(false);
+    crumbRow->addWidget(m_viewToggle, 0, Qt::AlignRight);
+    connect(m_previewBtn, &QToolButton::clicked, this, [this] { setPreview(true); });
+    connect(m_codeBtn, &QToolButton::clicked, this, [this] { setPreview(false); });
     // The open file's outline: jump to any class/function in it.
     m_outline = new QComboBox;
     m_outline->setMinimumWidth(220);
@@ -302,15 +327,58 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_entries->setRootIsDecorated(false);
     m_entries->setUniformRowHeights(true);
     m_entries->setProperty("singleClick", true);  // opens on a single click, like links on the web
-    touchScroll(m_entries);
     m_entries->setCursor(Qt::PointingHandCursor);
+    // The list is as tall as its rows and scrolls together with the README under it.
+    m_entries->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_entries->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_entries->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     m_entries->header()->setStretchLastSection(false);
     m_entries->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_entries->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     connect(m_entries, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *it) {
         browse(it->data(0, PathRole).toString());
     });
-    m_filesStack->addWidget(m_entries);
+    m_listScroll = new QScrollArea;
+    m_listScroll->setWidgetResizable(true);
+    m_listScroll->setFrameShape(QFrame::NoFrame);
+    m_listPage = new QWidget;
+    auto *lp = new QVBoxLayout(m_listPage);
+    lp->setContentsMargins(0, 0, 0, 0);
+    lp->setSpacing(12);
+    lp->addWidget(m_entries);
+    auto *readmeFrame = new QFrame;
+    readmeFrame->setFrameShape(QFrame::StyledPanel);
+    m_readmeBox = readmeFrame;
+    auto *rl = new QVBoxLayout(m_readmeBox);
+    rl->setContentsMargins(1, 1, 1, 1);
+    rl->setSpacing(0);
+    m_readmeTitle = new QLabel;
+    m_readmeTitle->setContentsMargins(12, 8, 12, 8);
+    QFont rtf = m_readmeTitle->font();
+    rtf.setBold(true);
+    m_readmeTitle->setFont(rtf);
+    rl->addWidget(m_readmeTitle);
+    auto *rule = new QFrame;
+    rule->setFrameShape(QFrame::HLine);
+    rule->setFrameShadow(QFrame::Plain);
+    rule->setForegroundRole(QPalette::Mid);
+    rl->addWidget(rule);
+    m_readme = new MarkdownView(m_api);
+    m_readme->setFrameShape(QFrame::NoFrame);
+    m_readme->setAutoHeight(true);
+    if (isTouchUi())
+        m_readme->setTextInteractionFlags(Qt::LinksAccessibleByMouse);  // a drag scrolls, a tap follows links
+    m_readme->onOpenPath = [this](const QString &path, const QString &frag) { openRepoLink(path, frag); };
+    m_readme->onScrollTo = [this](int y) {
+        m_listScroll->verticalScrollBar()->setValue(m_readme->mapTo(m_listPage, QPoint(0, y)).y());
+    };
+    rl->addWidget(m_readme);
+    m_readmeBox->setVisible(false);
+    lp->addWidget(m_readmeBox);
+    lp->addStretch(1);
+    m_listScroll->setWidget(m_listPage);
+    touchScroll(m_listScroll);
+    m_filesStack->addWidget(m_listScroll);
     m_viewer = new CodeView;
     m_viewer->onLinesClicked = [this](int, int) { updateHash(); };
     m_viewer->setReadOnly(true);
@@ -328,7 +396,15 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_viewer->onWordHover = [this](int line, int col, const QPoint &at) { hoverSymbol(line, col, at); };
     m_viewer->onNavKey = [this](int line, int col, bool refs) { lookupSymbol(line, col, !refs); };
     m_fileSplit = new QSplitter;
-    m_fileSplit->addWidget(m_viewer);
+    m_codeStack = new QStackedWidget;
+    m_codeStack->addWidget(m_viewer);
+    m_mdView = new MarkdownView(m_api);
+    m_mdView->onOpenPath = [this](const QString &path, const QString &frag) { openRepoLink(path, frag); };
+    if (isTouchUi())
+        m_mdView->setTextInteractionFlags(Qt::LinksAccessibleByMouse);
+    touchScroll(m_mdView);
+    m_codeStack->addWidget(m_mdView);
+    m_fileSplit->addWidget(m_codeStack);
     m_navPanel = new NavPanel;
     m_navPanel->setVisible(false);
     touchScroll(m_navPanel->view());
@@ -806,6 +882,8 @@ void ForgeWindow::applyRoute(QString hash)
             browse(path, Nav::Replace);
         } else if (m_filesStack->currentIndex() == 1
                    && (first != m_viewer->markedFirst() || std::max(first, last) != m_viewer->markedLast())) {
+            if (first > 0 && m_viewToggle->isVisible())
+                setPreview(false);
             m_viewer->setMarkedLines(first, last, first > 0);
         }
     } else if (refChanged) {
@@ -986,7 +1064,9 @@ void ForgeWindow::browse(const QString &path, Nav nav)
         if (isFile)
             return showFile(body);
         m_outline->setVisible(false);
+        m_viewToggle->setVisible(false);
         m_pendingSpan = {};
+        m_pendingAnchor.clear();
         m_entries->clear();
         for (const auto &v : body.value("entries").toArray()) {
             const QJsonObject e = v.toObject();
@@ -1002,8 +1082,94 @@ void ForgeWindow::browse(const QString &path, Nav nav)
             it->setData(0, PathRole, m_path.isEmpty() ? clean : m_path + "/" + clean);
             it->setData(0, DirRole, dir);
         }
+        fitEntries();
+        m_listScroll->verticalScrollBar()->setValue(0);
+        loadReadme(body.value("entries").toArray());
         m_filesStack->setCurrentIndex(0);
     });
+}
+
+void ForgeWindow::fitEntries()
+{
+    const int rows = m_entries->topLevelItemCount();
+    const int rowHeight = rows ? m_entries->sizeHintForRow(0) : 0;
+    m_entries->setFixedHeight(m_entries->header()->sizeHint().height() + rows * rowHeight
+                              + 2 * m_entries->frameWidth() + 2);
+}
+
+void ForgeWindow::loadReadme(const QJsonArray &entries)
+{
+    // The folder's README, like GitHub picks it: Markdown first, then other formats (shown as plain text).
+    static const QStringList preferred = {"readme.md", "readme.markdown", "readme.mdown", "readme.mkd",
+                                          "readme.rst", "readme.txt", "readme"};
+    QString pick;
+    int best = INT_MAX;
+    for (const auto &v : entries) {
+        const QString name = v.toObject().value("name").toString();
+        if (name.endsWith('/'))
+            continue;
+        const QString lower = name.toLower();
+        int rank = int(preferred.indexOf(lower));
+        if (rank < 0 && lower.startsWith("readme."))
+            rank = int(preferred.size());
+        if (rank >= 0 && rank < best) {
+            best = rank;
+            pick = name;
+        }
+    }
+    const int seq = ++m_readmeSeq;
+    m_readmeBox->setVisible(false);  // until this folder's README has loaded
+    if (pick.isEmpty())
+        return;
+    const QString repo = m_repo;
+    const QString dir = m_path;
+    const QString path = dir.isEmpty() ? pick : dir + "/" + pick;
+    m_readmeTitle->setText(pick);
+    if (MarkdownView::isMarkdown(pick)) {
+        m_readme->showMarkdown(repo, ref(), path, QString(), [this, seq](bool ok) {
+            if (seq == m_readmeSeq)
+                m_readmeBox->setVisible(ok);
+        });
+        return;
+    }
+    QUrlQuery q;
+    q.addQueryItem("ref", ref());
+    q.addQueryItem("path", path);
+    m_api->get(repoPath(repo) + "/tree", q, this, [this, seq, repo, dir, path](const QJsonObject &body,
+                                                                             const QString &error) {
+        if (seq != m_readmeSeq || repo != m_repo || dir != m_path)
+            return;
+        if (!error.isEmpty() || body.value("binary").toBool() || body.value("type").toString() != "file") {
+            m_readmeBox->setVisible(false);
+            return;
+        }
+        m_readmeBox->setVisible(true);
+        m_readme->showPlain(repo, ref(), path, body.value("content").toString());
+    });
+}
+
+void ForgeWindow::openRepoLink(const QString &path, const QString &fragment)
+{
+    // A link in a README: another file or folder at this ref; "#L12" opens it at that line, other
+    // fragments are headings in a Markdown file.
+    static const QRegularExpression lineRe(QStringLiteral("^L\\d+(-L?\\d+)?$"));
+    if (lineRe.match(fragment).hasMatch())
+        m_pendingLines = fragment;
+    else
+        m_pendingAnchor = fragment;
+    closeNav();
+    browse(path);
+}
+
+void ForgeWindow::setPreview(bool preview)
+{
+    m_previewBtn->setChecked(preview);
+    m_codeBtn->setChecked(!preview);
+    m_codeStack->setCurrentIndex(preview ? 1 : 0);
+    if (preview && m_viewer->markedFirst() > 0) {
+        m_viewer->setMarkedLines(0, 0, false);  // line links belong to the source view
+        updateHash();
+    }
 }
 
 void ForgeWindow::syncHighlightTheme()
@@ -1041,6 +1207,13 @@ void ForgeWindow::showFile(const QJsonObject &file)
     }
     if (!lang.isEmpty())
         m_status->setText(m_status->text() + " · " + lang);
+    // Markdown opens rendered, unless the link names lines (those live in the source).
+    const bool markdown = !file.value("binary").toBool() && MarkdownView::isMarkdown(file.value("path").toString());
+    m_viewToggle->setVisible(markdown);
+    const QString anchor = std::exchange(m_pendingAnchor, QString());
+    if (markdown)
+        m_mdView->showMarkdown(m_repo, ref(), file.value("path").toString(), anchor);
+    setPreview(markdown && m_pendingLines.isEmpty());
     m_filesStack->setCurrentIndex(1);
     // Line link from the URL (#L12 or #L12-L20): mark and scroll to it once the view has its size.
     const QString lines = std::exchange(m_pendingLines, QString());
@@ -1227,6 +1400,7 @@ void ForgeWindow::openPlace(const QString &path, int line, int col, int endCol, 
         m_navPanel->setBackEnabled(true);
     }
     if (path == m_path && m_filesStack->currentIndex() == 1) {
+        setPreview(false);
         m_viewer->setMarkedLines(line, line, false);
         const QString text = m_viewer->document()->findBlockByNumber(line - 1).text();
         if (endCol > col)

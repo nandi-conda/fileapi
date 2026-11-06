@@ -89,6 +89,31 @@ void Api::finish(QNetworkReply *reply, QObject *context, Callback done)
     });
 }
 
+void Api::getBytes(const QString &path, const QUrlQuery &query, QObject *context, BytesCallback done)
+{
+    QNetworkRequest req = request(path, query);
+    req.setRawHeader("Accept", "*/*");
+    finishBytes(m_net.get(req), context, done);
+}
+
+void Api::fetchExternal(const QUrl &url, QObject *context, BytesCallback done)
+{
+    if (url.scheme() != "https" && url.scheme() != "http")
+        return done({}, QStringLiteral("unsupported URL"));
+    finishBytes(m_net.get(QNetworkRequest(url)), context, done);
+}
+
+void Api::finishBytes(QNetworkReply *reply, QObject *context, BytesCallback done)
+{
+    connect(reply, &QNetworkReply::finished, context, [reply, done]() {
+        reply->deleteLater();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (status >= 400 || reply->error() != QNetworkReply::NoError)
+            return done({}, status ? QStringLiteral("HTTP %1").arg(status) : reply->errorString());
+        done(reply->readAll(), QString());
+    });
+}
+
 void Api::signIn()
 {
 #ifdef Q_OS_WASM

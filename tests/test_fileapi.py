@@ -576,6 +576,15 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert [c["message"] for c in log] == ["second", "first"]
         f = client.get("/api/forge/repos/web/site/tree", params={"path": "src/a.py", "ref": log[1]["sha"]}).json()
         assert f["content"] == "x = 1\n"
+        raw = client.get("/api/forge/repos/web/site/raw", params={"path": "README.md"})
+        assert raw.status_code == 200 and raw.content == b"hi\n" and raw.headers["content-type"].startswith("text/markdown")
+        assert "sandbox" in raw.headers["content-security-policy"] and raw.headers["x-content-type-options"] == "nosniff"
+        assert client.get("/api/forge/repos/web/site/raw", params={"path": "src"}).status_code == 404
+        md = client.get("/api/forge/repos/web/site/markdown", params={"path": "README.md"}).json()
+        assert md["html"] == "<p>hi</p>\n" and md["path"] == "README.md"
+        # No code navigation for Markdown, but asking isn't an error.
+        assert client.get("/api/forge/repos/web/site/symbols", params={"path": "README.md"}).status_code == 200
+        assert client.get("/api/forge/repos/web/secret/raw", params={"path": "README.md"}).status_code == 404
         assert client.get("/api/forge/repos/web/secret").status_code == 404
         # The UI's "not found" page relies on a private repo looking exactly like a missing one, even
         # with a stale/bad token: same status, same message shape.
@@ -1765,3 +1774,18 @@ def test_forge_gc_collects_unreachable_objects(tmp_path, backend):
         finally:
             r.close()
         assert forge.gc("o/r", grace=3600)["collectable"] == 0
+
+
+def test_markdown_rendering_is_sanitized():
+    from fileapi import markdown
+
+    html = markdown.render(
+        "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done\n- [ ] todo\n\n~~old~~\n\n"
+        '<p align="center"><img src="logo.png" width="80" onerror="alert(1)"></p>\n\n'
+        "<script>alert(1)</script>\n\n[x](javascript:alert(1)) [y](docs/a.md#b) <a href=\"#top\" style=\"color:red\">t</a>\n"
+    )
+    assert "<h1>Title</h1>" in html and "<table>" in html and "<s>old</s>" in html
+    assert "\u2611 done" in html and "\u2610 todo" in html
+    assert '<p align="center"><img src="logo.png" width="80"></p>' in html
+    assert "<script" not in html and "onerror" not in html and "href=\"javascript" not in html and "style" not in html
+    assert '<a href="docs/a.md#b">y</a>' in html and '<a href="#top">t</a>' in html

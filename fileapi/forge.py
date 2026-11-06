@@ -1056,6 +1056,32 @@ class Forge:
         finally:
             r.close()
 
+    def markdown(self, repo: str, path: str, ref: str = "HEAD") -> dict:
+        """A Markdown file rendered to sanitized HTML (fileapi/markdown.py)."""
+        from . import markdown
+
+        r = self.open(repo)
+        try:
+            commit, sha = self._file_at(r, ref, path)
+            data = r[sha].as_raw_string()
+            if parse_pointer(data):
+                raise StorageError(f"Stored with Git LFS: {path}")
+            text = data.decode(errors="replace")
+            return {"commit": commit.id.decode(), "path": "/".join(p for p in path.split("/") if p),
+                    "html": markdown.render_cached(sha.decode(), text)}
+        finally:
+            r.close()
+
+    def raw(self, repo: str, path: str, ref: str = "HEAD") -> tuple[bytes, tuple[str, int] | None]:
+        """A file's bytes at a ref, plus its Git LFS (oid, size) when the blob is only a pointer."""
+        r = self.open(repo)
+        try:
+            _, sha = self._file_at(r, ref, path)
+            data = r[sha].as_raw_string()
+            return data, parse_pointer(data)
+        finally:
+            r.close()
+
     def _file_at(self, r: BaseRepo, ref: str, path: str) -> tuple[Commit, bytes]:
         commit = self._peel_commit(r, self._resolve(r, ref))
         obj = r[commit.tree]

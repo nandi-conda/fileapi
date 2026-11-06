@@ -110,7 +110,7 @@ Access: the admin reaches every repo; public repos clone anonymously. Nobody els
 
 ### Web UI
 
-`/forge/` is a small browser UI for the forge: the repo list, files and their contents at any branch, tag or commit, and the commit log. Anyone sees the public repos; **Sign in** (atproto, same admin-only rule as MCP) shows the private ones too, and lets you create repos (just a name) and change their settings (rename keeps the owner). The URL tracks where you are (`/forge/#<handle>/<repo>/<path>`), so links can be shared.
+`/forge/` is a small browser UI for the forge: the repo list, files and their contents at any branch, tag or commit, and the commit log. Anyone sees the public repos; **Sign in** (atproto, same admin-only rule as MCP) shows the private ones too, and lets you create repos (just a name) and change their settings (rename keeps the owner). The URL tracks where you are (`/forge/#<handle>/<repo>/<path>`), so links can be shared. A folder's README (`README.md`, `.rst`, `.txt`, …) shows rendered under its file list, like on GitHub, and Markdown files open rendered with a **Preview / Code** switch; relative links and images resolve inside the repo.
 
 It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) on a small JSON API:
 
@@ -122,6 +122,8 @@ It is a Qt for WebAssembly app (Qt Widgets, C++, in `ui/`) on a small JSON API:
 | `PATCH`/`DELETE /api/forge/repos/<owner>/<repo>` | Signed in: change `description`, `default_branch`, `public`, `name` (same owner), or delete |
 | `GET /api/forge/repos/<owner>/<repo>` | Description, visibility, default branch, branches, tags, clone URL |
 | `GET /api/forge/repos/<owner>/<repo>/tree?ref=&path=` | A directory listing or a file's content |
+| `GET /api/forge/repos/<owner>/<repo>/markdown?ref=&path=` | A Markdown file as sanitized HTML (GitHub-flavoured; no script, styles or event handlers) |
+| `GET /api/forge/repos/<owner>/<repo>/raw?ref=&path=` | A file's bytes (README images), sandboxed by CSP |
 | `GET /api/forge/repos/<owner>/<repo>/commits?ref=&path=&limit=` | Recent commits (also at `/log`, but ad blockers block that path) |
 
 Send `Authorization: Bearer <access token>` for private repos; to anonymous callers a private repo is a 404.

@@ -30,6 +30,12 @@ public:
     void put(const QString &path, const QUrlQuery &query, const QByteArray &data, const QByteArray &contentType,
              QObject *context, Callback done);
 
+    using BytesCallback = std::function<void(const QByteArray &data, const QString &error)>;
+    // GET <base>/api/forge/<path>?<query> as raw bytes (file contents, e.g. images in a README).
+    void getBytes(const QString &path, const QUrlQuery &query, QObject *context, BytesCallback done);
+    // GET any http(s) URL, without the sign-in token (images a README links from elsewhere).
+    void fetchExternal(const QUrl &url, QObject *context, BytesCallback done);
+
     // Hand-offs to the page's JavaScript (index.html), which runs the OAuth sign-in.
     void signIn();
     void signOut();
@@ -43,6 +49,7 @@ public:
 private:
     QNetworkRequest request(const QString &path, const QUrlQuery &query = {}) const;
     void finish(QNetworkReply *reply, QObject *context, Callback done);
+    void finishBytes(QNetworkReply *reply, QObject *context, BytesCallback done);
 
     QNetworkAccessManager m_net;
     QString m_base;

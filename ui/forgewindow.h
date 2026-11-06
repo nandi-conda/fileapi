@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QMainWindow>
 #include <QUrlQuery>
@@ -8,6 +9,9 @@ class Api;
 class QAction;
 class CodeHighlighter;
 class CodeView;
+class MarkdownView;
+class QScrollArea;
+class QToolButton;
 class NavPanel;
 class SecretsPanel;
 class ReleasesPanel;
@@ -64,6 +68,11 @@ private:
     void selectPendingCommit();
     void loadLog();
     void showFile(const QJsonObject &file);
+    // README under a folder's listing; Preview/Code for Markdown files.
+    void loadReadme(const QJsonArray &entries);
+    void fitEntries();
+    void setPreview(bool preview);
+    void openRepoLink(const QString &path, const QString &fragment);
     QWidget *buildSettings();
     void fillSettings(const QJsonObject &info);
     void saveSettings();
@@ -125,6 +134,18 @@ private:
     QStackedWidget *m_filesStack;
     QTreeWidget *m_entries;
     CodeView *m_viewer;
+    QScrollArea *m_listScroll;
+    QWidget *m_listPage;
+    QWidget *m_readmeBox;
+    QLabel *m_readmeTitle;
+    MarkdownView *m_readme;
+    int m_readmeSeq = 0;
+    QStackedWidget *m_codeStack;
+    MarkdownView *m_mdView;
+    QWidget *m_viewToggle;
+    QToolButton *m_previewBtn;
+    QToolButton *m_codeBtn;
+    QString m_pendingAnchor;  // heading to scroll to once the Markdown file being opened has rendered
     QSplitter *m_fileSplit;
     NavPanel *m_navPanel;
     QComboBox *m_outline;

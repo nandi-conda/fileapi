@@ -24,6 +24,11 @@ dependencies = [
     "tree-sitter-c>=0.23",
     "tree-sitter-cpp>=0.23",
     "tree-sitter-java>=0.23",
+    # rendered READMEs in the forge web UI (fileapi/markdown.py)
+    "markdown-it-py>=3",
+    "mdit-py-plugins>=0.4",
+    "linkify-it-py>=2",
+    "nh3>=0.2.17",
 ]
 
 [project.optional-dependencies]
