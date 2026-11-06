@@ -8,6 +8,6 @@ data/
 state/
 repos/
 .pixi/
-ui/.toolchain/
+ui/.build-wasm/
 ui/build/
 aqtinstall.log

@@ -1,2 +1,2 @@
 .pixi/
-ui/.toolchain/
+ui/.build-wasm/

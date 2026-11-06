@@ -22,7 +22,7 @@ test:
 
 # Rebuild the forge web UI (Qt for WebAssembly) into fileapi/static/forge/; commit the result
 ui:
-    {{run}} ui/build.sh
+    {{pixi}} run -e ui ui/build.sh
 
 # Generate ui/build/compile_commands.json so clangd resolves Qt headers (uses the host Qt; editing only)
 ui-lsp:

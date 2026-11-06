@@ -128,7 +128,7 @@ The page signs in as a public OAuth client of fileapi itself (PKCE, redirect bac
 The built app is committed in `fileapi/static/forge/` (the wasm gzipped, about 5 MB), so `just deploy` needs no build step. After changing `ui/`, rebuild with:
 
 ```sh
-just ui   # downloads Qt 6.8 (host + wasm), emsdk 3.1.56, cmake and ninja into ui/.toolchain/ on first run (~2 GB)
+just ui   # pixi `ui` env: Qt 6.11 for WebAssembly + emsdk from prefix.dev/nandi-testing (Linux x86_64), cached by pixi
 ```
 
 ### Secrets and deploy jobs
