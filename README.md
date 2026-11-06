@@ -40,6 +40,8 @@ The atproto client metadata is served at `/oauth/atproto/client-metadata.json` a
 
 fileapi also hosts git repos. Each repo belongs to the signed-in account and lives under its atproto handle: `<handle>/<repo>`, e.g. `nandi.uk/blog`, cloned from `https://<host>/git/nandi.uk/blog.git`. MCP tools and the web UI only need the repo name. Clone and push them with plain git over HTTPS, and create and browse them over MCP.
 
+fileapi itself is mirrored there as `nandi.uk/fileapi` (GitHub stays primary). `just forge-mirror` pushes every GitHub branch and tag to the `forge` remote, and `just deploy` runs it after each deploy.
+
 Repos from before owners existed (`<project>/<repo>`) move under the admin's handle the next time the server starts; a name that is already taken becomes `<old project>-<repo>`. The old name stays as an alias, so old clone URLs, remotes and `/forge/#…` links keep working. Renames leave an alias the same way; creating a repo with an alias's name takes the name over. `FILEAPI_FORGE_OWNER` overrides the namespace (default: the admin handle). Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
 
 ### Sign in from git in the browser

@@ -96,6 +96,7 @@ deploy:
         exit 1
     fi
     just deploy-only
+    just forge-mirror || echo "Deployed, but mirroring to the forge failed (see above); rerun 'just forge-mirror'." >&2
 
 # Deploy to FastAPI Cloud without pulling first
 deploy-only: login
@@ -176,6 +177,38 @@ claude-add url=fileapi_url scope="user":
     claude mcp remove fileapi -s {{scope}} >/dev/null 2>&1 || true
     claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp"
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
+
+# Mirror this repo (every GitHub branch and tag) to the forge as <handle>/fileapi. GitHub stays primary.
+# Signs in through git-credential-fileapi (run `just git-setup` once). Big gaps go up one commit at a time,
+# because one huge pack (the committed forge UI wasm) times out on the host.
+forge-mirror url=fileapi_url repo="nandi.uk/fileapi":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base="{{url}}"; base="${base%/}"; base="${base%/mcp}"
+    forge="$base/git/{{repo}}.git"
+    git remote get-url forge >/dev/null 2>&1 || git remote add forge "$forge"
+    [ "$(git remote get-url forge)" = "$forge" ] || git remote set-url forge "$forge"
+    git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' --tags --prune
+    [ "$(git rev-parse --is-shallow-repository)" = "true" ] && git fetch --quiet --unshallow origin
+    # Step each branch toward its GitHub tip, oldest commit first, so no single push is large.
+    have=$(git ls-remote forge 'refs/heads/*' | awk '{print $1}')
+    for ref in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -vx HEAD); do
+        tip=$(git rev-parse "refs/remotes/origin/$ref")
+        remote=$(git ls-remote forge "refs/heads/$ref" | awk '{print $1}')
+        [ "$remote" = "$tip" ] && continue
+        if git push --quiet --force forge "$tip:refs/heads/$ref" 2>/dev/null; then echo "  $ref"; continue; fi
+        exclude=$(for h in $have; do git cat-file -e "$h" 2>/dev/null && echo "^$h"; done)
+        for c in $(git rev-list --reverse --first-parent "$tip" $exclude); do
+            git push --quiet --force forge "$c:refs/heads/$ref"
+        done
+        echo "  $ref (step by step)"
+    done
+    # Branches deleted on GitHub go away on the forge too.
+    for ref in $(git ls-remote forge 'refs/heads/*' | awk '{sub("refs/heads/","",$2); print $2}'); do
+        git show-ref --verify --quiet "refs/remotes/origin/$ref" || git push --quiet forge --delete "$ref"
+    done
+    git push --quiet forge --tags
+    echo "Forge mirror up to date: $base/forge/#{{repo}}"
 
 # Install the git credential helper (+ fileapi-release, and git-lfs from pixi if there isn't one) to ~/.local/bin and use it for this server
 git-setup url=fileapi_url:
