@@ -1959,3 +1959,40 @@ def test_b2_client_against_fake_api():
     assert calls["auth"] == 2
     b.delete(["git/abc"])
     assert files == {}
+
+
+def test_ci_can_ask_for_one_free(tmp_path, monkeypatch):
+    import json
+    import time as _t
+
+    import psycopg
+
+    from fileapi import blobs as blobs_mod
+
+    if not PG_URL:
+        pytest.skip("set TEST_DATABASE_URL to run Postgres tests")
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_release_chunks, fileapi_releases, fileapi_git_repos, fileapi_git_aliases")
+    monkeypatch.setattr(blobs_mod, "MIN_OBJECT", 1000)
+    monkeypatch.setenv("FILEAPI_BLOB_COPY", "off")
+    monkeypatch.delenv("FILEAPI_BLOBS", raising=False)
+    big = os.urandom(3000).hex()
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:
+        client.app.state.storage.write("big.txt", big, overwrite=True)
+    cfg = tmp_path / "B2_CONFIG"
+    cfg.write_text(json.dumps({"B2_FREE": "t1"}))
+    monkeypatch.setattr(blobs_mod, "BUILD_CONFIG", cfg)
+    monkeypatch.setenv("FILEAPI_BLOBS", "memory")
+    monkeypatch.setenv("FILEAPI_BLOB_COPY", "on")
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:
+        for _ in range(100):
+            h = client.get("/health").json()
+            if h["blob_free"]["state"] != "running" and h["blob_copy"] != "running":
+                break
+            _t.sleep(0.05)
+        assert h["blob_free"]["state"] == "done", h
+        assert client.app.state.migrator.counts()["fileapi_files"]["b2_only"][0] == 1
+        assert client.app.state.storage.read("big.txt") == big
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:  # same token: not again
+        _t.sleep(0.2)
+        assert client.app.state.migrator.status.get("step") == "copy"

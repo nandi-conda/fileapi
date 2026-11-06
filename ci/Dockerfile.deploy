@@ -9,6 +9,7 @@ ARG FORGE_SHA
 ARG FORGE_RUN
 ARG B2_KEY_ID
 ARG B2_BUCKET
+ARG B2_FREE
 ENV FASTAPI_CLOUD_APP=fileapi \
     FASTAPI_CLOUD_APP_ID=bdd95917-35be-404b-82bb-58203a95a7d9 \
     FILEAPI_URL=https://fileapi.fastapicloud.dev \
@@ -17,5 +18,5 @@ ENV FASTAPI_CLOUD_APP=fileapi \
 # FORGE_RUN differs on every run, so this step never comes from the cache.
 RUN --mount=type=secret,id=FASTAPI_TOKEN \
     FASTAPI_CLOUD_TOKEN="$(cat /run/secrets/FASTAPI_TOKEN)" DEPLOY_SHA="$FORGE_SHA" FORGE_RUN="$FORGE_RUN" \
-    B2_KEY_ID="$B2_KEY_ID" B2_BUCKET="$B2_BUCKET" \
+    B2_KEY_ID="$B2_KEY_ID" B2_BUCKET="$B2_BUCKET" B2_FREE="$B2_FREE" \
     python ci/deploy.py

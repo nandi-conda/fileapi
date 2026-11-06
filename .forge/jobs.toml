@@ -13,7 +13,9 @@ file = "ci/Dockerfile.deploy"
 save = false
 # B2_KEY_ID/B2_BUCKET: where the server keeps big blobs (Backblaze B2). The key ID isn't secret; the application
 # key is the B2_TOKEN user secret, which the server reads itself (it never passes through CI).
-build_args = { FORGE_SHA = "${FORGE_SHA}", FORGE_RUN = "${FORGE_URL}/forge/#${FORGE_REPO}/-/deploys/${FORGE_RUN_ID}", B2_KEY_ID = "00531018a18baa60000000004", B2_BUCKET = "fileapi" }
+# B2_FREE: a new value makes the deployed server drop the Postgres copies of bytes verified in B2 once, then VACUUM
+# (fileapi/blob_migrate.py free). Change it only to free again; it deletes data from the database.
+build_args = { FORGE_SHA = "${FORGE_SHA}", FORGE_RUN = "${FORGE_URL}/forge/#${FORGE_REPO}/-/deploys/${FORGE_RUN_ID}", B2_KEY_ID = "00531018a18baa60000000004", B2_BUCKET = "fileapi", B2_FREE = "2026-11-06-v-ok" }
 args = ["--secret", "id=FASTAPI_TOKEN,env=FASTAPI_TOKEN"]
 
 # Backup to GitHub on every push (branches and tags), fast-forwards only. Skipped until the

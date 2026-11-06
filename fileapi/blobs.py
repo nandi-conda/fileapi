@@ -254,12 +254,12 @@ BUILD_CONFIG = Path(__file__).with_name("B2_CONFIG")
 
 
 def build_config() -> dict:
-    """{"B2_KEY_ID", "B2_BUCKET"} written into the deploy by CI (ci/deploy.py, from .forge/jobs.toml)."""
+    """{"B2_KEY_ID", "B2_BUCKET", "B2_FREE"} written into the deploy by CI (ci/deploy.py, from .forge/jobs.toml)."""
     try:
         doc = json.loads(BUILD_CONFIG.read_text())
     except (OSError, ValueError):
         return {}
-    return {k: str(v) for k, v in doc.items() if k in ("B2_KEY_ID", "B2_BUCKET") and v}
+    return {k: str(v) for k, v in doc.items() if k in ("B2_KEY_ID", "B2_BUCKET", "B2_FREE") and v}
 
 
 def from_config(env=os.environ, secrets_: dict | None = None, build: dict | None = None):

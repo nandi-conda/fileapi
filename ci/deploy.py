@@ -97,7 +97,7 @@ def main() -> None:
     Path("fileapi/BUILD").write_text(sha + "\n")
     # Blob storage (fileapi/blobs.py): the B2 key ID and bucket from .forge/jobs.toml, baked into the build. The
     # application key itself is the B2_TOKEN user secret, which the server reads from the forge.
-    b2 = {k: os.environ[k] for k in ("B2_KEY_ID", "B2_BUCKET") if os.environ.get(k)}
+    b2 = {k: os.environ[k] for k in ("B2_KEY_ID", "B2_BUCKET", "B2_FREE") if os.environ.get(k)}
     if b2:
         Path("fileapi/B2_CONFIG").write_text(json.dumps(b2) + "\n")
         say(f"Blob storage: B2 bucket {b2.get('B2_BUCKET', 'fileapi')!r}, key ID {b2.get('B2_KEY_ID', '(not set)')}")

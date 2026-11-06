@@ -218,7 +218,15 @@ def create_app(
         if migrator is not None and os.environ.get("FILEAPI_BLOB_COPY", "on").lower() not in ("0", "off", "false", "no"):
             try:
                 if migrator.cfg.active is not None:
-                    migrator.run_background("copy")
+                    from .blobs import build_config
+
+                    # CI can ask for the Postgres copies to be freed once (B2_FREE = "<token>" in .forge/jobs.toml);
+                    # the KV record makes it run on one replica, one time per token.
+                    token = build_config().get("B2_FREE", "")
+                    if token and kv.create(f"blob_free_{token}", {"state": "running"}):
+                        migrator.run_background("copy_then_free", kv=kv, token=token)
+                    else:
+                        migrator.run_background("copy")
             except Exception:  # noqa: BLE001 - never block startup on this
                 pass
         try:
@@ -331,6 +339,14 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
             store = migrator.cfg.store
             out["blobs"] = store.name if store is not None and migrator.cfg.active is not None else "postgres"
             out["blob_copy"] = migrator.status.get("state")
+            out["blob_step"] = migrator.status.get("step")
+            from .blobs import build_config
+
+            token = build_config().get("B2_FREE")
+            if token:
+                rec = kv.get(f"blob_free_{token}") or {}
+                out["blob_free"] = {"token": token, "state": rec.get("state", "pending"),
+                                    "freed_mb": round(rec.get("freed_bytes", 0) / 1e6, 1)}
         return out
 
     # ---- REST API ------------------------------------------------------

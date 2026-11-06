@@ -172,6 +172,21 @@ class Migrator:
                               "b2_only": [row[4], int(row[5])]}
         return out
 
+    def copy_then_free(self, kv=None, token: str = "") -> dict:
+        """Copy, then free (one-shot, asked for by CI: B2_FREE in .forge/jobs.toml). The result goes in KV."""
+        try:
+            out = {"copy": self.copy()}
+            out["free"] = self.free()
+        except Exception as e:
+            if kv is not None and token:
+                kv.put(f"blob_free_{token}", {"state": "failed", "error": str(e)})
+            raise
+        if kv is not None and token:
+            freed = sum(v.get("bytes", 0) for k, v in out["free"].items() if k != "vacuum")
+            kv.put(f"blob_free_{token}", {"state": "done", "freed_bytes": freed, "result": out,
+                                          "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        return out
+
     def run_background(self, what: str = "copy", **kw) -> bool:
         """Run copy/free/sweep in a thread (one at a time). False if one is already running."""
         if not self._lock.acquire(blocking=False):
