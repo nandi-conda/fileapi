@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import BinaryIO
 
+from .blobs import delete_quietly, fetch, new_key
 from .storage import NotFound, StorageError
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -65,8 +66,9 @@ CREATE TABLE IF NOT EXISTS fileapi_lfs_chunks (
 
 
 class PgLfsStore:
-    def __init__(self, pool):
+    def __init__(self, pool, blobs=None):
         self.pool = pool
+        self.blobs = blobs  # fileapi.blobs.BlobConfig: chunks go to B2 when it's set up
 
     def init(self) -> None:
         with self.pool.connection() as c:
@@ -91,11 +93,23 @@ class PgLfsStore:
                             "ON CONFLICT DO NOTHING", (rid, oid, size))
             if cur.rowcount == 0:
                 return  # already stored (content-addressed, so it is the same bytes)
-            seq = 0
-            while chunk := f.read(CHUNK):
-                c.execute("INSERT INTO fileapi_lfs_chunks (repo_id, oid, seq, data) VALUES (%s, %s, %s, %s)",
-                          (rid, oid, seq, chunk))
-                seq += 1
+            store = self.blobs.active if self.blobs else None
+            seq, uploaded = 0, []
+            try:
+                while chunk := f.read(CHUNK):
+                    if store is not None:
+                        key = new_key("lfs")
+                        store.put(key, chunk)
+                        uploaded.append(key)
+                        c.execute("INSERT INTO fileapi_lfs_chunks (repo_id, oid, seq, data, b2key, size) "
+                                  "VALUES (%s, %s, %s, NULL, %s, %s)", (rid, oid, seq, key, len(chunk)))
+                    else:
+                        c.execute("INSERT INTO fileapi_lfs_chunks (repo_id, oid, seq, data) VALUES (%s, %s, %s, %s)",
+                                  (rid, oid, seq, chunk))
+                    seq += 1
+            except BaseException:
+                delete_quietly(store, uploaded)
+                raise
 
     def read(self, project: str, name: str, oid: str) -> Iterator[bytes]:
         with self.pool.connection() as c:
@@ -103,11 +117,12 @@ class PgLfsStore:
             n = c.execute("SELECT count(*) FROM fileapi_lfs_chunks WHERE repo_id = %s AND oid = %s", (rid, oid)).fetchone()[0]
         for seq in range(n):  # one chunk per query, so a large object never sits in memory whole
             with self.pool.connection() as c:
-                row = c.execute("SELECT data FROM fileapi_lfs_chunks WHERE repo_id = %s AND oid = %s AND seq = %s",
+                row = c.execute("SELECT data" + (", b2key" if self.blobs and self.blobs.pg_ready else ", NULL")
+                                + " FROM fileapi_lfs_chunks WHERE repo_id = %s AND oid = %s AND seq = %s",
                                 (rid, oid, seq)).fetchone()
             if row is None:
                 return
-            yield bytes(row[0])
+            yield bytes(row[0]) if row[0] is not None else fetch(self.blobs, row[1])
 
 
 class DiskLfsStore:

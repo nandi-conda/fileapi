@@ -260,6 +260,10 @@ class RepoSecrets:
     def delete_user(self, owner: str, name: str) -> None:
         self._delete(_user_key(owner), name)
 
+    def user_values(self, owner: str) -> dict[str, str]:
+        """An owner's decrypted user secrets (the server reads its B2 key from these)."""
+        return self._values(_user_key(owner))
+
     def values(self, repo: str) -> dict[str, str]:
         """Decrypted values for a job's environment: the owner's user secrets, then the repo's on top."""
         return {**self._values(_user_key(repo.split("/")[0])), **self._values(_repo_key("forge_secrets_", repo))}

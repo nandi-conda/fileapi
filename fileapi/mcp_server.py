@@ -55,6 +55,7 @@ def build_mcp(
     owner: str = "admin",
     jobs=None,
     releases=None,
+    migrator=None,
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
@@ -140,8 +141,49 @@ def build_mcp(
             _register_deploy_tools(mcp, forge, jobs, guard, owner)
         if releases is not None and passes is not None:
             _register_release_tools(mcp, forge, releases, passes, guard, public_url, owner)
+    if migrator is not None:
+        _register_blob_tools(mcp, migrator, guard)
 
     return mcp
+
+
+def _register_blob_tools(mcp: MCPServer, migrator, guard) -> None:
+    import json
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def blob_storage(
+        ctx: Context,
+        action: Annotated[str, Field(description=(
+            "status (default): where bytes live and the last run. copy: upload big rows still only in Postgres "
+            "to B2 (keeps the Postgres copy; safe). free: drop the Postgres copy of rows verified in B2, then "
+            "VACUUM (deletes data from the database). sweep: list blobs in B2 no row points at; with apply=true "
+            "delete them"))] = "status",
+        apply: bool = False,
+    ) -> str:
+        """Move bulky bytes (big git blobs, LFS objects, release assets, big files) from Postgres to Backblaze B2
+        and report on it. copy/free/sweep run in the background: call status to follow them."""
+        def go():
+            from .storage import StorageError
+
+            cfg = migrator.cfg
+            if action == "status":
+                store = cfg.store
+                out = {"blob_store": store.name if store else None, "writes_to_blob_store": cfg.active is not None,
+                       "config_error": cfg.error, "last_run": migrator.status}
+                if cfg.pg_ready:
+                    out["rows"] = migrator.counts()
+                return json.dumps(out, indent=1, default=str)
+            if action not in ("copy", "free", "sweep"):
+                raise StorageError("action must be status, copy, free or sweep")
+            if cfg.active is None:
+                raise StorageError("B2 isn't set up: needs B2_KEY_ID (CI config) and the B2_TOKEN or "
+                                   "B2_APPLICATION_KEY user secret, and room in the database for the blob columns")
+            kw = {"apply": apply} if action == "sweep" else {}
+            if not migrator.run_background(action, **kw):
+                raise StorageError(f"A {migrator.status.get('step')} run is still going: call status")
+            return f"Started {action} in the background. Call blob_storage(action='status') to follow it."
+
+        return guard(ctx, go)
 
 
 RepoArg = Annotated[str, Field(description="Repo name, e.g. 'blog' (it is yours: '<your handle>/blog'). "

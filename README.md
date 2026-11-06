@@ -335,6 +335,19 @@ fileapi's own repo lives on its forge as `nandi.uk/fileapi`, and that's where to
 
 A `github-mirror` job backs every push up to `github.com/nandi-conda/fileapi`, fast-forwards only. It's skipped until there's a `GITHUB_MIRROR_TOKEN` secret: a GitHub fine-grained personal access token (resource owner `nandi-conda`, only the `fileapi` repo, **Contents: Read and write**).
 
+### Blob storage on Backblaze B2
+
+With Postgres, the bulky bytes live in a [Backblaze B2](https://www.backblaze.com/cloud-storage) bucket instead of the database: git blobs of 32 KiB or more (compressed), Git LFS objects, release assets and stored files of 32 KiB or more (`FILEAPI_BLOB_MIN_BYTES`). Refs, metadata, commits, trees and small blobs stay in Postgres, so clones and listings stay one query. Each blob gets a random 128-bit name recorded in its row, and the app serves everything itself with the account key, so **keep the bucket private**.
+
+Configuration ([`fileapi/blobs.py`](fileapi/blobs.py)): `B2_KEY_ID` (the application key's ID, not secret), `B2_APPLICATION_KEY` or `B2_TOKEN` (the key itself), `B2_BUCKET` (default `fileapi`). They're read from env vars, then the forge owner's user secrets, then `fileapi/B2_CONFIG`, which `ci/deploy.py` writes from the `B2_KEY_ID`/`B2_BUCKET` build args in `.forge/jobs.toml`. So for this deployment the key ID is in the CI config and the key is the `B2_TOKEN` user secret; nothing is set on FastAPI Cloud. B2 is used through its native API, so no endpoint or region is needed.
+
+Moving existing data ([`fileapi/blob_migrate.py`](fileapi/blob_migrate.py), MCP tool `blob_storage`):
+
+- **copy** runs on its own after each start (`FILEAPI_BLOB_COPY=off` turns that off): rows still only in Postgres are uploaded and get their B2 key, and the Postgres copy stays. Git blobs no branch or tag reaches are skipped (that's `gc_repo`'s job).
+- **free** (`blob_storage action=free`) drops the Postgres copy of each row whose blob is verified in B2 (it exists, same size), then runs `VACUUM`. This is the step that deletes data from the database.
+- **sweep** lists blobs no row points at (and with `apply=true` deletes them); deleting a repo, a release asset, a file or gc'd objects deletes their blobs right away, and sweep catches what a failed delete left.
+- **status** shows where bytes live per table and the last run; `/health` reports `blobs` and `blob_copy`.
+
 ## Run elsewhere
 
 ```sh

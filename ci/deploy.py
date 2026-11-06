@@ -95,6 +95,12 @@ def main() -> None:
     if missing:
         fail(f"The forge UI build is missing {', '.join(missing)} in {ui}: run `just ui` and commit the result.")
     Path("fileapi/BUILD").write_text(sha + "\n")
+    # Blob storage (fileapi/blobs.py): the B2 key ID and bucket from .forge/jobs.toml, baked into the build. The
+    # application key itself is the B2_TOKEN user secret, which the server reads from the forge.
+    b2 = {k: os.environ[k] for k in ("B2_KEY_ID", "B2_BUCKET") if os.environ.get(k)}
+    if b2:
+        Path("fileapi/B2_CONFIG").write_text(json.dumps(b2) + "\n")
+        say(f"Blob storage: B2 bucket {b2.get('B2_BUCKET', 'fileapi')!r}, key ID {b2.get('B2_KEY_ID', '(not set)')}")
     run_id = os.environ.get("FORGE_RUN", "").rstrip("/").rsplit("/", 1)[-1]
     if len(run_id) == 16:  # the forge run: the new server marks it done if its job dies with the old replica
         Path("fileapi/BUILD_RUN").write_text(run_id + "\n")
@@ -113,7 +119,8 @@ def main() -> None:
             with urllib.request.urlopen(f"{SITE}/health", timeout=15) as resp:
                 health = json.loads(resp.read())
             if health.get("build") == sha:
-                say(f"Live: {SITE} runs {sha[:12]} (storage: {health.get('storage')}).")
+                say(f"Live: {SITE} runs {sha[:12]} (storage: {health.get('storage')}, blobs: "
+                    f"{health.get('blobs', 'postgres')}, copy to B2: {health.get('blob_copy', 'n/a')}).")
                 return
         except (OSError, ValueError):
             pass

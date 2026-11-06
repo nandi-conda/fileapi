@@ -1789,3 +1789,173 @@ def test_markdown_rendering_is_sanitized():
     assert '<p align="center"><img src="logo.png" width="80"></p>' in html
     assert "<script" not in html and "onerror" not in html and "href=\"javascript" not in html and "style" not in html
     assert '<a href="docs/a.md#b">y</a>' in html and '<a href="#top">t</a>' in html
+
+
+def test_blob_storage_offload_and_migration(tmp_path, monkeypatch):
+    """Big bytes go to the blob store (memory here, B2 in production); existing ones copy over, then free."""
+    import hashlib
+
+    import psycopg
+
+    from fileapi import blobs as blobs_mod
+
+    if not PG_URL:
+        pytest.skip("set TEST_DATABASE_URL to run Postgres tests")
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_release_chunks, fileapi_releases, fileapi_git_repos, fileapi_git_aliases")
+    monkeypatch.setattr(blobs_mod, "MIN_OBJECT", 1000)
+    monkeypatch.setenv("FILEAPI_BLOB_COPY", "off")
+    big_text = os.urandom(3000).hex() + "\n"
+    zblob = os.urandom(5000)
+    payload = os.urandom(6000)
+
+    # 1. Without B2: everything in Postgres, as before.
+    monkeypatch.delenv("FILEAPI_BLOBS", raising=False)
+    for k in ("B2_KEY_ID", "B2_APPLICATION_KEY", "B2_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:
+        assert client.get("/health").json()["blobs"] == "postgres"
+        forge = client.app.state.forge
+        forge.create("o", "r")
+        forge.commit_files("o/r", "main", {"big.txt": big_text, "small.txt": "s\n"}, "first")
+        client.app.state.storage.write("notes/big.md", big_text, overwrite=True)
+        oid = hashlib.sha256(payload).hexdigest()
+        assert client.put(f"/git/o/r.git/info/lfs/objects/{oid}", content=payload, headers=AUTH).status_code == 200
+        base = "/api/forge/repos/o/r/releases"
+        client.post(base, json={"tag": "v1"}, headers=AUTH)
+        assert client.put(f"{base}/v1/assets/a.bin", content=payload, headers=AUTH).status_code == 201
+
+    # 2. With a blob store: new big things go there, old ones are copied, then freed.
+    monkeypatch.setenv("FILEAPI_BLOBS", "memory")
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:
+        assert client.get("/health").json()["blobs"] == "memory"
+        forge, storage = client.app.state.forge, client.app.state.storage
+        store = forge.store.blobs.store
+        mig = client.app.state.migrator
+        counts = mig.counts()
+        assert counts["fileapi_git_objects"]["b2_only"][0] == 0 and counts["fileapi_files"]["postgres_only"][0] == 1
+
+        # New writes
+        forge.commit_files("o/r", "main", {"big2.txt": os.urandom(3000).hex()}, "second")
+        storage.write("notes/new.md", big_text, overwrite=True)
+        storage.append("notes/new.md", "more\n")
+        assert storage.read("notes/new.md") == big_text + "more\n"
+        storage.edit("notes/new.md", [__import__("fileapi.storage").storage.Edit("more", "less")])
+        assert storage.read("notes/new.md").endswith("less\n")
+        n_after_writes = len(store.data)
+        assert n_after_writes == 2  # big2.txt's blob + the current notes/new.md (old versions deleted)
+
+        # Copy existing rows (non-destructive), skipping an unreachable big blob
+        from dulwich.objects import Blob
+
+        r = forge.open("o/r")
+        try:
+            r.object_store.add_objects([(Blob.from_string(zblob), None)])  # goes to the store directly
+        finally:
+            r.close()
+        with psycopg.connect(PG_URL, autocommit=True) as c:  # pretend it's an old orphan still in Postgres
+            c.execute("UPDATE fileapi_git_objects SET created = now() - interval '1 day'")
+            sha = Blob.from_string(zblob).sha().digest()
+            key = c.execute("SELECT b2key FROM fileapi_git_objects WHERE sha = %s", (sha,)).fetchone()[0]
+            c.execute("UPDATE fileapi_git_objects SET b2key = NULL, size = NULL, data = %s WHERE sha = %s",
+                      (__import__("zlib").compress(zblob), sha))
+            store.delete([key])
+        rep = mig.copy()
+        assert rep["fileapi_git_objects"]["copied"] == 1 and rep["fileapi_git_objects"]["skipped_unreachable"] == 1
+        assert rep["fileapi_lfs_chunks"]["copied"] == 1 and rep["fileapi_release_chunks"]["copied"] == 1
+        assert rep["fileapi_files"]["copied"] == 1
+        assert mig.copy()["fileapi_lfs_chunks"]["copied"] == 0  # idempotent
+
+        freed = mig.free()
+        assert freed["fileapi_git_objects"]["freed"] == 1 and freed["fileapi_files"]["freed"] == 1
+        assert freed["vacuum"]["fileapi_git_objects"] == "vacuumed"
+        counts = mig.counts()
+        assert counts["fileapi_lfs_chunks"]["both"][0] == 0 and counts["fileapi_lfs_chunks"]["b2_only"][0] == 1
+
+        # Everything still reads back, now from the store
+        import fileapi.forge as forge_mod
+
+        forge_mod._OBJ_CACHE.clear()
+        assert forge.browse("o/r", "big.txt")["content"] == big_text
+        assert storage.read("notes/big.md") == big_text
+        assert client.get(f"/git/o/r.git/info/lfs/objects/{oid}", headers=AUTH).content == payload
+        assert client.get(f"{base}/v1/assets/a.bin", headers=AUTH, follow_redirects=True).content == payload
+        out = forge.gc("o/r", grace=0, apply=True)
+        assert out["deleted"] == 1 and out["deleted_bytes"] > 0
+
+        # Deleting things deletes their blobs; sweep finds leftovers.
+        storage.delete("notes/big.md")
+        store.put("git/" + "0" * 32, b"stray")
+        store.data["git/" + "0" * 32] = (b"stray", 0)
+        assert mig.sweep()["orphans"] == 1 and mig.sweep(apply=True)["deleted"] == 1
+        forge.delete("o/r")
+        assert set(store.data) == {k for (k,) in psycopg.connect(PG_URL).execute(
+            "SELECT b2key FROM fileapi_files WHERE b2key IS NOT NULL")}
+
+
+def test_b2_config_sources(monkeypatch):
+    from fileapi.blobs import B2Blobs, from_config
+
+    assert from_config({}, {}, {}) is None
+    s = from_config({}, {"B2_TOKEN": "K005secret"}, {"B2_KEY_ID": "0053abc", "B2_BUCKET": "fileapi"})
+    assert isinstance(s, B2Blobs) and (s.key_id, s.app_key, s.bucket) == ("0053abc", "K005secret", "fileapi")
+    s = from_config({"B2_BUCKET": "other"}, {"B2_TOKEN": "id1:key1"}, {})
+    assert (s.key_id, s.app_key, s.bucket) == ("id1", "key1", "other")
+    assert from_config({}, {"B2_TOKEN": "K005secret"}, {}) is None  # no key ID anywhere
+
+
+def test_b2_client_against_fake_api():
+    import httpx
+
+    from fileapi.blobs import B2Blobs
+
+    files: dict[str, dict] = {}
+    calls = {"auth": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("b2_authorize_account"):
+            calls["auth"] += 1
+            return httpx.Response(200, json={"accountId": "acc", "authorizationToken": f"tok{calls['auth']}",
+                                             "apiUrl": "https://api.b2", "downloadUrl": "https://f.b2",
+                                             "allowed": {"bucketId": None, "bucketName": None}})
+        tok = req.headers.get("Authorization")
+        if url.startswith("https://api.b2") and tok == "tok1" and "b2_list_file_names" in url:
+            return httpx.Response(401, json={"code": "expired_auth_token"})
+        if url.endswith("b2_list_buckets"):
+            return httpx.Response(200, json={"buckets": [{"bucketId": "bid", "bucketName": "fileapi"}]})
+        if url.endswith("b2_get_upload_url"):
+            return httpx.Response(200, json={"uploadUrl": "https://up.b2/x", "authorizationToken": "up"})
+        if url == "https://up.b2/x":
+            name = req.headers["X-Bz-File-Name"]
+            import hashlib
+            assert req.headers["X-Bz-Content-Sha1"] == hashlib.sha1(req.content).hexdigest()
+            files[name] = {"data": req.content, "id": "id-" + name}
+            return httpx.Response(200, json={"fileId": "id-" + name})
+        if url.startswith("https://f.b2/file/fileapi/"):
+            name = url.split("/file/fileapi/", 1)[1]
+            if name not in files:
+                return httpx.Response(404)
+            d = files[name]["data"]
+            return httpx.Response(200, content=b"" if req.method == "HEAD" else d, headers={"Content-Length": str(len(d))})
+        import json
+        body = json.loads(req.content or b"{}")
+        if url.endswith("b2_list_file_names"):
+            return httpx.Response(200, json={"files": [{"fileName": n, "contentLength": len(f["data"]),
+                                                        "uploadTimestamp": 0, "action": "upload"} for n, f in files.items()
+                                                       if n.startswith(body.get("prefix", ""))], "nextFileName": None})
+        if url.endswith("b2_list_file_versions"):
+            return httpx.Response(200, json={"files": [{"fileName": n, "fileId": f["id"]} for n, f in files.items()]})
+        if url.endswith("b2_delete_file_version"):
+            files.pop(body["fileName"])
+            return httpx.Response(200, json={})
+        return httpx.Response(400, json={"message": url})
+
+    b = B2Blobs("kid", "key", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert b.check()["bucket_id"] == "bid"
+    b.put("git/abc", b"hello")
+    assert b.get("git/abc") == b"hello" and b.size("git/abc") == 5 and b.size("git/nope") is None
+    assert [k for k, *_ in b.list()] == ["git/abc"]  # survives an expired token (re-authorizes)
+    assert calls["auth"] == 2
+    b.delete(["git/abc"])
+    assert files == {}

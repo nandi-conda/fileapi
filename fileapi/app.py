@@ -138,16 +138,26 @@ def create_app(
 
     database_url = database_url if database_url is not None else os.environ.get("DATABASE_URL") or None
     backend = "postgres" if database_url else "disk"
+    migrator = None
     if database_url:
         # Hosts without a persistent disk (FastAPI Cloud + Neon/Supabase): files and token live in Postgres.
         from .storage_pg import PostgresKV, PostgresStorage
 
-        storage = PostgresStorage(database_url)
+        from .blob_migrate import Migrator
+        from .blobs import BlobConfig, from_config
+
+        def resolve_blobs():
+            # Env vars, then the owner's user secrets (B2_TOKEN / B2_APPLICATION_KEY), then the key ID and
+            # bucket CI wrote into the build (.forge/jobs.toml -> fileapi/B2_CONFIG).
+            return from_config(secrets_=repo_secrets.user_values(owner) if repo_secrets.enabled else None)
+
+        blobs = BlobConfig(resolve_blobs)
+        storage = PostgresStorage(database_url, blobs=blobs)
         storage.init()
         kv = PostgresKV(storage)
-        forge = Forge(PgForgeStore(storage.pool))
-        lfs = PgLfsStore(storage.pool)
-        release_store = PgReleaseStore(storage.pool)
+        forge = Forge(PgForgeStore(storage.pool, blobs))
+        lfs = PgLfsStore(storage.pool, blobs)
+        release_store = PgReleaseStore(storage.pool, blobs)
     else:
         storage = Storage(root)
         storage.init()
@@ -164,6 +174,11 @@ def create_app(
     forge.store.init()
     lfs.init()
     release_store.init()
+    if database_url:
+        from .blobs import prepare_pg
+
+        prepare_pg(storage.pool, blobs)
+        migrator = Migrator(storage.pool, blobs, forge.store)
     releases = Releases(forge, release_store, int(os.environ.get("FILEAPI_RELEASE_MAX_ASSET", 2 * 1024 * 1024 * 1024)))
     passes = RepoPasses(kv)
     # Repo secrets are encrypted under FILEAPI_SECRETS_KEY; without it they're off (the rest still works).
@@ -185,7 +200,7 @@ def create_app(
     def owner_of(did: str | None) -> str | None:
         return owner if did and did == auth.admin_did else None
 
-    mcp = build_mcp(storage, public_url, forge, passes, owner, jobs, releases)
+    mcp = build_mcp(storage, public_url, forge, passes, owner, jobs, releases, migrator)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -198,6 +213,14 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         jobs.resume()  # Depot CI runs a replaced server was still following
+        # Copy bytes still only in Postgres to B2 (non-destructive; freeing the Postgres copies is a separate,
+        # explicit step: the blob_storage MCP tool with action=free).
+        if migrator is not None and os.environ.get("FILEAPI_BLOB_COPY", "on").lower() not in ("0", "off", "false", "no"):
+            try:
+                if migrator.cfg.active is not None:
+                    migrator.run_background("copy")
+            except Exception:  # noqa: BLE001 - never block startup on this
+                pass
         try:
             jobs.finish_self_deploy(BUILD_RUN, BUILD)  # the CI run that deployed this server
         except Exception:  # noqa: BLE001 - never block startup on bookkeeping
@@ -211,6 +234,7 @@ def create_app(
     app.state.forge = forge
     app.state.jobs = jobs
     app.state.releases = releases
+    app.state.migrator = migrator
 
     def learn_base(request: Request) -> None:
         """Jobs need this server's public URL (FORGE_URL); without FILEAPI_PUBLIC_URL, take it from a
@@ -301,8 +325,13 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 
     @app.get("/health")
     def health():
-        return {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend,
-                "build": BUILD}
+        out = {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend,
+               "build": BUILD}
+        if migrator is not None:
+            store = migrator.cfg.store
+            out["blobs"] = store.name if store is not None and migrator.cfg.active is not None else "postgres"
+            out["blob_copy"] = migrator.status.get("state")
+        return out
 
     # ---- REST API ------------------------------------------------------
     authed = [Depends(require_token)]

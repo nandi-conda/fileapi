@@ -38,6 +38,8 @@ from dulwich.refs import SYMREF, RefsContainer
 from dulwich.repo import BaseRepo, MemoryRepo, Repo
 from dulwich.server import Backend, ReceivePackHandler, UploadPackHandler
 
+from .blobs import BlobConfig, delete_quietly, fetch, new_key
+from . import blobs as _blobs
 from .lfs import parse_pointer
 from .storage import Conflict, NotFound, StorageError
 
@@ -299,9 +301,9 @@ _CACHE_LOCK = threading.Lock()
 
 
 class PgObjectStore(MemoryObjectStore):
-    def __init__(self, pool, repo_id: int):
+    def __init__(self, pool, repo_id: int, blobs: BlobConfig | None = None):
         super().__init__()
-        self.pool, self.repo_id = pool, repo_id
+        self.pool, self.repo_id, self.blobs = pool, repo_id, blobs
 
     def _hex(self, sha) -> bytes:
         return self._to_hexsha(sha)
@@ -331,12 +333,14 @@ class PgObjectStore(MemoryObjectStore):
             return hit
         with self.pool.connection() as c:
             row = c.execute(
-                "SELECT type, data FROM fileapi_git_objects WHERE repo_id = %s AND sha = %s",
+                "SELECT type, data" + (", b2key" if self.blobs and self.blobs.pg_ready else ", NULL")
+                + " FROM fileapi_git_objects WHERE repo_id = %s AND sha = %s",
                 (self.repo_id, bytes.fromhex(key[1].decode())),
             ).fetchone()
         if row is None:
             raise KeyError(key[1])
-        value = (row[0], zlib.decompress(row[1]))
+        data = row[1] if row[1] is not None else fetch(self.blobs, row[2])  # big blobs live in B2
+        value = (row[0], zlib.decompress(data))
         with _CACHE_LOCK:
             _OBJ_CACHE[key] = value
         return value
@@ -354,6 +358,13 @@ class PgObjectStore(MemoryObjectStore):
                 for obj, _ in objects]
         if not rows:
             return
+        store = self.blobs.active if self.blobs else None
+        big = [i for i, r in enumerate(rows) if r[2] == Blob.type_num and len(r[3]) >= _blobs.MIN_OBJECT]
+        if store is not None and big:
+            self._add_offloaded(store, rows, big)
+            rows = [r for i, r in enumerate(rows) if i not in set(big)]
+            if not rows:
+                return
         # An object gc might be about to collect (unreachable and old) can be sent again by a push: refresh its
         # timestamp so it counts as new. Unchanged toasted data is not rewritten by this update.
         sql = ("INSERT INTO fileapi_git_objects (repo_id, sha, type, data) VALUES (%s, %s, %s, %s) "
@@ -362,6 +373,38 @@ class PgObjectStore(MemoryObjectStore):
                   if _PG_HAS_CREATED.get(id(self.pool)) else "ON CONFLICT DO NOTHING"))
         with self.pool.connection() as c, c.cursor() as cur:
             cur.executemany(sql, rows)
+
+    def _add_offloaded(self, store, rows: list, big: list[int]) -> None:
+        """Store big blobs in B2 and only a pointer row in Postgres. Blobs this repo already has aren't
+        uploaded again (their timestamps are refreshed, as for small objects)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        shas = [rows[i][1] for i in big]
+        with self.pool.connection() as c:
+            have = {bytes(r[0]) for r in c.execute(
+                "SELECT sha FROM fileapi_git_objects WHERE repo_id = %s AND sha = ANY(%s)", (self.repo_id, shas))}
+            if have and _PG_HAS_CREATED.get(id(self.pool)):
+                c.execute("UPDATE fileapi_git_objects SET created = now() WHERE repo_id = %s AND sha = ANY(%s) "
+                          "AND created < now() - interval '10 minutes'", (self.repo_id, list(have)))
+        todo = [(rows[i], new_key("git")) for i in big if rows[i][1] not in have]
+        if not todo:
+            return
+        with ThreadPoolExecutor(4) as ex:
+            list(ex.map(lambda t: store.put(t[1], t[0][3]), todo))
+        with self.pool.connection() as c, c.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO fileapi_git_objects (repo_id, sha, type, data, b2key, size) VALUES (%s, %s, %s, NULL, %s, %s) "
+                "ON CONFLICT DO NOTHING RETURNING b2key", [(r[0], r[1], r[2], k, len(r[3])) for r, k in todo],
+                returning=True)
+            stored = set()
+            while True:
+                row = cur.fetchone()
+                if row:
+                    stored.add(row[0])
+                if not cur.nextset():
+                    break
+        # A concurrent push stored the same blob first: drop our copy.
+        delete_quietly(store, [k for _, k in todo if k not in stored])
 
     def add_pack(self):
         from tempfile import SpooledTemporaryFile
@@ -471,9 +514,9 @@ class PgRefsContainer(RefsContainer):
 
 
 class PgRepo(MemoryRepo):
-    def __init__(self, pool, repo_id: int, description: str = ""):
+    def __init__(self, pool, repo_id: int, description: str = "", blobs: BlobConfig | None = None):
         super().__init__()
-        self.object_store = PgObjectStore(pool, repo_id)
+        self.object_store = PgObjectStore(pool, repo_id, blobs)
         self.refs = PgRefsContainer(pool, repo_id)
         self._description = description.encode()
 
@@ -481,8 +524,9 @@ class PgRepo(MemoryRepo):
 class PgForgeStore:
     backend = "postgres"
 
-    def __init__(self, pool):
+    def __init__(self, pool, blobs: BlobConfig | None = None):
         self.pool = pool
+        self.blobs = blobs
 
     def init(self) -> None:
         with self.pool.connection() as c:
@@ -510,14 +554,50 @@ class PgForgeStore:
             if row is None:
                 raise NotFound(f"No such repo: {project}/{name}")
             rid = row[0]
-            tips = [bytes(v) for (v,) in c.execute("SELECT value FROM fileapi_git_refs WHERE repo_id = %s",
-                                                    (rid,)).fetchall()]
-            # Only commits, trees and tags are read in full: blobs are leaves and can be big.
-            rows = c.execute(
-                "SELECT sha, type, length(data), created < now() - make_interval(secs => %s), "
-                "CASE WHEN type IN (1, 2, 4) THEN data END FROM fileapi_git_objects WHERE repo_id = %s",
-                (grace, rid)).fetchall()
-        objects = {bytes(sha).hex().encode(): (t, size, old, data) for sha, t, size, old, data in rows}
+            objects, seen = self._reachable(c, rid, grace)
+        unreachable = [sha for sha in objects if sha not in seen]
+        doomed = [sha for sha in unreachable if objects[sha][2]]
+        out = {
+            "repo": f"{project}/{name}", "objects": len(objects), "stored_bytes": sum(o[1] for o in objects.values()),
+            "unreachable": len(unreachable), "unreachable_bytes": sum(objects[s][1] for s in unreachable),
+            "collectable": len(doomed), "collectable_bytes": sum(objects[s][1] for s in doomed),
+            "deleted": 0, "deleted_bytes": 0,
+        }
+        if apply and doomed:
+            keys = []
+            with self.pool.connection() as c:
+                for i in range(0, len(doomed), _GC_BATCH):
+                    batch = [bytes.fromhex(s.decode()) for s in doomed[i:i + _GC_BATCH]]
+                    # Re-check age in the DELETE: a push may have refreshed one since the scan.
+                    cur = c.execute(
+                        "DELETE FROM fileapi_git_objects WHERE repo_id = %s AND sha = ANY(%s) "
+                        "AND created < now() - make_interval(secs => %s) RETURNING " + self._size_sql()
+                        + (", b2key" if self._blobs_ready() else ", NULL"),
+                        (rid, batch, grace))
+                    rows = cur.fetchall()
+                    out["deleted"] += len(rows)
+                    out["deleted_bytes"] += sum(r[0] or 0 for r in rows)
+                    keys += [r[1] for r in rows if r[1]]
+            delete_quietly(self.blobs.store if self.blobs else None, keys)
+        return out
+
+    def _blobs_ready(self) -> bool:
+        return bool(self.blobs and self.blobs.pg_ready)
+
+    def _size_sql(self) -> str:
+        return "coalesce(length(data), size)" if self._blobs_ready() else "length(data)"
+
+    def _reachable(self, c, rid: int, grace: int = GC_GRACE_SECONDS):
+        """({hex sha: (type, stored bytes, older than grace, raw data of commits/trees/tags)}, reachable shas)."""
+        tips = [bytes(v) for (v,) in c.execute("SELECT value FROM fileapi_git_refs WHERE repo_id = %s",
+                                                (rid,)).fetchall()]
+        # Only commits, trees and tags are read in full: blobs are leaves and can be big (and only blobs go to B2).
+        age = ("created < now() - make_interval(secs => %s)" if _PG_HAS_CREATED.get(id(self.pool)) else "true")
+        rows = c.execute(
+            f"SELECT sha, type, {self._size_sql()}, {age}, "
+            "CASE WHEN type IN (1, 2, 4) THEN data END FROM fileapi_git_objects WHERE repo_id = %s",
+            ((grace, rid) if "%s" in age else (rid,))).fetchall()
+        objects = {bytes(sha).hex().encode(): (t, size or 0, old, data) for sha, t, size, old, data in rows}
         seen: set[bytes] = set()
         stack = [v for v in tips if not v.startswith(SYMREF) and len(v) == 40]
         while stack:
@@ -536,27 +616,7 @@ class PgForgeStore:
                 stack.extend(e.sha for e in obj.iteritems() if (e.mode & 0o170000) != 0o160000)  # skip gitlinks
             else:  # tag
                 stack.append(obj.object[1])
-        unreachable = [sha for sha in objects if sha not in seen]
-        doomed = [sha for sha in unreachable if objects[sha][2]]
-        out = {
-            "repo": f"{project}/{name}", "objects": len(objects), "stored_bytes": sum(o[1] for o in objects.values()),
-            "unreachable": len(unreachable), "unreachable_bytes": sum(objects[s][1] for s in unreachable),
-            "collectable": len(doomed), "collectable_bytes": sum(objects[s][1] for s in doomed),
-            "deleted": 0, "deleted_bytes": 0,
-        }
-        if apply and doomed:
-            with self.pool.connection() as c:
-                for i in range(0, len(doomed), _GC_BATCH):
-                    batch = [bytes.fromhex(s.decode()) for s in doomed[i:i + _GC_BATCH]]
-                    # Re-check age in the DELETE: a push may have refreshed one since the scan.
-                    cur = c.execute(
-                        "DELETE FROM fileapi_git_objects WHERE repo_id = %s AND sha = ANY(%s) "
-                        "AND created < now() - make_interval(secs => %s) RETURNING length(data)",
-                        (rid, batch, grace))
-                    sizes = [r[0] for r in cur.fetchall()]
-                    out["deleted"] += len(sizes)
-                    out["deleted_bytes"] += sum(sizes)
-        return out
+        return objects, seen
 
     def usage(self) -> dict:
         """Space used per table and per repo, to see what fills the database."""
@@ -569,13 +629,15 @@ class PgForgeStore:
                 "WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
                 "ORDER BY 2 DESC").fetchall()
             repos = c.execute(
-                "SELECT r.project || '/' || r.name, count(o.sha), coalesce(sum(length(o.data)), 0) "
+                "SELECT r.project || '/' || r.name, count(o.sha), coalesce(sum(length(o.data)), 0), "
+                + ("coalesce(sum(o.size) FILTER (WHERE o.data IS NULL), 0) " if self._blobs_ready() else "0 ")
+                + 
                 "FROM fileapi_git_repos r LEFT JOIN fileapi_git_objects o ON o.repo_id = r.id "
                 "GROUP BY 1 ORDER BY 3 DESC").fetchall()
         return {
             "database_bytes": db,
             "tables": [{"table": t, "bytes": b, "live_rows": live, "dead_rows": dead} for t, b, live, dead in tables],
-            "repos": [{"repo": r, "objects": n, "stored_bytes": int(b)} for r, n, b in repos],
+            "repos": [{"repo": r, "objects": n, "stored_bytes": int(b), "b2_bytes": int(b2)} for r, n, b, b2 in repos],
         }
 
     @staticmethod
@@ -609,7 +671,7 @@ class PgForgeStore:
             ).fetchone()
         if row is None:
             raise NotFound(f"No such repo: {project}/{name}")
-        return PgRepo(self.pool, row[0], row[1])
+        return PgRepo(self.pool, row[0], row[1], self.blobs)
 
     def set_public(self, project: str, name: str, public: bool) -> None:
         with self.pool.connection() as c:
@@ -664,10 +726,17 @@ class PgForgeStore:
             return dict(c.execute("SELECT old, new FROM fileapi_git_aliases ORDER BY old").fetchall())
 
     def delete(self, project: str, name: str) -> None:
+        keys: list[str] = []
         with self.pool.connection() as c:
+            if self._blobs_ready():  # the rows go by cascade; their blobs in B2 are deleted after
+                for table in ("fileapi_git_objects", "fileapi_lfs_chunks", "fileapi_release_chunks"):
+                    keys += [k for (k,) in c.execute(
+                        f"SELECT t.b2key FROM {table} t JOIN fileapi_git_repos r ON r.id = t.repo_id "
+                        "WHERE r.project = %s AND r.name = %s AND t.b2key IS NOT NULL", (project, name))]
             cur = c.execute("DELETE FROM fileapi_git_repos WHERE project = %s AND name = %s", (project, name))
         if cur.rowcount == 0:
             raise NotFound(f"No such repo: {project}/{name}")
+        delete_quietly(self.blobs.store if self.blobs else None, keys)
 
 
 # --------------------------------------------------------------------------- Disk backend

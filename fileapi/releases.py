@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
+from .blobs import delete_quietly, fetch, new_key
 from .storage import Conflict, NotFound, StorageError
 
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$")
@@ -84,8 +85,12 @@ CREATE TABLE IF NOT EXISTS fileapi_release_chunks (
 
 
 class PgReleaseStore:
-    def __init__(self, pool):
+    def __init__(self, pool, blobs=None):
         self.pool = pool
+        self.blobs = blobs  # fileapi.blobs.BlobConfig: chunks go to B2 when it's set up
+
+    def _ready(self) -> bool:
+        return bool(self.blobs and self.blobs.pg_ready)
 
     def init(self) -> None:
         with self.pool.connection() as c:
@@ -119,18 +124,31 @@ class PgReleaseStore:
     def blob_size(self, project: str, name: str, blob: str) -> int:
         with self.pool.connection() as c:
             rid = self._repo_id(c, project, name)
-            row = c.execute("SELECT coalesce(max(off + length(data)), 0) FROM fileapi_release_chunks "
+            row = c.execute("SELECT coalesce(max(off + " + ("coalesce(length(data), size)" if self._ready() else "length(data)")
+                            + "), 0) FROM fileapi_release_chunks "
                             "WHERE repo_id = %s AND blob = %s", (rid, blob)).fetchone()
         return int(row[0])
 
     def blob_append(self, project: str, name: str, blob: str, offset: int, f: BinaryIO) -> int:
         with self.pool.connection() as c, c.transaction():
             rid = self._repo_id(c, project, name)
-            pos = offset
-            while chunk := f.read(CHUNK):
-                c.execute("INSERT INTO fileapi_release_chunks (repo_id, blob, off, data) VALUES (%s, %s, %s, %s)",
-                          (rid, blob, pos, chunk))
-                pos += len(chunk)
+            store = self.blobs.active if self.blobs else None
+            pos, uploaded = offset, []
+            try:
+                while chunk := f.read(CHUNK):
+                    if store is not None:
+                        key = new_key("release")
+                        store.put(key, chunk)
+                        uploaded.append(key)
+                        c.execute("INSERT INTO fileapi_release_chunks (repo_id, blob, off, data, b2key, size) "
+                                  "VALUES (%s, %s, %s, NULL, %s, %s)", (rid, blob, pos, key, len(chunk)))
+                    else:
+                        c.execute("INSERT INTO fileapi_release_chunks (repo_id, blob, off, data) VALUES (%s, %s, %s, %s)",
+                                  (rid, blob, pos, chunk))
+                    pos += len(chunk)
+            except BaseException:
+                delete_quietly(store, uploaded)
+                raise
         return pos
 
     def blob_read(self, project: str, name: str, blob: str) -> Iterator[bytes]:
@@ -140,18 +158,22 @@ class PgReleaseStore:
                                             "ORDER BY off", (rid, blob)).fetchall()]
         for off in offs:  # one chunk per query, so a large asset never sits in memory whole
             with self.pool.connection() as c:
-                row = c.execute("SELECT data FROM fileapi_release_chunks WHERE repo_id = %s AND blob = %s AND off = %s",
+                row = c.execute("SELECT data" + (", b2key" if self._ready() else ", NULL")
+                                + " FROM fileapi_release_chunks WHERE repo_id = %s AND blob = %s AND off = %s",
                                 (rid, blob, off)).fetchone()
             if row is None:
                 return
-            yield bytes(row[0])
+            yield bytes(row[0]) if row[0] is not None else fetch(self.blobs, row[1])
 
     def blob_delete(self, project: str, name: str, blobs: list[str]) -> None:
         if not blobs:
             return
         with self.pool.connection() as c:
             rid = self._repo_id(c, project, name)
-            c.execute("DELETE FROM fileapi_release_chunks WHERE repo_id = %s AND blob = ANY(%s)", (rid, blobs))
+            cur = c.execute("DELETE FROM fileapi_release_chunks WHERE repo_id = %s AND blob = ANY(%s) RETURNING "
+                            + ("b2key" if self._ready() else "NULL"), (rid, blobs))
+            keys = [k for (k,) in cur.fetchall() if k]
+        delete_quietly(self.blobs.store if self.blobs else None, keys)
 
 
 class DiskReleaseStore:

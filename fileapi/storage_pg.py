@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from .blobs import delete_quietly, fetch
 from .storage import Conflict, Edit, Entry, NotFound, StorageError, normalize
 
 SCHEMA = """
@@ -33,7 +34,8 @@ def _like_prefix(prefix: str) -> str:
 
 
 class PostgresStorage:
-    def __init__(self, dsn: str, pool: ConnectionPool | None = None):
+    def __init__(self, dsn: str, pool: ConnectionPool | None = None, blobs=None):
+        self.blobs = blobs  # fileapi.blobs.BlobConfig: big files go to B2 when it's set up
         # Hosted Postgres (Neon) drops idle connections when the compute suspends, so a pooled connection
         # can be dead by the time a request borrows it, which used to surface as a 500 on the first request
         # after a quiet spell. check= pings each connection on checkout and replaces a dead one; max_idle
@@ -53,9 +55,34 @@ class PostgresStorage:
     def _iso(ts: datetime) -> str:
         return ts.astimezone(timezone.utc).isoformat()
 
+    def _ready(self) -> bool:
+        return bool(self.blobs and self.blobs.pg_ready)
+
+    def _key_col(self) -> str:
+        return "b2key" if self._ready() else "NULL::text"
+
     def _file_row(self, path: str):
         with self.pool.connection() as c:
-            return c.execute("SELECT content, size, modified FROM fileapi_files WHERE path = %s", (path,)).fetchone()
+            return c.execute(f"SELECT content, size, modified, {self._key_col()} FROM fileapi_files WHERE path = %s",
+                             (path,)).fetchone()
+
+    def _content(self, content: str, key: str | None) -> str:
+        return fetch(self.blobs, key).decode("utf-8") if key else content
+
+    def _offload(self, content: str) -> tuple[str, str | None]:
+        """(what goes in the content column, B2 key or None): big files go to B2 when it's set up."""
+        from .blobs import MIN_OBJECT, new_key
+
+        store = self.blobs.active if self.blobs else None
+        data = content.encode("utf-8")
+        if store is None or len(data) < MIN_OBJECT:
+            return content, None
+        key = new_key("file")
+        store.put(key, data)
+        return "", key
+
+    def _drop(self, keys) -> None:
+        delete_quietly(self.blobs.store if self.blobs else None, keys)
 
     def _has_children(self, prefix: str) -> bool:
         if not prefix:
@@ -132,35 +159,52 @@ class PostgresStorage:
             if self._has_children(path):
                 raise StorageError(f"Is a directory: {p}")
             raise NotFound(f"No such file: {p}")
-        return row[0]
+        return self._content(row[0], row[3])
 
     def write(self, p: str, content: str, overwrite: bool) -> tuple[bool, int]:
         path = self._require_file_path(p)
         size = len(content.encode("utf-8"))
-        with self.pool.connection() as c:
-            if overwrite:
+        stored, key = self._offload(content)
+        if not self._ready():
+            with self.pool.connection() as c:
+                if overwrite:
+                    row = c.execute(
+                        """INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s)
+                           ON CONFLICT (path) DO UPDATE SET content = EXCLUDED.content, size = EXCLUDED.size,
+                           modified = now() RETURNING (xmax = 0)""",
+                        (path, content, size),
+                    ).fetchone()
+                    return (bool(row[0]), size)
                 row = c.execute(
-                    """INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s)
-                       ON CONFLICT (path) DO UPDATE SET content = EXCLUDED.content, size = EXCLUDED.size,
-                       modified = now() RETURNING (xmax = 0)""",
+                    "INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1",
                     (path, content, size),
                 ).fetchone()
-                return (bool(row[0]), size)
-            row = c.execute(
-                "INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1",
-                (path, content, size),
-            ).fetchone()
-        if row is None:
-            raise Conflict(f"File already exists: {p} (use write_file or edit_file to change it)")
-        return (True, size)
+            if row is None:
+                raise Conflict(f"File already exists: {p} (use write_file or edit_file to change it)")
+            return (True, size)
+        with self.pool.connection() as c, c.transaction():
+            old = c.execute("SELECT b2key FROM fileapi_files WHERE path = %s FOR UPDATE", (path,)).fetchone()
+            if old is not None and not overwrite:
+                self._drop([key])
+                raise Conflict(f"File already exists: {p} (use write_file or edit_file to change it)")
+            c.execute(
+                """INSERT INTO fileapi_files (path, content, size, b2key) VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (path) DO UPDATE SET content = EXCLUDED.content, size = EXCLUDED.size,
+                   b2key = EXCLUDED.b2key, modified = now()""",
+                (path, stored, size, key),
+            )
+        if old is not None:
+            self._drop([old[0]])
+        return (old is None, size)
 
     def edit(self, p: str, edits: list[Edit]) -> int:
         path = normalize(p)
         with self.pool.connection() as c, c.transaction():
-            row = c.execute("SELECT content FROM fileapi_files WHERE path = %s FOR UPDATE", (path,)).fetchone()
+            row = c.execute(f"SELECT content, {self._key_col()} FROM fileapi_files WHERE path = %s FOR UPDATE",
+                            (path,)).fetchone()
             if row is None:
                 raise NotFound(f"No such file: {p}")
-            content = row[0]
+            content = self._content(row[0], row[1])
             for i, e in enumerate(edits, 1):
                 if not e.old_text:
                     raise StorageError(f"Edit {i}: old_text must not be empty")
@@ -170,15 +214,45 @@ class PostgresStorage:
                 if count > 1:
                     raise StorageError(f"Edit {i}: old_text matches {count} times in {p}; include more context")
                 content = content.replace(e.old_text, e.new_text, 1)
-            c.execute(
-                "UPDATE fileapi_files SET content = %s, size = %s, modified = now() WHERE path = %s",
-                (content, len(content.encode("utf-8")), path),
-            )
+            if self._ready():
+                stored, key = self._offload(content)
+                c.execute("UPDATE fileapi_files SET content = %s, size = %s, b2key = %s, modified = now() "
+                          "WHERE path = %s", (stored, len(content.encode("utf-8")), key, path))
+            else:
+                c.execute(
+                    "UPDATE fileapi_files SET content = %s, size = %s, modified = now() WHERE path = %s",
+                    (content, len(content.encode("utf-8")), path),
+                )
+        if self._ready() and row[1]:
+            self._drop([row[1]])
         return len(edits)
 
     def append(self, p: str, content: str) -> int:
         path = self._require_file_path(p)
         size = len(content.encode("utf-8"))
+        if self._ready():
+            # A file in B2 (or one this append makes big) is rewritten whole; small ones append in SQL.
+            from .blobs import MIN_OBJECT
+
+            with self.pool.connection() as c, c.transaction():
+                row = c.execute("SELECT content, size, b2key FROM fileapi_files WHERE path = %s FOR UPDATE",
+                                (path,)).fetchone()
+                if row is not None and (row[2] or (self.blobs.active and row[1] + size >= MIN_OBJECT)):
+                    whole = self._content(row[0], row[2]) + content
+                    stored, key = self._offload(whole)
+                    c.execute("UPDATE fileapi_files SET content = %s, size = %s, b2key = %s, modified = now() "
+                              "WHERE path = %s", (stored, row[1] + size, key, path))
+                    old_key, total = row[2], row[1] + size
+                else:
+                    old_key = total = None
+            if total is not None:
+                self._drop([old_key])
+                return total
+            if row is None and self.blobs.active and size >= MIN_OBJECT:
+                try:
+                    return self.write(p, content, overwrite=False)[1]
+                except Conflict:
+                    return self.append(p, content)  # someone created it meanwhile
         with self.pool.connection() as c:
             row = c.execute(
                 """INSERT INTO fileapi_files (path, content, size) VALUES (%s, %s, %s)
@@ -193,7 +267,9 @@ class PostgresStorage:
         if not path:
             raise StorageError("Refusing to delete the storage root")
         with self.pool.connection() as c:
-            if c.execute("DELETE FROM fileapi_files WHERE path = %s RETURNING 1", (path,)).fetchone():
+            row = c.execute(f"DELETE FROM fileapi_files WHERE path = %s RETURNING {self._key_col()}", (path,)).fetchone()
+            if row:
+                self._drop([row[0]])
                 return
         if self._has_children(path):
             raise Conflict(f"Directory not empty: {p}")
@@ -210,7 +286,10 @@ class PostgresStorage:
                 if c.execute("SELECT 1 FROM fileapi_files WHERE path = %s", (b,)).fetchone():
                     if not overwrite:
                         raise Conflict(f"Destination exists: {dst}")
-                    c.execute("DELETE FROM fileapi_files WHERE path = %s", (b,))
+                    gone = c.execute(f"DELETE FROM fileapi_files WHERE path = %s RETURNING {self._key_col()}",
+                                     (b,)).fetchone()
+                    if gone:
+                        self._drop([gone[0]])
                 elif self._has_children(b):
                     raise Conflict(f"Destination exists: {dst}")
                 c.execute("UPDATE fileapi_files SET path = %s, modified = now() WHERE path = %s", (b, a))
