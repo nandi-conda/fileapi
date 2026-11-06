@@ -1,6 +1,14 @@
 # CI for fileapi on its own forge (nandi.uk/fileapi). See "Deploy jobs" in README.md.
 # Uses the secrets DEPOT_TOKEN + DEPOT_PROJECT_ID (user secrets) and FASTAPI_TOKEN (repo secret).
 
+# Commits to GitHub's main come in by themselves: the server checks github.com/nandi-conda/fileapi every
+# minute and fast-forwards the forge's main, which runs the deploy job below like any push. No token: the
+# repo is public. So a commit to main deploys whether it was pushed here or to GitHub.
+[upstream]
+url = "https://github.com/nandi-conda/fileapi.git"
+branches = ["main"]
+interval = 60
+
 # Pushes to main deploy to FastAPI Cloud from a Depot build: ci/Dockerfile.deploy runs ci/deploy.py on
 # Depot's builders, with FASTAPI_TOKEN as a build secret. The build output (fastapi deploy's log) is
 # this run's output, with the Depot build link.

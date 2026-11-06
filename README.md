@@ -40,7 +40,7 @@ The atproto client metadata is served at `/oauth/atproto/client-metadata.json` a
 
 fileapi also hosts git repos. Each repo belongs to the signed-in account and lives under its atproto handle: `<handle>/<repo>`, e.g. `nandi.uk/blog`, cloned from `https://<host>/git/nandi.uk/blog.git`. MCP tools and the web UI only need the repo name. Clone and push them with plain git over HTTPS, and create and browse them over MCP.
 
-fileapi itself is mirrored there as `nandi.uk/fileapi` (GitHub stays primary). `just forge-mirror` pushes every GitHub branch and tag to the `forge` remote, and `just deploy` runs it after each deploy.
+fileapi itself lives there as `nandi.uk/fileapi` too. Its `main` follows GitHub's by itself (see [Pull mirrors](#pull-mirrors-upstream)), so a commit to either one deploys. `just forge-mirror` still pushes every GitHub branch and tag to the `forge` remote by hand.
 
 Repos from before owners existed (`<project>/<repo>`) move under the admin's handle the next time the server starts; a name that is already taken becomes `<old project>-<repo>`. The old name stays as an alias, so old clone URLs, remotes and `/forge/#…` links keep working. Renames leave an alias the same way; creating a repo with an alias's name takes the name over. `FILEAPI_FORGE_OWNER` overrides the namespace (default: the admin handle). Git is pure Python ([dulwich](https://www.dulwich.io)), so the host needs no git binary.
 
@@ -199,6 +199,19 @@ url = "https://github.com/me/app.git"
 token = "${GITHUB_MIRROR_TOKEN}"
 ```
 
+#### Pull mirrors (`[upstream]`)
+
+A repo can follow branches of another git host. Put an `[upstream]` table in `.forge/jobs.toml` on its default branch:
+
+```toml
+[upstream]
+url = "https://github.com/me/app.git"   # a public repo; for a private one put a secret in it: https://x-access-token:${GH_READ}@github.com/...
+branches = ["main"]                      # names or globs; default: the repo's default branch
+interval = 60                            # seconds between checks, 30 to 3600
+```
+
+Every server checks the upstream's refs every `interval` (one small request). When a listed branch moved, it fetches just the new commits and fast-forwards the forge branch, compare-and-swap, so two replicas or a push racing it move it once. That counts as a push: the jobs for that branch run as usual, so a commit on GitHub deploys with nothing else to do. A branch the forge has moved past, or that diverged, is left alone (and logged). `POST /api/forge/repos/<owner>/<repo>/upstream/sync` (no sign-in) checks right away, so a GitHub webhook on push events pointed at it makes it instant; it can only ever pull from the URL in the repo's own config. Set `FILEAPI_UPSTREAM=off` to turn polling off.
+
 A `depot_ci` job starts a [Depot CI](https://depot.dev/docs/ci/overview) workflow (`depot ci dispatch`, so the workflow needs `on: workflow_dispatch`) and follows it to the end. Depot CI reads code from GitHub, so pair it with a mirror job and `after`: a job with `after = "<job>"` waits for that job of the same push and runs only if it succeeded (otherwise it shows as `skipped`). `secrets` are copied into Depot CI's secrets for that repo before each dispatch, so the forge stays the one place you set them. It needs `DEPOT_TOKEN` as an organization API token or your user token (a project token can't start CI runs). The run's output shows the Depot links and the record gets `depot.ci_run_id` and `depot.url`. Because the work happens on Depot, a deploy of this server itself is fine: when the new version replaces the replica that was following the run, the new server picks the wait back up at startup, and the outcome still lands in the run.
 
 ```toml
@@ -330,7 +343,7 @@ Then connect a client (below) and sign in as the admin. Tables are created autom
 
 ### Deploys from CI
 
-fileapi's own repo lives on its forge as `nandi.uk/fileapi`, and that's where to push. Its [`.forge/jobs.toml`](.forge/jobs.toml) deploys every push to `main` from a [Depot](https://depot.dev) build: [`ci/Dockerfile.deploy`](ci/Dockerfile.deploy) installs the FastAPI CLI and runs [`ci/deploy.py`](ci/deploy.py) on Depot's builders, with the `FASTAPI_TOKEN` secret mounted as a build secret (never in a layer; nothing is pushed or saved). The code goes straight from the forge to Depot, no GitHub involved, and a deploy that replaces the server running the job doesn't matter: once `fastapi deploy` has uploaded, FastAPI Cloud finishes on its own.
+fileapi's own repo lives on its forge as `nandi.uk/fileapi`. Every commit to `main` deploys, whether it's pushed to the forge or to GitHub: the forge follows `github.com/nandi-conda/fileapi`'s `main` through `[upstream]` and picks a GitHub commit up within a minute, no token needed (the GitHub repo is public). Its [`.forge/jobs.toml`](.forge/jobs.toml) deploys every push to `main` from a [Depot](https://depot.dev) build: [`ci/Dockerfile.deploy`](ci/Dockerfile.deploy) installs the FastAPI CLI and runs [`ci/deploy.py`](ci/deploy.py) on Depot's builders, with the `FASTAPI_TOKEN` secret mounted as a build secret (never in a layer; nothing is pushed or saved). The code goes straight from the forge to Depot, no GitHub involved, and a deploy that replaces the server running the job doesn't matter: once `fastapi deploy` has uploaded, FastAPI Cloud finishes on its own.
 
 `ci/deploy.py` deploys to the app `fileapi` (its ID is in the Dockerfile: deploy tokens can't look an app up by name), checks `DATABASE_URL` and `FILEAPI_SECRETS_KEY` are set there when the token may read env vars (a deploy token gets 403, so it warns; the app refuses to start without `DATABASE_URL` anyway, and FastAPI Cloud then keeps the old version), checks the committed forge UI build is present (CI doesn't run `just ui`), writes the commit to `fileapi/BUILD` (served as `build` in `/health`) and the forge run's ID to `fileapi/BUILD_RUN`, runs `fastapi deploy`, and waits for `/health` to report the commit. The new server marks that run successful when it starts, in case the job died with the replica the deploy replaced.
 

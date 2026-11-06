@@ -2113,3 +2113,92 @@ def test_blob_disk_cache(tmp_path):
     assert sum(f.stat().st_size for f in (tmp_path / "cache").iterdir()) <= 4000
     c.delete(["lfs/n5"])
     assert inner.size("lfs/n5") is None and not (tmp_path / "cache" / "lfs_n5").exists()
+
+
+def test_upstream_pull_mirror(tmp_path, backend):
+    """A repo with [upstream] follows that host's branch: new commits there move the forge branch (a push for
+    the forge's listeners, so deploy jobs run); a forge that's ahead or diverged is left alone."""
+    from dulwich.objects import Blob as GBlob, Commit as GCommit, Tree as GTree
+    from dulwich.repo import Repo
+
+    from fileapi.upstream import parse_upstream
+
+    up_path = tmp_path / "github.git"
+    up = Repo.init_bare(str(up_path), mkdir=True)
+
+    def commit_on(repo, parent: bytes, name: str, text: str) -> bytes:
+        base = repo[repo[parent].tree]
+        blob = GBlob.from_string(text.encode())
+        tree = GTree()
+        for item in base.items():
+            tree.add(item.path, item.mode, item.sha)
+        tree.add(name.encode(), 0o100644, blob.id)
+        c = GCommit()
+        c.tree, c.parents = tree.id, [parent]
+        c.author = c.committer = b"x <x@x>"
+        c.author_time = c.commit_time = 0
+        c.author_timezone = c.commit_timezone = 0
+        c.message = f"add {name}".encode()
+        for o in (blob, tree, c):
+            repo.object_store.add_object(o)
+        return c.id
+
+    toml = f'[upstream]\nurl = "{up_path}"\nbranches = ["main"]\ninterval = 30\n'
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge, upstream = client.app.state.forge, client.app.state.upstream
+        upstream.stop()  # drive it by hand here
+        pushes = []
+
+        class Spy:
+            def on_push(self, repo, updates):
+                pushes.append((repo, updates))
+
+        forge.listeners.append(Spy())
+        forge.create("nandi.uk", "app")
+        c1 = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": toml}, "jobs")["commit"].encode()
+        r = forge.open("nandi.uk/app")
+        try:
+            for sha in list(r.object_store):
+                up.object_store.add_object(r[sha])
+        finally:
+            r.close()
+        up.refs[b"refs/heads/main"] = c1
+        pushes.clear()
+
+        # Nothing new upstream.
+        assert upstream.sync("nandi.uk/app")[0]["status"] == "up to date" and not pushes
+
+        # A commit lands upstream: the forge fast-forwards and tells its listeners (deploy jobs).
+        c2 = commit_on(up, c1, "a.txt", "from github")
+        up.refs[b"refs/heads/main"] = c2
+        res = upstream.sync("nandi.uk/app")
+        assert res[0]["status"] == "updated" and res[0]["sha"] == c2.decode(), res
+        assert forge.branches("nandi.uk/app")["branches"]["main"] == c2.decode()
+        assert pushes == [("nandi.uk/app", [("refs/heads/main", c1.decode(), c2.decode())])]
+        assert forge.raw("nandi.uk/app", "a.txt")[0] == b"from github"
+        assert upstream.sync("nandi.uk/app")[0]["status"] == "up to date" and len(pushes) == 1
+
+        # The forge moved past the upstream: kept. Then the upstream diverges: kept too.
+        c3 = forge.commit_files("nandi.uk/app", "main", {"b.txt": "b"}, "on the forge")["commit"]
+        pushes.clear()
+        res = upstream.sync("nandi.uk/app")
+        assert res[0]["status"] == "kept" and "ahead" in res[0]["reason"], res
+        up.refs[b"refs/heads/main"] = commit_on(up, c2, "c.txt", "elsewhere")
+        res = upstream.sync("nandi.uk/app")
+        assert res[0]["status"] == "kept" and "diverged" in res[0]["reason"], res
+        assert forge.branches("nandi.uk/app")["branches"]["main"] == c3 and not pushes
+
+        # run_once honours the interval; poke (the webhook endpoint) makes the next pass check again.
+        upstream._due.clear()
+        upstream.run_once(now=1000.0)
+        assert upstream._due["nandi.uk/app"] == 1030.0
+        assert client.post("/api/forge/repos/nandi.uk/app/upstream/sync").status_code == 202
+        assert upstream._due["nandi.uk/app"] == 0
+        assert client.post("/api/forge/repos/nope/nope/upstream/sync").status_code == 202
+
+    assert parse_upstream("[[job]]\nname='a'\nrun='x'\n") is None
+    for bad, msg in (("[upstream]\nbranches=['main']\n", "url is required"),
+                     ("[upstream]\nurl='x'\ninterval=5\n", "interval"),
+                     ("[upstream]\nurl='x'\ncolour='red'\n", "unknown upstream setting")):
+        with pytest.raises(StorageError, match=msg):
+            parse_upstream(bad)

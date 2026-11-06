@@ -32,6 +32,7 @@ from .lfs import DiskLfsStore, PgLfsStore, Spool, check_oid
 from .releases import DiskReleaseStore, PgReleaseStore, Releases
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
+from .upstream import Upstream, enabled_from_env as upstream_enabled
 from . import auth as oauth
 from .auth import Auth
 from .tokens import FileKV
@@ -186,6 +187,8 @@ def create_app(
     jobs_on = os.environ.get("FILEAPI_JOBS", "on").strip().lower() not in ("0", "off", "false", "no")
     jobs = Jobs(forge, kv, repo_secrets, enabled=jobs_on, workers=int(os.environ.get("FILEAPI_JOB_WORKERS", 2)))
     jobs.passes = passes
+    # Pull mirrors: repos whose jobs.toml has [upstream] follow that host's branches and deploy when they move.
+    upstream = Upstream(forge, repo_secrets)
     jobs.base_url = public_url.rstrip("/") if public_url else None  # else learned from requests (see below)
     # The admin is pinned by DID; the handle is only a login hint and display name.
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
@@ -213,6 +216,8 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         jobs.resume()  # Depot CI runs a replaced server was still following
+        if jobs.enabled and upstream_enabled():
+            upstream.start()
         # Copy bytes still only in Postgres to B2 (non-destructive; freeing the Postgres copies is a separate,
         # explicit step: the blob_storage MCP tool with action=free).
         if migrator is not None and os.environ.get("FILEAPI_BLOB_COPY", "on").lower() not in ("0", "off", "false", "no"):
@@ -233,14 +238,18 @@ def create_app(
             jobs.finish_self_deploy(BUILD_RUN, BUILD)  # the CI run that deployed this server
         except Exception:  # noqa: BLE001 - never block startup on bookkeeping
             pass
-        async with mcp.session_manager.run():
-            yield
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            upstream.stop()
 
     app = FastAPI(title="fileapi", version="1.6.0", lifespan=lifespan)
     app.state.storage = storage
     app.state.auth = auth
     app.state.forge = forge
     app.state.jobs = jobs
+    app.state.upstream = upstream
     app.state.releases = releases
     app.state.migrator = migrator
 
@@ -884,6 +893,16 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         if branch not in heads:
             raise NotFound(f"No such branch: {branch}")
         return {"runs": jobs.start(full, branch, heads[branch], trigger="manual", job=body.job or None)}
+
+    @app.post("/api/forge/repos/{project}/{repo}/upstream/sync", tags=["forge"], status_code=202)
+    def forge_upstream_sync(project: str, repo: str):
+        """Check the repo's [upstream] now instead of at the next interval. No sign-in: a webhook (GitHub's
+        push event, say) can call it, and all it can do is pull from the URL the repo's own jobs.toml names."""
+        try:
+            upstream.poke(f"{project}/{repo}")
+        except StorageError:
+            pass
+        return {"queued": True}
 
     # ---- Web UI (Qt for WebAssembly build in fileapi/static/forge) --------
     ui_dir = Path(__file__).parent / "static" / "forge"
