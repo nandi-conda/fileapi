@@ -19,6 +19,11 @@ Deploy jobs
         branches = ["main"]           # default: the repo's default branch; ["*"] = every branch
         run = "python deploy.py"      # secrets and FORGE_* variables are in the environment
 
+        [[job]]                       # on a pushed tag: build and publish a release
+        name = "release"
+        tags = ["v*"]                 # tag globs; a job with only tags doesn't run for branch pushes
+        run = "make dist && forge-release upload --create $FORGE_TAG dist/*"
+
         [[job]]                       # an HTTP request (deploy hooks): no shell or curl needed on the host
         name = "render"
         post = "${RENDER_DEPLOY_HOOK}"
@@ -36,6 +41,11 @@ Deploy jobs
 
     A depot job needs the DEPOT_TOKEN secret (a Depot project, organization or user token; repo or user secret). The server downloads the
     Depot CLI the first time it's needed; shell jobs whose script mentions `depot` get it on PATH too.
+
+    Every job gets FORGE_REPO, FORGE_BRANCH (empty for a tag), FORGE_TAG, FORGE_REF, FORGE_SHA, FORGE_BEFORE,
+    FORGE_JOB, FORGE_RUN_ID and FORGE_TRIGGER, plus FORGE_URL, FORGE_API (this repo's /api/forge URL) and
+    FORGE_TOKEN: a credential for this repo only (push, releases; Bearer header) that expires after the
+    job's timeout. Shell jobs have `forge-release` on PATH to create releases and upload assets.
 
     `${NAME}` in post/headers/body (and the depot table) is replaced by that secret or FORGE_* value. Each run (status, output
     with secrets masked, timing) is kept in the KV store, the last RUNS_KEPT per repo.
@@ -284,7 +294,8 @@ def parse_jobs(text: str) -> list[dict]:
             raise StorageError(f"{JOBS_FILE}: job {name!r}: timeout is whole seconds, 1 to {MAX_TIMEOUT}")
         if depot is not None:
             depot = _parse_depot(name, depot)
-        jobs.append({"name": name, "branches": _as_list(j.get("branches"), "branches"), "run": run, "post": post,
+        jobs.append({"name": name, "branches": _as_list(j.get("branches"), "branches"),
+                     "tags": _as_list(j.get("tags"), "tags"), "run": run, "post": post,
                      "depot": depot, "headers": headers, "body": body, "timeout": timeout})
     return jobs
 
@@ -405,6 +416,9 @@ class Jobs:
         self._index_lock = threading.Lock()
         self._futures: set = set()
         self.http = httpx.Client(timeout=60, follow_redirects=False)
+        # Set by the app: jobs get FORGE_TOKEN (a RepoPasses pass for their repo) and FORGE_URL/FORGE_API.
+        self.passes = None
+        self.base_url: str | None = None
         forge.listeners.append(self)
 
     # -- run records ------------------------------------------------------------
@@ -452,12 +466,24 @@ class Jobs:
         if not self.enabled:
             return
         for ref, old, new in updates:
-            if not new or not ref.startswith("refs/heads/"):
+            if not new:
                 continue  # deleted branches and tags don't deploy
             try:
-                self.start(repo, ref[len("refs/heads/"):], new, before=old, trigger="push")
+                if ref.startswith("refs/heads/"):
+                    self.start(repo, ref[len("refs/heads/"):], new, before=old, trigger="push")
+                elif ref.startswith("refs/tags/"):  # jobs with `tags = [...]` (release builds, say)
+                    self.start(repo, "", self._commit_of(repo, new), before=old, trigger="tag",
+                               tag=ref[len("refs/tags/"):])
             except StorageError:
-                continue  # no jobs file, or nothing matches this branch
+                continue  # no jobs file, or nothing matches this branch or tag
+
+    def _commit_of(self, repo: str, sha: str) -> str:
+        """An annotated tag's commit (lightweight tags already point at one)."""
+        r = self.forge.open(repo)
+        try:
+            return self.forge._peel_commit(r, sha.encode()).id.decode()
+        finally:
+            r.close()
 
     def on_rename(self, old: str, new: str) -> None:
         self.secrets.move(old, new)
@@ -498,8 +524,9 @@ class Jobs:
             r.close()
 
     def start(self, repo: str, branch: str, sha: str, *, before: str | None = None, trigger: str = "manual",
-              job: str | None = None) -> list[dict]:
-        """Queue the jobs for a commit on a branch. A named job runs whatever its branches say."""
+              job: str | None = None, tag: str | None = None) -> list[dict]:
+        """Queue the jobs for a commit on a branch (or, with tag, for a pushed tag: the jobs whose `tags`
+        match it). A named job runs whatever its branches or tags say."""
         if not self.enabled:
             raise StorageError("Deploy jobs are turned off on this server (FILEAPI_JOBS=off)")
         jobs = self.jobs_at(repo, sha)
@@ -508,14 +535,19 @@ class Jobs:
             jobs = [j for j in jobs if j["name"] == job]
             if not jobs:
                 raise NotFound(f"No job named {job!r} in {JOBS_FILE}")
+        elif tag:
+            jobs = [j for j in jobs if j["tags"] and _branch_matches(j["tags"], tag, "")]
+            if not jobs:
+                raise NotFound(f"No job in {JOBS_FILE} runs for tag {tag}")
         else:
-            jobs = [j for j in jobs if _branch_matches(j["branches"], branch, default)]
+            # A job with only `tags` runs for tags, not for its repo's default branch.
+            jobs = [j for j in jobs if (j["branches"] or not j["tags"]) and _branch_matches(j["branches"], branch, default)]
             if not jobs:
                 raise NotFound(f"No job in {JOBS_FILE} runs for branch {branch}")
         started = []
         for j in jobs:
             run = {"id": pysecrets.token_hex(8), "repo": repo, "job": j["name"], "kind": _kind(j),
-                   "branch": branch, "sha": sha, "before": before, "trigger": trigger, "status": "queued",
+                   "branch": branch, "tag": tag, "sha": sha, "before": before, "trigger": trigger, "status": "queued",
                    "queued": _now(), "queued_ts": time.time(), "timeout": j["timeout"]}
             self._save_run(run)
             self._add_to_index(repo, run["id"])
@@ -528,12 +560,21 @@ class Jobs:
     # -- running ----------------------------------------------------------------------
     def _execute(self, run: dict, job: dict) -> None:
         secrets = self.secrets.values(run["repo"])
-        out = _Output({k: v for k, v in secrets.items() if k not in UNMASKED})
+        tag = run.get("tag") or ""
+        env = {**secrets, "FORGE_REPO": run["repo"], "FORGE_BRANCH": run["branch"], "FORGE_TAG": tag,
+               "FORGE_REF": f"refs/tags/{tag}" if tag else f"refs/heads/{run['branch']}", "FORGE_SHA": run["sha"],
+               "FORGE_BEFORE": run["before"] or "", "FORGE_JOB": run["job"], "FORGE_RUN_ID": run["id"],
+               "FORGE_TRIGGER": run["trigger"]}
+        masked = {k: v for k, v in secrets.items() if k not in UNMASKED}
+        if self.passes is not None and self.base_url:
+            # A credential for this one repo (git push, releases) that lasts as long as the job can.
+            token, _ = self.passes.issue(run["repo"], job["timeout"] // 60 + 10)
+            env.update(FORGE_URL=self.base_url, FORGE_API=f"{self.base_url}/api/forge/repos/{run['repo']}",
+                       FORGE_TOKEN=token)
+            masked["FORGE_TOKEN"] = token
+        out = _Output(masked)
         run.update(status="running", started=_now(), started_ts=time.time())
         self._save_run(run)
-        env = {**secrets, "FORGE_REPO": run["repo"], "FORGE_BRANCH": run["branch"],
-               "FORGE_REF": f"refs/heads/{run['branch']}", "FORGE_SHA": run["sha"], "FORGE_BEFORE": run["before"] or "",
-               "FORGE_JOB": run["job"], "FORGE_RUN_ID": run["id"], "FORGE_TRIGGER": run["trigger"]}
         status, error, code = "failed", None, None
         try:
             if job["run"] is not None:
@@ -556,6 +597,7 @@ class Jobs:
     def _run_shell(self, run: dict, job: dict, env: dict, out: _Output) -> int:
         sh = shutil.which("bash") or "/bin/sh"
         tools = [self.depot_cli(out)] if re.search(r"\bdepot\b", job["run"]) else []
+        tools.append(self.release_cli())
         return self._run_process(run, job, env, out, lambda src, home: [sh, "-e", "-c", job["run"]], tools)
 
     def _run_process(self, run: dict, job: dict, env: dict, out: _Output, argv, tools=(), after=None) -> int:
@@ -586,6 +628,23 @@ class Jobs:
             return proc.returncode
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+    def release_cli(self) -> str:
+        """A `forge-release` command for jobs: fileapi's release client (git_credential.py release), which
+        reads FORGE_URL, FORGE_REPO and FORGE_TOKEN from the job's environment."""
+        import sys
+
+        dest = Path(self.tools_dir) / "forge-release" / "forge-release"
+        client = Path(__file__).with_name("git_credential.py")
+        script = f'#!/bin/sh\nexec "{sys.executable}" "{client}" release "$@"\n'
+        with self._tools_lock:
+            if not dest.is_file() or dest.read_text() != script:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_name(f".forge-release.{os.getpid()}")
+                tmp.write_text(script)
+                tmp.chmod(0o755)
+                os.replace(tmp, dest)
+        return str(dest)
 
     # -- Depot --------------------------------------------------------------------------
     def depot_cli(self, out: _Output | None = None) -> str:

@@ -48,7 +48,7 @@ def backend(request):
         import psycopg
 
         with psycopg.connect(PG_URL, autocommit=True) as c:
-            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_git_repos, fileapi_git_aliases")
+            c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_release_chunks, fileapi_releases, fileapi_git_repos, fileapi_git_aliases")
         return {"DATABASE_URL": PG_URL}
     return {}
 
@@ -1279,3 +1279,207 @@ esac
     assert not any(p.endswith("/secrets/DEPOT_TOKEN") and "/repos/" in p for _, p, _ in calls) and api == []
     with pytest.raises(SystemExit):
         depot_setup.main([])
+
+
+# ---- releases ------------------------------------------------------------------
+
+
+def test_releases_api(tmp_path, backend):
+    import hashlib
+
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("nandi.uk", "tool")
+        sha = forge.commit_files("nandi.uk/tool", "main", {"a.txt": "a\n"}, "first")["commit"]
+        base = "/api/forge/repos/nandi.uk/tool/releases"
+
+        # Private repo: invisible and read-only without signing in.
+        assert client.get(base).status_code == 404
+        assert client.post(base, json={"tag": "v1.0.0"}).status_code == 401
+        assert client.get(base, headers=AUTH).json() == {"releases": [], "can_edit": True,
+                                                         "max_asset": 2 * 1024 * 1024 * 1024}
+
+        r = client.post(base, json={"tag": "v1.0.0", "name": "First", "notes": "# Hello"}, headers=AUTH)
+        assert r.status_code == 201, r.text
+        rel = r.json()
+        assert rel["tag"] == "v1.0.0" and rel["target"] == sha and rel["tagged"] is False and rel["assets"] == []
+        assert client.post(base, json={"tag": "v1.0.0"}, headers=AUTH).status_code == 409
+        for bad in ("latest", "../x", "a b", ""):
+            assert client.post(base, json={"tag": bad}, headers=AUTH).status_code == 400, bad
+
+        # One-shot upload (curl -T), then a replacement.
+        data = os.urandom(300_000)
+        r = client.put(f"{base}/v1.0.0/assets/tool-linux.tar.gz", content=data, headers=AUTH)
+        assert r.status_code == 201, r.text
+        assert r.json()["size"] == len(data) and r.json()["sha256"] == hashlib.sha256(data).hexdigest()
+        assert r.json()["state"] == "ready" and r.json()["content_type"] == "application/x-tar"
+        r = client.put(f"{base}/v1.0.0/assets/tool-linux.tar.gz", content=data[:10], headers=AUTH)
+        assert r.json()["size"] == 10
+        client.put(f"{base}/v1.0.0/assets/tool-linux.tar.gz", content=data, headers=AUTH)
+
+        # In pieces, with the offset checked and the sha256 verified at the end.
+        big = os.urandom(9 * 1024 * 1024 + 5)
+        url = f"{base}/v1.0.0/assets/big.bin"
+        assert client.put(url, params={"final": "false"}, content=big[:4_000_000], headers=AUTH).status_code == 200
+        r = client.put(url, params={"offset": 123, "final": "false"}, content=big[4_000_000:], headers=AUTH)
+        assert r.status_code == 409 and "offset=4000000" in r.json()["detail"]
+        listed = client.get(base, headers=AUTH).json()["releases"][0]["assets"]
+        assert [(a["name"], a["state"]) for a in listed] == [("tool-linux.tar.gz", "ready"), ("big.bin", "uploading")]
+        assert client.get(url, headers=AUTH).status_code == 404  # not downloadable until complete
+        r = client.put(url, params={"offset": 4_000_000, "sha256": hashlib.sha256(big).hexdigest()},
+                       content=big[4_000_000:], headers=AUTH)
+        assert r.status_code == 200 and r.json()["state"] == "ready" and r.json()["size"] == len(big)
+        r = client.get(url, headers=AUTH)
+        assert r.content == big and r.headers["content-length"] == str(len(big))
+        assert "attachment" in r.headers["content-disposition"]
+        bad = client.put(f"{base}/v1.0.0/assets/x.bin", params={"sha256": "0" * 64}, content=b"abc", headers=AUTH)
+        assert bad.status_code == 400 and "mismatch" in bad.json()["detail"]
+        assert "x.bin" not in str(client.get(base, headers=AUTH).json())
+        for bad_name in (".hidden", "a\\b"):
+            assert client.put(f"{base}/v1.0.0/assets/{bad_name}", content=b"x", headers=AUTH).status_code == 400
+        assert client.put(f"{base}/v9/assets/x.bin", content=b"x", headers=AUTH).status_code == 404
+        r = client.put(f"{base}/v9/assets/x.bin", params={"create": "true"}, content=b"x", headers=AUTH)
+        assert r.status_code == 201 and client.get(f"{base}/v9", headers=AUTH).json()["assets"][0]["name"] == "x.bin"
+
+        # Private repo: download_url is a signed link that works without a header (and only for that file).
+        signed = client.get(f"{base}/v1.0.0", headers=AUTH).json()["assets"][0]["download_url"]
+        assert "?dl=" in signed
+        path = signed.split("testserver", 1)[1]
+        assert client.get(path).content == data
+        assert client.get(path.replace("tool-linux.tar.gz", "big.bin")).status_code == 404
+        assert client.get(path.split("?")[0]).status_code == 404
+
+        # Drafts and prereleases; `latest` is the newest published release.
+        client.post(base, json={"tag": "v2.0.0-rc1", "prerelease": True}, headers=AUTH)
+        client.post(base, json={"tag": "v2.0.0", "draft": True}, headers=AUTH)
+        client.delete(f"{base}/v9", headers=AUTH)
+        assert client.get(f"{base}/latest", headers=AUTH).json()["tag"] == "v1.0.0"
+        forge.set_public("nandi.uk/tool", True)
+        tags = [r["tag"] for r in client.get(base).json()["releases"]]
+        assert tags == ["v2.0.0-rc1", "v1.0.0"]  # anonymous: no drafts
+        assert client.get(base).json()["can_edit"] is False
+        assert client.get(f"{base}/v2.0.0").status_code == 404
+        assert "?dl=" not in client.get(f"{base}/latest").json()["assets"][0]["download_url"]
+        assert client.get(f"{base}/latest/assets/tool-linux.tar.gz").content == data
+        assert client.put(f"{base}/v1.0.0/assets/y", content=b"y").status_code == 401
+        r = client.patch(f"{base}/v2.0.0", json={"draft": False, "notes": "Done"}, headers=AUTH)
+        assert r.status_code == 200 and r.json()["draft"] is False
+        assert client.get(f"{base}/latest").json()["tag"] == "v2.0.0"
+        downloads = client.get(f"{base}/v1.0.0").json()["assets"][0]["downloads"]
+        assert downloads >= 2
+
+        # A repo pass (repo_remote_url, a job's FORGE_TOKEN) can publish; for this repo only.
+        passes = client.app.state.forge  # noqa: F841 - the pass issuer lives in the app closure
+        from fileapi.forge import RepoPasses
+
+        cred, _ = RepoPasses(client.app.state.auth.kv).issue("nandi.uk/tool", 5)
+        r = client.put(f"{base}/v2.0.0/assets/ci.txt", content=b"from ci", headers={"Authorization": f"Bearer {cred}"})
+        assert r.status_code == 201, r.text
+        other, _ = RepoPasses(client.app.state.auth.kv).issue("nandi.uk/other", 5)
+        assert client.put(f"{base}/v2.0.0/assets/ci.txt", content=b"x",
+                          headers={"Authorization": f"Bearer {other}"}).status_code == 401
+
+        # Rename a release onto a git tag: it points at the tagged commit.
+        sha2 = forge.commit_files("nandi.uk/tool", "main", {"a.txt": "b\n"}, "second")["commit"]
+        r = forge.open("nandi.uk/tool")
+        r.refs[b"refs/tags/v2.0.1"] = sha2.encode()
+        r.close()
+        r = client.patch(f"{base}/v2.0.0", json={"tag": "v2.0.1"}, headers=AUTH)
+        assert r.json()["tag"] == "v2.0.1" and r.json()["target"] == sha2 and r.json()["tagged"] is True
+
+        # Releases follow a repo rename and go with a delete.
+        assert client.patch("/api/forge/repos/nandi.uk/tool", json={"name": "tool2"}, headers=AUTH).status_code == 200
+        base2 = "/api/forge/repos/nandi.uk/tool2/releases"
+        assert client.get(f"{base2}/v1.0.0/assets/big.bin", headers=AUTH).content == big
+        assert client.delete(f"{base2}/v1.0.0/assets/big.bin", headers=AUTH).status_code == 204
+        assert client.get(f"{base2}/v1.0.0/assets/big.bin", headers=AUTH).status_code == 404
+        assert client.delete(f"{base2}/v1.0.0", headers=AUTH).status_code == 204
+        assert [r["tag"] for r in client.get(base2, headers=AUTH).json()["releases"]] == ["v2.0.1", "v2.0.0-rc1"]
+        assert client.delete("/api/forge/repos/nandi.uk/tool2", headers=AUTH).status_code == 204
+        forge.create("nandi.uk", "tool2")
+        assert client.get(base2, headers=AUTH).json()["releases"] == []
+
+
+RELEASE_JOBS = """
+[[job]]
+name = "publish"
+tags = ["v*"]
+run = '''
+echo "built for $FORGE_TAG" > notes.txt
+forge-release upload --create "$FORGE_TAG" notes.txt
+echo "token=$FORGE_TOKEN"
+'''
+
+[[job]]
+name = "deploy"
+run = "echo deploy"
+"""
+
+
+@pytest.mark.anyio
+async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
+    """A pushed tag runs the jobs with `tags`, which publish with forge-release; the CLI and MCP tools
+    see the result."""
+    r = httpx.post(f"{server_url}/api/forge/repos", json={"name": "rel"}, headers=AUTH)
+    assert r.status_code == 201, r.text
+    remote = server_url.replace("://", f"://x:{TOKEN}@") + "/git/nandi.uk/rel.git"
+    work = tmp_path / "work"
+    work.mkdir()
+    git("init", "-b", "main", cwd=work)
+    (work / ".forge").mkdir()
+    (work / ".forge" / "jobs.toml").write_text(RELEASE_JOBS)
+    git("add", ".", cwd=work)
+    git("commit", "-m", "jobs", cwd=work)
+    git("push", remote, "main", cwd=work)
+    git("tag", "-a", "v1.0", "-m", "one", cwd=work)
+    git("push", remote, "v1.0", cwd=work)
+
+    api = f"{server_url}/api/forge/repos/nandi.uk/rel"
+    for _ in range(200):
+        runs = httpx.get(f"{api}/runs", headers=AUTH).json()["runs"]
+        if len(runs) == 2 and all(x["status"] not in ("queued", "running") for x in runs):
+            break
+        time.sleep(0.1)
+    by_job = {x["job"]: x for x in runs}
+    assert set(by_job) == {"publish", "deploy"}, runs  # main push -> deploy only; tag push -> publish only
+    pub = httpx.get(f"{api}/runs/{by_job['publish']['id']}", headers=AUTH).json()
+    assert pub["status"] == "success" and pub["tag"] == "v1.0" and pub["trigger"] == "tag", pub
+    assert "token=***" in pub["output"]
+    rel = httpx.get(f"{api}/releases/v1.0", headers=AUTH).json()
+    assert rel["tagged"] is True and [a["name"] for a in rel["assets"]] == ["notes.txt"]
+    assert httpx.get(rel["assets"][0]["download_url"]).text == "built for v1.0\n"
+
+    # The CLI, signed in with a token, inside the clone (repo and server come from the remote).
+    git("remote", "add", "origin", f"{server_url}/git/nandi.uk/rel.git", cwd=work)
+    big = work / "big.bin"
+    big.write_bytes(os.urandom(3 * 1024 * 1024 + 7))
+    cli = [sys.executable, str(Path(__file__).parent.parent / "fileapi" / "git_credential.py"), "release"]
+    env = {**os.environ, "FILEAPI_TOKEN": TOKEN, "GIT_CONFIG_GLOBAL": os.devnull}
+    for k in ("FORGE_URL", "FORGE_REPO", "FORGE_TOKEN"):
+        env.pop(k, None)
+
+    def run(*args):
+        return subprocess.run([*cli, *args], cwd=work, env=env, capture_output=True, text=True)
+
+    r = run("create", "v1.1", "--notes", "Second", "--draft")
+    assert r.returncode == 0, r.stderr
+    r = run("upload", "--piece", "1m", "v1.1", str(big))
+    assert r.returncode == 0, r.stderr
+    assert "v1.1\tv1.1 [draft]" in run("list").stdout
+    r = run("download", "v1.1", "-o", str(tmp_path / "dl"))
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "dl" / "big.bin").read_bytes() == big.read_bytes()
+    assert run("publish", "v1.1").returncode == 0
+    assert run("upload", "nope", str(big)).returncode == 1
+
+    async with connect(server_url, TOKEN) as c:
+        listing = text(await c.call_tool("list_releases", {"repo": "rel"}))
+        assert listing.index("v1.1") < listing.index("v1.0") and "big.bin  3.0 MiB" in listing
+        r = await c.call_tool("upload_release_asset", {"repo": "rel", "tag": "v2", "name": "sum.txt",
+                                                       "text": "abc\n", "create": True})
+        assert not r.is_error, text(r)
+        assert "Bearer fg_" in text(await c.call_tool("release_upload_url", {"repo": "rel", "tag": "v2"}))
+        assert "Done" in text(await c.call_tool("update_release", {"repo": "rel", "tag": "v2", "name": "Done"}))
+        assert not (await c.call_tool("delete_release_asset", {"repo": "rel", "tag": "v2", "name": "sum.txt"})).is_error
+        assert not (await c.call_tool("delete_release", {"repo": "rel", "tag": "v2"})).is_error
+        assert (await c.call_tool("delete_release", {"repo": "rel", "tag": "v2"})).is_error

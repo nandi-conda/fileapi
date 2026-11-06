@@ -54,6 +54,7 @@ def build_mcp(
     passes: RepoPasses | None = None,
     owner: str = "admin",
     jobs=None,
+    releases=None,
 ) -> MCPServer:
     mcp = MCPServer(
         name="fileapi",
@@ -137,6 +138,8 @@ def build_mcp(
         _register_forge_tools(mcp, forge, guard, public_url, passes, owner)
         if jobs is not None:
             _register_deploy_tools(mcp, forge, jobs, guard, owner)
+        if releases is not None and passes is not None:
+            _register_release_tools(mcp, forge, releases, passes, guard, public_url, owner)
 
     return mcp
 
@@ -466,3 +469,156 @@ def _register_deploy_tools(mcp: MCPServer, forge: Forge, jobs, guard, default_ow
             return f"No runs yet. Commit {JOBS_FILE} to {full} and push, or call run_deploy."
         return "\n".join(f"{r['id']}  {r['status']:<8} {r['job']}  {r['branch']}@{r['sha'][:12]}  "
                          f"{r.get('started') or r.get('queued')}  {r['trigger']}" for r in runs)
+
+
+TagArg = Annotated[str, Field(description="Release tag, e.g. v1.2.0 (need not exist in git)")]
+
+
+def _human(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return str(n)
+
+
+def _register_release_tools(mcp: MCPServer, forge: Forge, releases, passes, guard, public_url: str | None,
+                            default_owner: str) -> None:
+    import base64
+    import io
+    from urllib.parse import quote
+
+    def full_name(ctx: Context, repo: str) -> str:
+        full = forge.canonical(qualify(repo, _owner(ctx, default_owner)))
+        forge.open(full).close()
+        return full
+
+    def api(ctx: Context, full: str) -> str:
+        return f"{_base_url(ctx, public_url)}/api/forge/repos/{full}/releases"
+
+    def describe(ctx: Context, full: str, rel: dict) -> str:
+        flags = [f for f in ("draft", "prerelease") if rel.get(f)]
+        target = (rel.get("target") or "")[:12] or "no commit"
+        lines = [f"{rel['tag']}  {rel['name']}" + (f"  [{', '.join(flags)}]" if flags else "")
+                 + f"  @{target}{'' if rel.get('tagged') else ' (no git tag)'}  created {rel['created']}"]
+        private = not forge.is_public(full)
+        for a in rel["assets"]:
+            url = f"{api(ctx, full)}/{quote(rel['tag'])}/assets/{quote(a['name'])}"
+            if private:
+                url += "?dl=" + passes.sign_link(f"{full}/{rel['tag']}/{a['name']}")
+            state = "" if a["state"] == "ready" else f"  ({a['state']})"
+            lines.append(f"  {a['name']}  {_human(a['size'])}{state}  {url}")
+        return "\n".join(lines)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def list_releases(ctx: Context, repo: RepoArg,
+                      tag: Annotated[str, Field(description="Show only this release, with its notes")] = "") -> str:
+        """A repo's releases, newest first, with their assets and download URLs (private repos: signed links
+        that work for an hour)."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        if tag.strip():
+            rel = guard(ctx, lambda: releases.get(full, tag.strip()))
+            return describe(ctx, full, rel) + "\n\n" + (rel["notes"] or "(no notes)")
+        rels = guard(ctx, lambda: releases.list(full))
+        if not rels:
+            return f"{full} has no releases. Make one with create_release."
+        return "\n\n".join(describe(ctx, full, r) for r in rels)
+
+    @mcp.tool(structured_output=False)
+    def create_release(
+        ctx: Context,
+        repo: RepoArg,
+        tag: TagArg,
+        name: Annotated[str, Field(description="Title; default: the tag")] = "",
+        notes: Annotated[str, Field(description="Release notes (Markdown)")] = "",
+        ref: Annotated[str, Field(description="Commit to point at when the tag isn't in git; default: the default branch")] = "",
+        prerelease: bool = False,
+        draft: Annotated[bool, Field(description="Hidden from anyone not signed in until published")] = False,
+    ) -> str:
+        """Create a release. Then add files with upload_release_asset (small) or release_upload_url (big)."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        rel = guard(ctx, lambda: releases.create(full, tag, name, notes, ref.strip() or None, prerelease, draft))
+        return "Created release:\n" + describe(ctx, full, rel)
+
+    @mcp.tool(structured_output=False)
+    def update_release(
+        ctx: Context,
+        repo: RepoArg,
+        tag: TagArg,
+        new_tag: Annotated[str, Field(description="Rename the release to this tag")] = "",
+        name: Annotated[str | None, Field(description="New title")] = None,
+        notes: Annotated[str | None, Field(description="New notes (replaces them)")] = None,
+        prerelease: bool | None = None,
+        draft: Annotated[bool | None, Field(description="false publishes a draft")] = None,
+    ) -> str:
+        """Change a release's tag, title, notes or flags. Leave a field out to keep it."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        rel = guard(ctx, lambda: releases.update(full, tag, name=name, notes=notes, prerelease=prerelease,
+                                                 draft=draft, new_tag=new_tag.strip() or None))
+        return "Updated:\n" + describe(ctx, full, rel)
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def delete_release(ctx: Context, repo: RepoArg, tag: TagArg) -> str:
+        """Delete a release and all its assets (the git tag, if any, stays)."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        guard(ctx, lambda: releases.delete(full, tag))
+        return f"Deleted release {tag} of {full}."
+
+    @mcp.tool(structured_output=False)
+    def upload_release_asset(
+        ctx: Context,
+        repo: RepoArg,
+        tag: TagArg,
+        name: Annotated[str, Field(description="File name of the asset, e.g. app-linux-x86_64.tar.gz")],
+        content_base64: Annotated[str, Field(description="The file's bytes, base64. Up to about 7 MB; for "
+                                                         "bigger files use release_upload_url")] = "",
+        text: Annotated[str, Field(description="Or the file as UTF-8 text (checksums, notes)")] = "",
+        create: Annotated[bool, Field(description="Create the release if it doesn't exist")] = False,
+    ) -> str:
+        """Add (or replace) a small file on a release."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        if bool(content_base64) == bool(text):
+            raise ToolError("Give exactly one of content_base64 or text")
+        try:
+            data = base64.b64decode(content_base64, validate=True) if content_base64 else text.encode()
+        except ValueError:
+            raise ToolError("content_base64 is not valid base64") from None
+
+        def go():
+            if create:
+                try:
+                    releases.get(full, tag)
+                except StorageError:
+                    releases.create(full, tag)
+            return releases.upload(full, tag, name, io.BytesIO(data), len(data))
+
+        a = guard(ctx, go)
+        return f"Uploaded {a['name']} ({_human(a['size'])}, sha256 {a['sha256']}) to {full} {tag}."
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True), structured_output=False)
+    def delete_release_asset(ctx: Context, repo: RepoArg, tag: TagArg, name: str) -> str:
+        """Remove one file from a release."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        guard(ctx, lambda: releases.delete_asset(full, tag, name))
+        return f"Deleted {name} from {full} {tag}."
+
+    @mcp.tool(structured_output=False)
+    def release_upload_url(
+        ctx: Context,
+        repo: RepoArg,
+        tag: TagArg,
+        minutes: Annotated[int, Field(description="How long the credential works (1 to 1440)")] = 60,
+    ) -> str:
+        """A short-lived credential and curl commands to upload big release assets straight to the server
+        (from a shell, outside MCP). Works for this one repo only."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        cred, expires = passes.issue(full, minutes)
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))
+        url = f"{api(ctx, full)}/{quote(tag)}/assets"
+        return (f"Credential for {full} until {when} (Authorization: Bearer header):\n{cred}\n\n"
+                f"Upload a file (creates the release if needed):\n"
+                f'  curl -fsS -H "Authorization: Bearer {cred}" -T dist/app.tar.gz "{url}/app.tar.gz?create=true"\n'
+                f"Or with the fileapi release client (splits big files into pieces):\n"
+                f"  FORGE_TOKEN={cred} FORGE_URL={_base_url(ctx, public_url)} FORGE_REPO={full} "
+                f"git-credential-fileapi release upload --create {tag} dist/*\n"
+                f"Assets up to {_human(releases.max_asset)}.")

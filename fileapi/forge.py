@@ -1080,3 +1080,17 @@ class RepoPasses:
             return False
         return (hmac.compare_digest(sig, self._sig(payload)) and pass_repo == repo
                 and int(expires) > time.time())
+
+    # Signed download links (release assets of private repos), so a browser can fetch one without
+    # sending a header. They only open the one thing they name, and only until they expire.
+    def sign_link(self, path: str, minutes: int = 60) -> str:
+        expires = int(time.time()) + max(1, min(int(minutes), self.MAX_MINUTES)) * 60
+        return f"{expires}.{self._sig(f'dl|{path}|{expires}')}"
+
+    def check_link(self, value: str | None, path: str) -> bool:
+        import hmac
+
+        expires, _, sig = (value or "").partition(".")
+        if not expires.isdigit() or int(expires) < time.time():
+            return False
+        return hmac.compare_digest(sig, self._sig(f"dl|{path}|{expires}"))

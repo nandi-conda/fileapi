@@ -25,8 +25,20 @@ Settings (git config, any scope): fileapi.lfsThreshold (bytes, k/m/g suffixes ok
 off) and fileapi.autoLfs (auto = repos with a fileapi remote, true = every repo, false = never).
 For a repo cloned before setup, run `git-credential-fileapi lfs-install` inside it.
 
+Releases: `git-credential-fileapi release ...` (or `fileapi-release ...`, a link `just git-setup` makes)
+creates releases and uploads assets, splitting big files into pieces:
+
+    fileapi-release upload --create v1.2.0 dist/*      # makes the release if needed, uploads the files
+    fileapi-release create v1.2.0 --notes-file CHANGES.md [--title ...] [--draft] [--prerelease]
+    fileapi-release list | download v1.2.0 [NAME...] [-o DIR] | publish v1.2.0 | delete v1.2.0 [NAME]
+
+The repo comes from --repo owner/name, $FORGE_REPO, or the current git repo's fileapi remote; the server
+from --url, $FORGE_URL or that remote. The credential is $FORGE_TOKEN (deploy jobs get one), else
+$FILEAPI_TOKEN, else this helper's browser sign-in.
+
 Commands: get / store / erase (the git credential protocol), setup [url], login [url], logout [url],
-status, lfs-install, pre-commit (the hook). Standard library only, so the file runs anywhere python3 does.
+status, lfs-install, pre-commit (the hook), release. Standard library only, so the file runs anywhere
+python3 does.
 """
 
 from __future__ import annotations
@@ -461,9 +473,186 @@ def setup(base: str) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- releases
+
+RELEASE_PIECE = 32 * 1024 * 1024  # below the request-size limits of hosting proxies
+
+
+def _remote_repo() -> tuple[str, str] | None:
+    """(server base, owner/name) from the current repo's remote that points at a fileapi /git/ URL."""
+    try:
+        remotes = _git("remote").stdout.split()
+    except OSError:
+        return None
+    for name in (["origin"] if "origin" in remotes else []) + [r for r in remotes if r != "origin"]:
+        url = _git("remote", "get-url", name).stdout.strip()
+        p = urllib.parse.urlparse(url)
+        parts = p.path.strip("/").split("/")
+        if p.scheme in ("http", "https") and p.hostname and len(parts) == 3 and parts[0] == "git":
+            host = p.hostname + (f":{p.port}" if p.port else "")
+            return f"{p.scheme}://{host}", f"{parts[1]}/{parts[2].removesuffix('.git')}"
+    return None
+
+
+class _ReleaseClient:
+    def __init__(self, url: str | None, repo: str | None):
+        url = url or os.environ.get("FORGE_URL")
+        repo = repo or os.environ.get("FORGE_REPO")
+        remote = None if (url and repo) else _remote_repo()
+        self.base = _base(url or (remote[0] if remote else None) or os.environ.get("FILEAPI_URL") or DEFAULT_URL)
+        self.repo = repo or (remote[1] if remote else "")
+        if self.repo.count("/") != 1:
+            raise RuntimeError("which repo? pass --repo <owner>/<name> (or run inside a clone of it)")
+        self.api = f"{self.base}/api/forge/repos/{self.repo}/releases"
+        token = os.environ.get("FORGE_TOKEN") or os.environ.get("FILEAPI_TOKEN")
+        if not token:
+            entry = token_for(self.base)
+            token = entry["access_token"] if entry else None
+        if not token:
+            raise RuntimeError(f"not signed in to {self.base}")
+        self.token = token
+
+    def call(self, method: str, path: str = "", body=None, query: dict | None = None,
+             data: bytes | None = None, ctype: str | None = None, raw: bool = False):
+        url = self.api + path + ("?" + urllib.parse.urlencode(query) if query else "")
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json", "User-Agent": NAME}
+        if body is not None:
+            data, ctype = json.dumps(body).encode(), "application/json"
+        if ctype:
+            headers["Content-Type"] = ctype
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.load(e).get("detail")
+            except ValueError:
+                detail = None
+            raise RuntimeError(f"{method} {url.split('?')[0]}: HTTP {e.code} {detail or e.reason}") from None
+        if raw:
+            return resp
+        with resp:
+            text = resp.read()
+        return json.loads(text) if text else None
+
+    def ensure(self, tag: str) -> None:
+        try:
+            self.call("GET", f"/{urllib.parse.quote(tag)}")
+        except RuntimeError as e:
+            if "HTTP 404" not in str(e):
+                raise
+            self.call("POST", body={"tag": tag})
+            _log(f"created release {tag}")
+
+    def upload(self, tag: str, path: str, piece: int = RELEASE_PIECE) -> dict:
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                h.update(chunk)
+        url = f"/{urllib.parse.quote(tag)}/assets/{urllib.parse.quote(name)}"
+        offset = 0
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(piece)
+                final = offset + len(data) >= size
+                q = {"offset": offset, "final": "true" if final else "false"}
+                if final:
+                    q["sha256"] = h.hexdigest()
+                out = self.call("PUT", url, query=q, data=data, ctype="application/octet-stream")
+                offset += len(data)
+                if final:
+                    return out
+
+
+def release_main(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="fileapi-release", description="Releases on a fileapi forge repo")
+    ap.add_argument("--url", help="server, e.g. https://fileapi.fastapicloud.dev (default: $FORGE_URL or the remote)")
+    ap.add_argument("--repo", help="<owner>/<name> (default: $FORGE_REPO or the current repo's remote)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="releases, newest first")
+    c = sub.add_parser("create", help="make a release")
+    c.add_argument("tag")
+    c.add_argument("--title", default="")
+    c.add_argument("--notes", default="")
+    c.add_argument("--notes-file")
+    c.add_argument("--ref", help="commit to point at when the tag isn't in git (default: the default branch)")
+    c.add_argument("--prerelease", action="store_true")
+    c.add_argument("--draft", action="store_true")
+    u = sub.add_parser("upload", help="upload files (replacing ones of the same name)")
+    u.add_argument("tag")
+    u.add_argument("files", nargs="+")
+    u.add_argument("--create", action="store_true", help="make the release first if it doesn't exist")
+    u.add_argument("--piece", default="32m", help="upload big files in pieces of this size (default 32m)")
+    d = sub.add_parser("download", help="download assets (all of them by default); tag may be 'latest'")
+    d.add_argument("tag")
+    d.add_argument("names", nargs="*")
+    d.add_argument("-o", "--output", default=".", help="directory to save into")
+    sub.add_parser("publish", help="publish a draft").add_argument("tag")
+    x = sub.add_parser("delete", help="delete a release, or one of its assets")
+    x.add_argument("tag")
+    x.add_argument("name", nargs="?")
+    a = ap.parse_args(argv)
+
+    def q(tag: str) -> str:
+        return "/" + urllib.parse.quote(tag)
+
+    try:
+        cl = _ReleaseClient(a.url, a.repo)
+        if a.cmd == "list":
+            for r in cl.call("GET")["releases"]:
+                flags = "".join(f" [{f}]" for f in ("draft", "prerelease") if r.get(f))
+                print(f"{r['tag']}\t{r['name']}{flags}\t{r['created']}")
+                for asset in r["assets"]:
+                    print(f"  {asset['name']}\t{_human(asset['size'])}\t{asset['state']}")
+        elif a.cmd == "create":
+            notes = open(a.notes_file).read() if a.notes_file else a.notes
+            r = cl.call("POST", body={"tag": a.tag, "name": a.title, "notes": notes, "ref": a.ref,
+                                      "prerelease": a.prerelease, "draft": a.draft})
+            _log(f"created release {r['tag']} at {(r.get('target') or 'no commit')[:12]}")
+        elif a.cmd == "upload":
+            piece = _parse_size(a.piece) or RELEASE_PIECE
+            if a.create:
+                cl.ensure(a.tag)
+            for path in a.files:
+                out = cl.upload(a.tag, path, piece=piece)
+                _log(f"uploaded {out['name']} ({_human(out['size'])}) to {a.tag}")
+        elif a.cmd == "download":
+            rel = cl.call("GET", q(a.tag))
+            assets = [x for x in rel["assets"] if x["state"] == "ready" and (not a.names or x["name"] in a.names)]
+            missing = set(a.names) - {x["name"] for x in assets}
+            if missing:
+                raise RuntimeError(f"no such asset in {rel['tag']}: {', '.join(sorted(missing))}")
+            os.makedirs(a.output, exist_ok=True)
+            for asset in assets:
+                dest = os.path.join(a.output, asset["name"])
+                with cl.call("GET", f"{q(rel['tag'])}/assets/{urllib.parse.quote(asset['name'])}", raw=True) as r, \
+                        open(dest, "wb") as f:
+                    while chunk := r.read(1024 * 1024):
+                        f.write(chunk)
+                _log(f"saved {dest}")
+        elif a.cmd == "publish":
+            cl.call("PATCH", q(a.tag), body={"draft": False})
+            _log(f"published {a.tag}")
+        elif a.cmd == "delete":
+            cl.call("DELETE", q(a.tag) + (f"/assets/{urllib.parse.quote(a.name)}" if a.name else ""))
+            _log(f"deleted {a.tag + ' ' + a.name if a.name else 'release ' + a.tag}")
+    except (RuntimeError, OSError) as e:
+        _log(str(e))
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if os.path.basename(sys.argv[0] or "").startswith("fileapi-release"):
+        return release_main(argv)
     cmd = argv[0] if argv else ""
+    if cmd == "release":
+        return release_main(argv[1:])
     base = _base(argv[1] if len(argv) > 1 else os.environ.get("FILEAPI_URL", DEFAULT_URL))
     if cmd == "get":
         return _git_get(_read_attrs())

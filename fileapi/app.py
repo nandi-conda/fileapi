@@ -12,7 +12,9 @@ import base64
 import contextlib
 import gzip
 import os
+import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -24,6 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .deploy import KEY_ENV, JOBS_FILE, Jobs, RepoSecrets, SecretsUnavailable, parse_key
 from .forge import SERVICES, DiskForgeStore, Forge, PgForgeStore, RepoPasses, owner_name, split_repo
 from .lfs import DiskLfsStore, PgLfsStore, Spool, check_oid
+from .releases import DiskReleaseStore, PgReleaseStore, Releases
 from .mcp_server import build_mcp
 from .storage import Conflict, Edit, NotFound, Storage, StorageError
 from . import auth as oauth
@@ -59,6 +62,24 @@ class SecretBody(BaseModel):
 class RunBody(BaseModel):
     ref: str | None = None  # branch to run for (default: the default branch)
     job: str | None = None  # one job by name, whatever its branches say
+    tag: str | None = None  # run the jobs for this pushed tag instead (their `tags` globs), as a tag push would
+
+
+class NewReleaseBody(BaseModel):
+    tag: str
+    name: str = ""
+    notes: str = ""
+    ref: str | None = None  # commit to point at when the tag isn't in git (default: the default branch)
+    prerelease: bool = False
+    draft: bool = False
+
+
+class ReleaseUpdateBody(BaseModel):
+    tag: str | None = None  # rename
+    name: str | None = None
+    notes: str | None = None
+    prerelease: bool | None = None
+    draft: bool | None = None
 
 
 class NewRepoBody(BaseModel):
@@ -110,6 +131,7 @@ def create_app(
         kv = PostgresKV(storage)
         forge = Forge(PgForgeStore(storage.pool))
         lfs = PgLfsStore(storage.pool)
+        release_store = PgReleaseStore(storage.pool)
     else:
         storage = Storage(root)
         storage.init()
@@ -122,13 +144,18 @@ def create_app(
             raise RuntimeError("FILEAPI_GIT_ROOT must be outside FILEAPI_ROOT")
         forge = Forge(DiskForgeStore(git))
         lfs = DiskLfsStore(git)
+        release_store = DiskReleaseStore(git)
     forge.store.init()
     lfs.init()
+    release_store.init()
+    releases = Releases(forge, release_store, int(os.environ.get("FILEAPI_RELEASE_MAX_ASSET", 2 * 1024 * 1024 * 1024)))
     passes = RepoPasses(kv)
     # Repo secrets are encrypted under FILEAPI_SECRETS_KEY; without it they're off (the rest still works).
     repo_secrets = RepoSecrets(kv, parse_key(os.environ.get(KEY_ENV)))
     jobs_on = os.environ.get("FILEAPI_JOBS", "on").strip().lower() not in ("0", "off", "false", "no")
     jobs = Jobs(forge, kv, repo_secrets, enabled=jobs_on, workers=int(os.environ.get("FILEAPI_JOB_WORKERS", 2)))
+    jobs.passes = passes
+    jobs.base_url = public_url.rstrip("/") if public_url else None  # else learned from requests (see below)
     # The admin is pinned by DID; the handle is only a login hint and display name.
     admin_did = admin_did or os.environ.get("FILEAPI_ADMIN_DID") or oauth.ADMIN_DID
     admin_handle = os.environ.get("FILEAPI_ADMIN_HANDLE") or (oauth.ADMIN_HANDLE if admin_did == oauth.ADMIN_DID else "")
@@ -142,7 +169,7 @@ def create_app(
     def owner_of(did: str | None) -> str | None:
         return owner if did and did == auth.admin_did else None
 
-    mcp = build_mcp(storage, public_url, forge, passes, owner, jobs)
+    mcp = build_mcp(storage, public_url, forge, passes, owner, jobs, releases)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -162,6 +189,13 @@ def create_app(
     app.state.auth = auth
     app.state.forge = forge
     app.state.jobs = jobs
+    app.state.releases = releases
+
+    def learn_base(request: Request) -> None:
+        """Jobs need this server's public URL (FORGE_URL); without FILEAPI_PUBLIC_URL, take it from a
+        signed-in request (a push, a run), which came in through the public address."""
+        if not public_url:
+            jobs.base_url = oauth.base_url(request, None)
 
     @app.middleware("http")
     async def mcp_auth(request: Request, call_next):
@@ -178,6 +212,7 @@ def create_app(
             request.scope.setdefault("state", {})["authed"] = True
             request.scope["state"]["did"] = did
             request.scope["state"]["owner"] = owner_of(did)
+            learn_base(request)
         return await call_next(request)
 
     def require_token(request: Request) -> None:
@@ -307,6 +342,8 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
             body += chunk
             if len(body) > max_push:
                 raise HTTPException(413, f"Request larger than FILEAPI_GIT_MAX_PUSH ({max_push} bytes)")
+        if service == "git-receive-pack":
+            learn_base(request)
         data = await run_in_threadpool(forge.rpc, full, service, bytes(body), request.headers.get("content-encoding"))
         return Response(data, media_type=f"application/x-{service}-result", headers={"Cache-Control": "no-cache"})
 
@@ -527,6 +564,121 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
         forge.delete(f"{project}/{repo}")
         return Response(status_code=204)
 
+    # ---- Releases -----------------------------------------------------------
+    # Read like the repo (public: anyone; private: signed in, or a signed download link); write as the
+    # admin or with a pass for the repo (repo_remote_url, or FORGE_TOKEN inside a deploy job).
+    def release_reader(request: Request, project: str, repo: str) -> tuple[str, bool]:
+        """(repo, whether the caller may see drafts)."""
+        full = forge.canonical(f"{project}/{repo}")
+        token = _request_token(request)
+        if passes.check(token, full) or forge_viewer(request):
+            forge.open(full).close()
+            return full, True
+        if not forge.is_public(full):
+            raise NotFound(f"No such repo: {full}")
+        return full, False
+
+    def release_writer(request: Request, project: str, repo: str) -> str:
+        full = forge.canonical(f"{project}/{repo}")
+        if not passes.check(_request_token(request), full):
+            forge_admin(request)
+        forge.open(full).close()
+        return full
+
+    def with_links(request: Request, full: str, rel: dict) -> dict:
+        base = f"{oauth.base_url(request, public_url)}/api/forge/repos/{full}/releases"
+        private = not forge.is_public(full)
+        for a in rel["assets"]:
+            path = f"{full}/{rel['tag']}/{a['name']}"
+            url = f"{base}/{quote(rel['tag'])}/assets/{quote(a['name'])}"
+            a["download_url"] = f"{url}?dl={passes.sign_link(path)}" if private else url
+        return rel
+
+    @app.get("/api/forge/repos/{project}/{repo}/releases", tags=["forge"])
+    def forge_releases(request: Request, project: str, repo: str):
+        full, drafts = release_reader(request, project, repo)
+        return {"releases": [with_links(request, full, r) for r in releases.list(full, drafts)],
+                "can_edit": drafts and (passes.check(_request_token(request), full)
+                                        or owner_of(auth.identify(_request_token(request))) is not None),
+                "max_asset": releases.max_asset}
+
+    @app.post("/api/forge/repos/{project}/{repo}/releases", tags=["forge"], status_code=201)
+    def forge_create_release(request: Request, project: str, repo: str, body: NewReleaseBody):
+        """Create a release. If the tag exists in git it points at that commit, else at `ref`'s."""
+        full = release_writer(request, project, repo)
+        rel = releases.create(full, body.tag, body.name, body.notes, body.ref, body.prerelease, body.draft)
+        return with_links(request, full, rel)
+
+    @app.get("/api/forge/repos/{project}/{repo}/releases/{tag}", tags=["forge"])
+    def forge_release(request: Request, project: str, repo: str, tag: str):
+        """One release; `latest` is the newest that isn't a draft or prerelease."""
+        full, drafts = release_reader(request, project, repo)
+        return with_links(request, full, releases.get(full, tag, drafts))
+
+    @app.patch("/api/forge/repos/{project}/{repo}/releases/{tag}", tags=["forge"])
+    def forge_update_release(request: Request, project: str, repo: str, tag: str, body: ReleaseUpdateBody):
+        full = release_writer(request, project, repo)
+        rel = releases.update(full, tag, name=body.name, notes=body.notes, prerelease=body.prerelease,
+                              draft=body.draft, new_tag=body.tag)
+        return with_links(request, full, rel)
+
+    @app.delete("/api/forge/repos/{project}/{repo}/releases/{tag}", tags=["forge"], status_code=204)
+    def forge_delete_release(request: Request, project: str, repo: str, tag: str):
+        releases.delete(release_writer(request, project, repo), tag)
+        return Response(status_code=204)
+
+    @app.put("/api/forge/repos/{project}/{repo}/releases/{tag}/assets/{name}", tags=["forge"])
+    async def forge_upload_asset(request: Request, project: str, repo: str, tag: str, name: str,
+                                 offset: int = Query(0, ge=0), final: bool = True, sha256: str | None = None,
+                                 create: bool = False):
+        """Upload an asset as the raw request body (`curl -T file`). Big files can come in pieces: the first
+        with offset=0, the next with offset=<bytes sent so far>, all but the last with final=false.
+        create=true makes the release first if it doesn't exist."""
+        full = await run_in_threadpool(release_writer, request, project, repo)
+        if create and offset == 0:
+            try:
+                await run_in_threadpool(releases.get, full, tag)
+            except NotFound:
+                try:
+                    await run_in_threadpool(releases.create, full, tag)
+                except Conflict:
+                    pass  # made by a parallel upload meanwhile
+        limit = releases.max_asset - offset
+        spool = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, prefix="release-")
+        try:
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, f"Asset larger than FILEAPI_RELEASE_MAX_ASSET ({releases.max_asset} bytes)")
+                spool.write(chunk)
+            spool.seek(0)
+            asset = await run_in_threadpool(lambda: releases.upload(
+                full, tag, name, spool, size, offset=offset, final=final,
+                content_type=request.headers.get("content-type"), sha256=sha256))
+        finally:
+            spool.close()
+        return JSONResponse(asset, status_code=201 if offset == 0 and final else 200)
+
+    @app.get("/api/forge/repos/{project}/{repo}/releases/{tag}/assets/{name}", tags=["forge"])
+    def forge_download_asset(request: Request, project: str, repo: str, tag: str, name: str, dl: str | None = None):
+        """Download an asset. Private repos: sign in, or use the asset's download_url (a signed link)."""
+        full = forge.canonical(f"{project}/{repo}")
+        if dl is not None and passes.check_link(dl, f"{full}/{tag}/{name}"):
+            drafts = True
+        else:
+            full, drafts = release_reader(request, project, repo)
+        asset, data = releases.open_asset(full, tag, name, drafts)
+        disposition = "attachment; filename*=UTF-8''" + quote(asset["name"])
+        return StreamingResponse(data, media_type=asset["content_type"] or "application/octet-stream",
+                                 headers={"Content-Length": str(asset["size"]), "Content-Disposition": disposition,
+                                          "X-Checksum-Sha256": asset["sha256"] or "", "Cache-Control": "no-cache"})
+
+    @app.delete("/api/forge/repos/{project}/{repo}/releases/{tag}/assets/{name}", tags=["forge"], status_code=204)
+    def forge_delete_asset(request: Request, project: str, repo: str, tag: str, name: str):
+        releases.delete_asset(release_writer(request, project, repo), tag, name)
+        return Response(status_code=204)
+
     # Secrets (write-only: names and dates come back, never values) and deploy jobs. Admin only, runs too,
     # since a job's output can say things about the deploy target.
     def admin_repo(request: Request, project: str, repo: str) -> str:
@@ -585,7 +737,14 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_start_run(request: Request, project: str, repo: str, body: RunBody | None = None):
         """Run the jobs for a branch's current commit now (all that match it, or one by name)."""
         full = admin_repo(request, project, repo)
+        learn_base(request)
         body = body or RunBody()
+        if body.tag:
+            tags = forge.branches(full).get("tags", {})
+            if body.tag not in tags:
+                raise NotFound(f"No such tag: {body.tag}")
+            sha = jobs._commit_of(full, tags[body.tag])
+            return {"runs": jobs.start(full, "", sha, trigger="manual", job=body.job or None, tag=body.tag)}
         branch = (body.ref or forge.branches(full).get("default") or "main").strip()
         heads = forge.branches(full).get("branches", {})
         if branch not in heads:
