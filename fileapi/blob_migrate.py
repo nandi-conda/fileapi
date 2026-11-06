@@ -66,6 +66,8 @@ class Migrator:
         with self.pool.connection() as c:
             keep = self._reachable(c) if reachable_only else None
         for table, pk, col, kind in TABLES:
+            if table == "fileapi_git_objects" and not _blobs.GIT_TO_BLOBS:
+                continue  # git objects stay in Postgres (see blobs.GIT_TO_BLOBS)
             with self.pool.connection() as c:
                 rows = self._candidates(c, table, pk, col)
             skipped = 0
@@ -102,6 +104,8 @@ class Migrator:
         store = self._store()
         report = {}
         for table, pk, col, _ in TABLES:
+            if table == "fileapi_git_objects" and not _blobs.GIT_TO_BLOBS:
+                continue  # git objects stay in Postgres
             cond = " AND ".join(f"{k} = %s" for k in pk)
             with self.pool.connection() as c:
                 rows = c.execute(
@@ -170,6 +174,55 @@ class Migrator:
                     f"coalesce(sum({size}) FILTER (WHERE b2key IS NOT NULL AND {empty}), 0) FROM {table}").fetchone()
                 out[table] = {"postgres_only": [row[0], int(row[1])], "both": [row[2], int(row[3])],
                               "b2_only": [row[4], int(row[5])]}
+        return out
+
+    def restore_git(self) -> dict:
+        """Bring git objects that an earlier version moved to B2 back into Postgres (they're read in bulk by
+        clones and pushes). The B2 copy stays until a sweep, so this is safe to stop and re-run."""
+        if _blobs.GIT_TO_BLOBS:
+            return {"skipped": "FILEAPI_BLOB_GIT is on"}
+        store = self.cfg.store
+        if store is None:
+            raise RuntimeError("B2 isn't configured, so objects stored there can't be read")
+        with self.pool.connection() as c:
+            rows = c.execute("SELECT repo_id, sha, b2key FROM fileapi_git_objects "
+                             "WHERE data IS NULL AND b2key IS NOT NULL").fetchall()
+        done = nbytes = 0
+        for i, (rid, sha, key) in enumerate(rows):
+            self.status.update(table="fileapi_git_objects", row=i, rows=len(rows))
+            data = store.get(key)
+            with self.pool.connection() as c:
+                c.execute("UPDATE fileapi_git_objects SET data = %s WHERE repo_id = %s AND sha = %s AND data IS NULL",
+                          (data, rid, sha))
+            done += 1
+            nbytes += len(data)
+        return {"restored": done, "bytes": nbytes, "left": len(rows) - done}
+
+    def _retry_restore(self, delay: float = 1800, tries: int = 48) -> None:
+        def again():
+            try:
+                log.info("git restore retry: %s", self.restore_git())
+            except Exception as e:  # noqa: BLE001
+                log.warning("Restoring git objects from B2 failed again: %s", e)
+                if tries > 1:
+                    self._retry_restore(delay, tries - 1)
+
+        t = threading.Timer(delay, again)
+        t.daemon = True
+        t.start()
+
+    def startup(self, kv=None, token: str = "") -> dict:
+        """What runs after each start: put git objects back in Postgres, copy the rest, free once if CI asked."""
+        try:
+            out = {"restore_git": self.restore_git()}
+        except Exception as e:  # noqa: BLE001 - e.g. B2's daily download cap: retry later, carry on now
+            log.warning("Restoring git objects from B2 failed (retrying in 30 min): %s", e)
+            out = {"restore_git": {"error": str(e)}}
+            self._retry_restore()
+        if token and kv is not None:
+            out.update(self.copy_then_free(kv, token))
+        else:
+            out["copy"] = self.copy()
         return out
 
     def copy_then_free(self, kv=None, token: str = "") -> dict:

@@ -39,6 +39,9 @@ DEFAULT_BUCKET = "fileapi"
 # Git blobs at least this big (compressed) and stored files at least this big go to the bucket; smaller ones
 # stay in Postgres, where reading many of them (a clone, a tree listing) is one query instead of many requests.
 MIN_OBJECT = int(os.environ.get("FILEAPI_BLOB_MIN_BYTES", 32 * 1024))
+# Git objects stay in Postgres unless this is on: a clone or push reads many of them, and each B2 read is a billed
+# (and on free accounts capped) download. They're small enough for the database (~100 MB for every repo here).
+GIT_TO_BLOBS = os.environ.get("FILEAPI_BLOB_GIT", "off").strip().lower() in ("1", "on", "true", "yes")
 
 
 class BlobError(StorageError):
@@ -239,6 +242,85 @@ class B2Blobs:
                 return
 
 
+class CachedBlobs:
+    """A local disk cache in front of a blob store. Blob names are random and blobs never change, so a cached
+    copy is always right. B2 bills (and on a free account caps) every download, and a replica serves the same
+    release asset or LFS object many times: reads hit B2 once per replica. Uploads are cached too (write-through).
+    The disk is ephemeral on FastAPI Cloud, which only costs a re-download after a restart."""
+
+    def __init__(self, inner, root: str | os.PathLike, max_bytes: int):
+        self.inner, self.max_bytes = inner, max_bytes
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.name = inner.name
+        self._lock = threading.Lock()
+        self._used = sum(f.stat().st_size for f in self.root.glob("*") if f.is_file())
+
+    def __getattr__(self, attr):  # check(), bucket_id, ... of the inner store
+        return getattr(self.inner, attr)
+
+    def _path(self, key: str) -> Path:
+        return self.root / key.replace("/", "_")
+
+    def _keep(self, key: str, data: bytes) -> None:
+        if len(data) > self.max_bytes // 4:
+            return
+        p = self._path(key)
+        tmp = p.with_name(p.name + f".{threading.get_ident()}.tmp")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, p)
+        except OSError as e:
+            log.warning("Blob cache write failed: %s", e)
+            tmp.unlink(missing_ok=True)
+            return
+        with self._lock:
+            self._used += len(data)
+            if self._used > self.max_bytes:
+                self._evict()
+
+    def _evict(self) -> None:
+        files = sorted((f for f in self.root.glob("*") if f.is_file() and not f.name.endswith(".tmp")),
+                       key=lambda f: f.stat().st_atime)
+        for f in files:
+            if self._used <= self.max_bytes * 0.8:
+                break
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                self._used -= size
+            except OSError:
+                pass
+
+    def put(self, key: str, data: bytes) -> None:
+        self.inner.put(key, data)
+        self._keep(key, data)
+
+    def get(self, key: str) -> bytes:
+        p = self._path(key)
+        try:
+            data = p.read_bytes()
+            os.utime(p)  # recently used: evicted last
+            return data
+        except FileNotFoundError:
+            pass
+        data = self.inner.get(key)
+        self._keep(key, data)
+        return data
+
+    def size(self, key: str) -> int | None:
+        return self.inner.size(key)
+
+    def delete(self, keys: Iterable[str]) -> None:
+        keys = list(keys)
+        for k in keys:
+            self._path(k).unlink(missing_ok=True)
+        self.inner.delete(keys)
+
+    def list(self, prefix: str = ""):
+        return self.inner.list(prefix)
+
+
 def delete_quietly(blobs, keys: Iterable[str | None]) -> None:
     """Delete blobs whose rows are gone; a failure only leaves an orphan for `fileapi blobs sweep`."""
     keys = [k for k in keys if k]
@@ -281,7 +363,18 @@ def from_config(env=os.environ, secrets_: dict | None = None, build: dict | None
             log.warning("B2 is only half configured: it needs a key ID (B2_KEY_ID) and its application key "
                         "(B2_APPLICATION_KEY or B2_TOKEN)")
         return None
-    return B2Blobs(key_id, app_key, (src.get("B2_BUCKET") or DEFAULT_BUCKET).strip())
+    store = B2Blobs(key_id, app_key, (src.get("B2_BUCKET") or DEFAULT_BUCKET).strip())
+    cache_max = int(env.get("FILEAPI_BLOB_CACHE_MAX", 1024 * 1024 * 1024))
+    if cache_max <= 0:
+        return store
+    import tempfile
+
+    root = env.get("FILEAPI_BLOB_CACHE") or os.path.join(tempfile.gettempdir(), "fileapi-blob-cache")
+    try:
+        return CachedBlobs(store, root, cache_max)
+    except OSError as e:
+        log.warning("No blob cache (%s): reading straight from B2", e)
+        return store
 
 
 class BlobConfig:

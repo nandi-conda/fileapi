@@ -157,7 +157,7 @@ def _register_blob_tools(mcp: MCPServer, migrator, guard) -> None:
             "status (default): where bytes live and the last run. copy: upload big rows still only in Postgres "
             "to B2 (keeps the Postgres copy; safe). free: drop the Postgres copy of rows verified in B2, then "
             "VACUUM (deletes data from the database). sweep: list blobs in B2 no row points at; with apply=true "
-            "delete them"))] = "status",
+            "delete them. restore_git: bring git objects stored in B2 back into Postgres"))] = "status",
         apply: bool = False,
     ) -> str:
         """Move bulky bytes (big git blobs, LFS objects, release assets, big files) from Postgres to Backblaze B2
@@ -173,8 +173,8 @@ def _register_blob_tools(mcp: MCPServer, migrator, guard) -> None:
                 if cfg.pg_ready:
                     out["rows"] = migrator.counts()
                 return json.dumps(out, indent=1, default=str)
-            if action not in ("copy", "free", "sweep"):
-                raise StorageError("action must be status, copy, free or sweep")
+            if action not in ("copy", "free", "sweep", "restore_git"):
+                raise StorageError("action must be status, copy, free, sweep or restore_git")
             if cfg.active is None:
                 raise StorageError("B2 isn't set up: needs B2_KEY_ID (CI config) and the B2_TOKEN or "
                                    "B2_APPLICATION_KEY user secret, and room in the database for the blob columns")

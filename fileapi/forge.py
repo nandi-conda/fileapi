@@ -339,7 +339,16 @@ class PgObjectStore(MemoryObjectStore):
             ).fetchone()
         if row is None:
             raise KeyError(key[1])
-        data = row[1] if row[1] is not None else fetch(self.blobs, row[2])  # big blobs live in B2
+        data = row[1]
+        if data is None:  # moved to B2 earlier: read it there and bring it back into Postgres
+            data = fetch(self.blobs, row[2])
+            if not _blobs.GIT_TO_BLOBS:
+                try:
+                    with self.pool.connection() as c:
+                        c.execute("UPDATE fileapi_git_objects SET data = %s WHERE repo_id = %s AND sha = %s "
+                                  "AND data IS NULL", (data, self.repo_id, bytes.fromhex(key[1].decode())))
+                except Exception:  # noqa: BLE001 - the read still succeeds
+                    pass
         value = (row[0], zlib.decompress(data))
         with _CACHE_LOCK:
             _OBJ_CACHE[key] = value
@@ -360,7 +369,7 @@ class PgObjectStore(MemoryObjectStore):
             return
         store = self.blobs.active if self.blobs else None
         big = [i for i, r in enumerate(rows) if r[2] == Blob.type_num and len(r[3]) >= _blobs.MIN_OBJECT]
-        if store is not None and big:
+        if store is not None and big and _blobs.GIT_TO_BLOBS:
             self._add_offloaded(store, rows, big)
             rows = [r for i, r in enumerate(rows) if i not in set(big)]
             if not rows:

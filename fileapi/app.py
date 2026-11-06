@@ -224,9 +224,9 @@ def create_app(
                     # the KV record makes it run on one replica, one time per token.
                     token = build_config().get("B2_FREE", "")
                     if token and kv.create(f"blob_free_{token}", {"state": "running"}):
-                        migrator.run_background("copy_then_free", kv=kv, token=token)
+                        migrator.run_background("startup", kv=kv, token=token)
                     else:
-                        migrator.run_background("copy")
+                        migrator.run_background("startup")
             except Exception:  # noqa: BLE001 - never block startup on this
                 pass
         try:

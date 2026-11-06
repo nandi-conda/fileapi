@@ -1853,6 +1853,7 @@ def test_blob_storage_offload_and_migration(tmp_path, monkeypatch):
     with psycopg.connect(PG_URL, autocommit=True) as c:
         c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_release_chunks, fileapi_releases, fileapi_git_repos, fileapi_git_aliases")
     monkeypatch.setattr(blobs_mod, "MIN_OBJECT", 1000)
+    monkeypatch.setattr(blobs_mod, "GIT_TO_BLOBS", True)
     monkeypatch.setenv("FILEAPI_BLOB_COPY", "off")
     big_text = os.urandom(3000).hex() + "\n"
     zblob = os.urandom(5000)
@@ -1946,9 +1947,9 @@ def test_b2_config_sources(monkeypatch):
     from fileapi.blobs import B2Blobs, from_config
 
     assert from_config({}, {}, {}) is None
-    s = from_config({}, {"B2_TOKEN": "K005secret"}, {"B2_KEY_ID": "0053abc", "B2_BUCKET": "fileapi"})
+    s = from_config({"FILEAPI_BLOB_CACHE_MAX": "0"}, {"B2_TOKEN": "K005secret"}, {"B2_KEY_ID": "0053abc", "B2_BUCKET": "fileapi"})
     assert isinstance(s, B2Blobs) and (s.key_id, s.app_key, s.bucket) == ("0053abc", "K005secret", "fileapi")
-    s = from_config({"B2_BUCKET": "other"}, {"B2_TOKEN": "id1:key1"}, {})
+    s = from_config({"B2_BUCKET": "other", "FILEAPI_BLOB_CACHE_MAX": "0"}, {"B2_TOKEN": "id1:key1"}, {})
     assert (s.key_id, s.app_key, s.bucket) == ("id1", "key1", "other")
     assert from_config({}, {"B2_TOKEN": "K005secret"}, {}) is None  # no key ID anywhere
 
@@ -2043,5 +2044,60 @@ def test_ci_can_ask_for_one_free(tmp_path, monkeypatch):
         assert client.app.state.migrator.counts()["fileapi_files"]["b2_only"][0] == 1
         assert client.app.state.storage.read("big.txt") == big
     with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:  # same token: not again
-        _t.sleep(0.2)
-        assert client.app.state.migrator.status.get("step") == "copy"
+        mig = client.app.state.migrator
+        for _ in range(100):
+            if mig.status.get("state") == "done":
+                break
+            _t.sleep(0.05)
+        assert "copy" in mig.status["result"] and "free" not in mig.status["result"]
+
+
+def test_git_objects_come_back_from_blobs(tmp_path, monkeypatch):
+    """Git objects an earlier version put in B2 are read back into Postgres (and new ones stay there)."""
+    import psycopg
+
+    from fileapi import blobs as blobs_mod
+
+    if not PG_URL:
+        pytest.skip("set TEST_DATABASE_URL to run Postgres tests")
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute("DROP TABLE IF EXISTS fileapi_files, fileapi_kv, fileapi_git_objects, fileapi_git_refs, fileapi_lfs_chunks, fileapi_lfs_objects, fileapi_release_chunks, fileapi_releases, fileapi_git_repos, fileapi_git_aliases")
+    monkeypatch.setattr(blobs_mod, "MIN_OBJECT", 1000)
+    monkeypatch.setenv("FILEAPI_BLOB_COPY", "off")
+    monkeypatch.setenv("FILEAPI_BLOBS", "memory")
+    a, b = os.urandom(3000).hex(), os.urandom(3000).hex()
+    with TestClient(app_for(tmp_path, database_url=PG_URL)) as client:
+        forge, mig = client.app.state.forge, client.app.state.migrator
+        monkeypatch.setattr(blobs_mod, "GIT_TO_BLOBS", True)
+        forge.commit_files("o/r" if forge.create("o", "r") else "o/r", "main", {"a.txt": a, "b.txt": b}, "one")
+        assert mig.counts()["fileapi_git_objects"]["b2_only"][0] == 2
+        monkeypatch.setattr(blobs_mod, "GIT_TO_BLOBS", False)
+        import fileapi.forge as forge_mod
+
+        forge_mod._OBJ_CACHE.clear()
+        assert forge.browse("o/r", "a.txt")["content"] == a  # read-through puts it back
+        assert mig.counts()["fileapi_git_objects"]["b2_only"][0] == 1
+        assert mig.restore_git()["restored"] == 1
+        assert mig.counts()["fileapi_git_objects"]["b2_only"][0] == 0
+        forge.commit_files("o/r", "main", {"c.txt": os.urandom(3000).hex()}, "two")
+        assert mig.counts()["fileapi_git_objects"]["b2_only"][0] == 0
+        assert mig.free()["fileapi_lfs_chunks"]["freed"] == 0 and "fileapi_git_objects" not in mig.free()
+
+
+def test_blob_disk_cache(tmp_path):
+    from fileapi.blobs import CachedBlobs, MemoryBlobs
+
+    inner = MemoryBlobs()
+    calls = []
+    real_get = inner.get
+    inner.get = lambda k: (calls.append(k), real_get(k))[1]
+    c = CachedBlobs(inner, tmp_path / "cache", 4000)
+    c.put("lfs/a", b"x" * 900)
+    assert c.get("lfs/a") == b"x" * 900 and calls == []  # written through
+    inner.put("lfs/b", b"y" * 900)
+    assert c.get("lfs/b") == c.get("lfs/b") and calls == ["lfs/b"]  # one download
+    for i in range(6):
+        c.put(f"lfs/n{i}", b"z" * 900)
+    assert sum(f.stat().st_size for f in (tmp_path / "cache").iterdir()) <= 4000
+    c.delete(["lfs/n5"])
+    assert inner.size("lfs/n5") is None and not (tmp_path / "cache" / "lfs_n5").exists()
