@@ -587,6 +587,17 @@ def test_forge_json_api_and_web_ui(tmp_path, backend):
         assert int(wasm.headers["x-uncompressed-length"]) == len(wasm.content)
         assert client.get("/forge/qtloader.js").headers["content-type"].startswith("text/javascript")
 
+        # Favicon and app icons live at the root, and both pages link them.
+        assert '/favicon.svg' in page.text and '/apple-touch-icon.png' in page.text
+        assert '/favicon.svg' in client.get("/").text
+        ico = client.get("/favicon.ico")
+        assert ico.status_code == 200 and ico.headers["content-type"] == "image/x-icon" and ico.content[:4] == b"\0\0\1\0"
+        assert client.get("/favicon.svg").headers["content-type"].startswith("image/svg+xml")
+        for name in ("apple-touch-icon.png", "apple-touch-icon-precomposed.png", "icon-192.png", "icon-512.png"):
+            r = client.get(f"/{name}")
+            assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n", name
+        assert client.get("/site.webmanifest").json()["start_url"] == "/forge/"
+
 
 def test_repos_move_under_the_owner_and_keep_old_urls(tmp_path, backend):
     from fileapi.forge import RepoPasses

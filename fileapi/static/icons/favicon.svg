@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>fileapi forge</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26324d"/>
+      <stop offset="1" stop-color="#141a29"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff6a2b"/>
+      <stop offset="1" stop-color="#ffc24a"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <g transform="translate(0 3)">
+  <!-- a commit graph rising off the anvil like sparks: trunk plus one branch -->
+  <path d="M26 27V14M26 22c0-6 14-4 14-11" fill="none" stroke="url(#ember)" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="26" cy="12" r="4.5" fill="#ffc24a"/>
+  <circle cx="40" cy="10" r="4.5" fill="#ffb03f"/>
+  <!-- anvil -->
+  <path fill="#e8edf6" d="M6 29h48v7h-5c-4 0-6 3-6 6v1h5v8H16v-8h5v-1c0-3-2-5.5-6-6.5C10 34.5 7 32.5 6 29z"/>
+  <path fill="#9fb0cc" d="M16 49h32v2H16z"/>
+  </g>
+</svg>

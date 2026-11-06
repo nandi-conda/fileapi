@@ -243,6 +243,8 @@ def create_app(
         )
         return HTMLResponse(f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>fileapi</title>
+<link rel=icon href="/favicon.ico" sizes="48x48"><link rel=icon href="/favicon.svg" type="image/svg+xml">
+<link rel=apple-touch-icon href="/apple-touch-icon.png"><link rel=manifest href="/site.webmanifest">
 <style>body{{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:0 1rem;background:#fafafa;color:#1a1a1a}}
 code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all}}
 @media (prefers-color-scheme:dark){{body{{background:#121212;color:#eee}}code{{background:#2a2a2a}}}}</style></head>
@@ -253,6 +255,22 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 <p><b>Git repos:</b> <code>{base}/git/{owner}/&lt;repo&gt;.git</code> (public repos clone anonymously; for the rest install the <a href="/git-credential-fileapi">git credential helper</a> and git signs you in in the browser, or use the <code>repo_remote_url</code> MCP tool)</p>
 <p><b>Repo browser:</b> <a href="/forge/">/forge/</a></p>
 <p><b>REST API docs:</b> <a href="/docs">/docs</a></p></body></html>""")
+
+    # ---- Favicon and app icons (fileapi/static/icons), at the root where browsers look for them ----
+    icons_dir = Path(__file__).parent / "static" / "icons"
+    icon_files = {"favicon.ico": "image/x-icon", "favicon.svg": "image/svg+xml", "apple-touch-icon.png": "image/png",
+                  "icon-32.png": "image/png", "icon-192.png": "image/png", "icon-512.png": "image/png",
+                  "site.webmanifest": "application/manifest+json"}
+
+    def _icon_route(name: str, media_type: str):
+        def serve():
+            return FileResponse(icons_dir / name, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
+        return serve
+
+    for _name, _type in icon_files.items():
+        app.get(f"/{_name}", include_in_schema=False)(_icon_route(_name, _type))
+    # Older iOS asks for this name when the page links no icon.
+    app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)(_icon_route("apple-touch-icon.png", "image/png"))
 
     @app.get("/git-credential-fileapi", include_in_schema=False)
     def git_credential_helper():
