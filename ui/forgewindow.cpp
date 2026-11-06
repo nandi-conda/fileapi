@@ -12,6 +12,8 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDesktopServices>
@@ -257,6 +259,16 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_clone = new QLineEdit;
     m_clone->setReadOnly(true);
     cloneRow->addWidget(m_clone, 1);
+    auto *copyClone = new QPushButton("Copy");
+    copyClone->setIcon(style()->standardIcon(QStyle::SP_FileLinkIcon));
+    copyClone->setToolTip("Copy the git clone command");
+    cloneRow->addWidget(copyClone);
+    connect(copyClone, &QPushButton::clicked, this, [this] {
+        if (m_clone->text().isEmpty())
+            return;
+        QGuiApplication::clipboard()->setText(m_clone->text());
+        status("Copied: " + m_clone->text(), false);
+    });
     m_headRow->addWidget(m_cloneRow, 1);
     lay->addLayout(m_headRow);
     connect(m_ref, &QComboBox::textActivated, this, [this] {
@@ -1037,6 +1049,7 @@ void ForgeWindow::openRepo(const QString &repo, Nav nav)
         m_desc->setToolTip(desc);
         m_title->setText(m_repo + (info.value("public").toBool() ? "" : "  (private)"));
         m_clone->setText("git clone " + info.value("clone_url").toString());
+        m_clone->setCursorPosition(0);  // show the start, not the tail
         const QString def = info.value("default").toString();
         const QJsonObject branches = info.value("branches").toObject();
         const QJsonObject tags = info.value("tags").toObject();
