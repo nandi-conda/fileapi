@@ -95,6 +95,9 @@ def main() -> None:
     if missing:
         fail(f"The forge UI build is missing {', '.join(missing)} in {ui}: run `just ui` and commit the result.")
     Path("fileapi/BUILD").write_text(sha + "\n")
+    run_id = os.environ.get("FORGE_RUN", "").rstrip("/").rsplit("/", 1)[-1]
+    if len(run_id) == 16:  # the forge run: the new server marks it done if its job dies with the old replica
+        Path("fileapi/BUILD_RUN").write_text(run_id + "\n")
     import shutil
 
     cli = [CLI] if shutil.which(CLI) else [sys.executable, "-m", "fastapi"]

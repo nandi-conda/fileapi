@@ -1697,3 +1697,17 @@ secrets = ["FASTAPI_TOKEN"]
         got = client.get(f"{base}/runs/{stuck['id']}", headers=AUTH).json()
         assert got["status"] == "success" and "picked up the wait" in got["output"]
         assert jobs.resume() == 0
+
+
+def test_finish_self_deploy(tmp_path):
+    with TestClient(app_for(tmp_path)) as client:
+        jobs = client.app.state.jobs
+        run = {"id": "cd" * 8, "repo": "nandi.uk/app", "job": "deploy", "status": "running", "sha": "a" * 40,
+               "started_ts": time.time() - 30, "output": "deploying\n"}
+        jobs.kv.put(f"forge_run_{run['id']}", run)
+        assert not jobs.finish_self_deploy(run["id"], "b" * 40)  # some other commit is live
+        assert jobs.finish_self_deploy(run["id"], "a" * 40)
+        got = jobs.kv.get(f"forge_run_{run['id']}")
+        assert got["status"] == "success" and "is live" in got["output"]
+        assert not jobs.finish_self_deploy(run["id"], "a" * 40)  # already recorded
+        assert not jobs.finish_self_deploy("nope", None)

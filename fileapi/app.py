@@ -107,10 +107,16 @@ def _request_token(request: Request) -> str | None:
 
 
 # The commit this server was deployed from: CI writes it to fileapi/BUILD before deploying (not in git).
-try:
-    BUILD = (Path(__file__).with_name("BUILD").read_text().strip() or None)
-except OSError:
-    BUILD = None
+# BUILD_RUN is the forge run that deployed it, finished at startup if its job died with the old replica.
+def _build_file(name: str) -> str | None:
+    try:
+        return Path(__file__).with_name(name).read_text().strip() or None
+    except OSError:
+        return None
+
+
+BUILD = _build_file("BUILD")
+BUILD_RUN = _build_file("BUILD_RUN")
 
 
 def create_app(
@@ -191,6 +197,10 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         jobs.resume()  # Depot CI runs a replaced server was still following
+        try:
+            jobs.finish_self_deploy(BUILD_RUN, BUILD)  # the CI run that deployed this server
+        except Exception:  # noqa: BLE001 - never block startup on bookkeeping
+            pass
         async with mcp.session_manager.run():
             yield
 

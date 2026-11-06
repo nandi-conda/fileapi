@@ -1122,6 +1122,24 @@ class Jobs:
             n += 1
         return n
 
+    def finish_self_deploy(self, run_id: str | None, sha: str | None) -> bool:
+        """At startup of a server that a CI run deployed (CI writes fileapi/BUILD_RUN): if that run still says
+        running, its job was on the replica this deploy replaced. This server being up is the outcome: record it."""
+        if not run_id or not re.fullmatch(r"[0-9a-f]{16}", run_id):
+            return False
+        run = self.kv.get(f"forge_run_{run_id}")
+        if not run or run.get("status") not in ("running", "queued"):
+            return False
+        if sha and run.get("sha") and run["sha"] != sha:
+            return False
+        note = (f"\nThe new version ({(sha or '')[:12]}) is live: it started up and recorded this. The job's own "
+                "server was the one this deploy replaced, so it couldn't.\n")
+        run.update(status="success", exit_code=0, finished=_now(),
+                   duration=round(time.time() - (run.get("started_ts") or time.time()), 1),
+                   output=(run.get("output") or "") + note)
+        self._save_run(run)
+        return True
+
     def _resume_one(self, run: dict) -> None:
         secrets = self.secrets.values(run["repo"])
         out = _Output({k: v for k, v in secrets.items() if k not in UNMASKED})
