@@ -11,12 +11,14 @@ Secrets
 
 Deploy jobs
     A repo opts in by committing `.forge/jobs.toml`. After every push (git, push_bundle or commit_files) the
-    server reads that file from the pushed commit and runs the jobs whose `branches` match, in a background
-    thread on the replica that took the push. Two kinds of job:
+    server reads that file from the pushed commit and starts the jobs whose `branches` match, from a background
+    thread on the replica that took the push. No job's code ever runs on this server: scripts and builds run
+    on Depot (depot.dev), and the server only starts them and follows their output. Kinds of job:
 
-        [[job]]                       # a shell script, run with sh -e in a checkout of the pushed commit
+        [[job]]                       # a shell script, run with bash -e on Depot in a checkout of the pushed commit
         name = "deploy"
         branches = ["main"]           # default: the repo's default branch; ["*"] = every branch
+        image = "python:3.12-bookworm"  # the container it runs in (this is the default); platform = "linux/arm64"
         run = "python deploy.py"      # secrets and FORGE_* variables are in the environment
 
         [[job]]                       # on a pushed tag: build and publish a release
@@ -62,19 +64,20 @@ Deploy jobs
     picks the wait back up. The run record keeps the Depot link (depot.url) and the output is saved as it
     grows, so the link shows while the run is going.
 
-    A depot job needs the DEPOT_TOKEN secret (a Depot project, organization or user token; repo or user secret). The server downloads the
-    Depot CLI the first time it's needed; shell jobs whose script mentions `depot` get it on PATH too.
+    A run or depot job needs the DEPOT_TOKEN secret (a Depot project, organization or user token; repo or user
+    secret) and a project (depot.project or the DEPOT_PROJECT_ID secret). The server downloads the Depot CLI the
+    first time it's needed; run scripts that mention `depot` get it installed in their container too. post and
+    mirror jobs are the server's own HTTP request and git push (no repo code), so they stay here.
 
     Every job gets FORGE_REPO, FORGE_BRANCH (empty for a tag), FORGE_TAG, FORGE_REF, FORGE_SHA, FORGE_BEFORE,
     FORGE_JOB, FORGE_RUN_ID and FORGE_TRIGGER, plus FORGE_URL, FORGE_API (this repo's /api/forge URL) and
     FORGE_TOKEN: a credential for this repo only (push, releases; Bearer header) that expires after the
-    job's timeout. Shell jobs have `forge-release` on PATH to create releases and upload assets.
+    job's timeout. Run jobs have `forge-release` on PATH to create releases and upload assets.
 
     `${NAME}` in post/headers/body (and the depot table) is replaced by that secret or FORGE_* value. Each run (status, output
     with secrets masked, timing) is kept in the KV store, the last RUNS_KEPT per repo.
 
-Only the admin can push (or set secrets), so a job's code is as trusted as the server's own. Jobs still get
-a scrubbed environment: none of the server's own variables (DATABASE_URL, FILEAPI_SECRETS_KEY...) except PATH.
+Jobs get a scrubbed environment: none of the server's own variables (DATABASE_URL, FILEAPI_SECRETS_KEY...).
 """
 
 from __future__ import annotations
@@ -85,6 +88,7 @@ import json
 import os
 import re
 import secrets as pysecrets
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -117,6 +121,7 @@ DEPOT_CI_DONE = {"finished": "success", "failed": "failed", "cancelled": "cancel
 WATCH_KEY = "forge_depot_ci_watch"  # depot_ci runs still being followed: a restarted server picks them up
 MAX_TIMEOUT = 3600
 DEPOT_CLI_VERSION = "2.103.9"  # FILEAPI_DEPOT_CLI_VERSION overrides ("latest" works too)
+DEFAULT_RUN_IMAGE = "python:3.12-bookworm"  # a run job's image unless it sets `image` (bash, git, curl, python3)
 UNMASKED = {"DEPOT_PROJECT_ID"}  # secrets for convenience, not secret: masking them would break build links
 DEPOT_URL_RE = re.compile(r"https://depot\.dev/orgs/[\w-]+/projects/[\w-]+/builds/[\w-]+")
 
@@ -331,6 +336,11 @@ def parse_jobs(text: str) -> list[dict]:
         timeout = j.get("timeout", DEFAULT_TIMEOUT)
         if not isinstance(timeout, int) or not 1 <= timeout <= MAX_TIMEOUT:
             raise StorageError(f"{JOBS_FILE}: job {name!r}: timeout is whole seconds, 1 to {MAX_TIMEOUT}")
+        image, platform = j.get("image"), j.get("platform")
+        for key, value in (("image", image), ("platform", platform)):
+            if value is not None and (run is None or not isinstance(value, str) or not value):
+                raise StorageError(f"{JOBS_FILE}: job {name!r}: {key} is a string, for run jobs (the container "
+                                   "the script runs in on Depot)")
         if depot is not None:
             depot = _parse_depot(name, depot)
         if mirror is not None:
@@ -340,7 +350,7 @@ def parse_jobs(text: str) -> list[dict]:
         jobs.append({"name": name, "branches": _as_list(j.get("branches"), "branches"),
                      "tags": _as_list(j.get("tags"), "tags"), "run": run, "post": post,
                      "depot": depot, "mirror": mirror, "depot_ci": depot_ci, "after": after,
-                     "headers": headers, "body": body, "timeout": timeout})
+                     "image": image, "platform": platform, "headers": headers, "body": body, "timeout": timeout})
     by_name = {j["name"]: j for j in jobs}
     for j in jobs:
         seen, cur = {j["name"]}, j
@@ -451,6 +461,26 @@ def _parse_depot(name: str, d) -> dict:
         if p.startswith("/") or ".." in Path(p).parts:
             raise StorageError(f"{JOBS_FILE}: job {name!r}: depot paths are relative to the repo root")
     return out
+
+
+def _shell_dockerfile(image: str, tools: list[str], depot_version: str) -> str:
+    """The Dockerfile a `run` job is built from on Depot (see Jobs._run_shell)."""
+    lines = ["# syntax=docker/dockerfile:1", f"FROM {image}", "ARG TARGETARCH"]
+    if "depot" in tools:  # the script drives Depot builds itself; its own layer, so it's cached
+        lines.append(
+            'RUN set -e; case "$TARGETARCH" in arm64) a=arm64;; *) a=x86_64;; esac; '
+            f'u="https://dl.depot.dev/cli/download/Linux/$a/{depot_version.removeprefix("v")}"; '
+            'if command -v curl >/dev/null; then curl -fsSL "$u" -o /tmp/depot.tgz; else wget -qO /tmp/depot.tgz "$u"; fi; '
+            'mkdir -p /tmp/depot-cli && tar -xzf /tmp/depot.tgz -C /tmp/depot-cli; '
+            'install -m 0755 "$(find /tmp/depot-cli -type f -path \'*bin/depot\' | head -n 1)" /usr/local/bin/depot; '
+            'rm -rf /tmp/depot.tgz /tmp/depot-cli')
+    lines += ["COPY --from=forge-tools bin /opt/forge/bin", "ENV PATH=/opt/forge/bin:$PATH CI=true",
+              "COPY . /src", "WORKDIR /src", "ARG FORGE_RUN_ID",
+              "RUN --mount=type=secret,id=forge_env,required=true --mount=type=bind,from=forge-tools,target=/opt/forge/job \\",
+              '    set -a && . /run/secrets/forge_env && set +a && '
+              'if command -v bash >/dev/null; then exec bash -e /opt/forge/job/job.sh; else exec sh -e /opt/forge/job/job.sh; fi',
+              ""]
+    return "\n".join(lines)
 
 
 def _branch_matches(patterns: list[str], branch: str, default: str) -> bool:
@@ -753,6 +783,10 @@ class Jobs:
             out.write(f"Skipped: {error}\n")
         except Exception as e:  # noqa: BLE001 - every failure belongs in the run record
             status, error = "error", out.mask(str(e))
+        if not (run.get("depot") or {}).get("url"):  # a quick run can end before progress() saw the link
+            link = DEPOT_URL_RE.search(out.value())
+            if link:
+                run["depot"] = {**(run.get("depot") or {}), "url": link.group(0)}
         run.update(status=status, exit_code=code, finished=_now(),
                    duration=round(time.time() - run["started_ts"], 1), output=out.value())
         if error:
@@ -766,10 +800,53 @@ class Jobs:
         self._release_children(run)
 
     def _run_shell(self, run: dict, job: dict, env: dict, out: _Output) -> int:
-        sh = shutil.which("bash") or "/bin/sh"
-        tools = [self.depot_cli(out)] if re.search(r"\bdepot\b", job["run"]) else []
-        tools.append(self.release_cli())
-        return self._run_process(run, job, env, out, lambda src, home: [sh, "-e", "-c", job["run"]], tools)
+        """A `run` script runs on Depot, never on this server: the script becomes the last RUN step of a
+        generated Dockerfile (FROM the job's image, the pushed commit copied into /src) that Depot builds with
+        nothing exported. Secrets and FORGE_* reach the step as one BuildKit secret, so they never land in an
+        image layer or the build log, and FORGE_RUN_ID as a build arg keeps the step from being served from cache."""
+        project = self._depot_project(None, env, "Shell (run) jobs run on Depot, so they need")
+        tools = ["forge-release"]
+        if re.search(r"\bdepot\b", job["run"]):
+            tools.append("depot")
+        dockerfile = _shell_dockerfile(job["image"] or DEFAULT_RUN_IMAGE, tools,
+                                       os.environ.get("FILEAPI_DEPOT_CLI_VERSION", "").strip() or DEPOT_CLI_VERSION)
+        cli = self.depot_cli(out)
+        client = Path(__file__).with_name("git_credential.py")
+
+        def argv(src: Path, home: Path) -> list[str]:
+            ctx = home / "forge-job"
+            (ctx / "bin").mkdir(parents=True)
+            (ctx / "job.sh").write_text(job["run"] if job["run"].endswith("\n") else job["run"] + "\n")
+            (ctx / "job.Dockerfile").write_text(dockerfile)
+            (ctx / "job.Dockerfile.dockerignore").write_text("")  # the repo's own .dockerignore doesn't apply
+            shutil.copyfile(client, ctx / "bin" / "git_credential.py")
+            wrapper = ctx / "bin" / "forge-release"
+            wrapper.write_text('#!/bin/sh\nexec python3 "$(dirname "$0")/git_credential.py" release "$@"\n')
+            wrapper.chmod(0o755)
+            secret = home / "forge-env"
+            secret.write_text("".join(f"export {k}={shlex.quote(v)}\n" for k, v in
+                                      {"CI": "true", **env, "DEPOT_PROJECT_ID": project}.items()))
+            secret.chmod(0o600)
+            cmd = ["build", "--project", project, "--progress", "plain", "--file", str(ctx / "job.Dockerfile"),
+                   "--build-context", f"forge-tools={ctx}", "--secret", f"id=forge_env,src={secret}",
+                   "--build-arg", f"FORGE_RUN_ID={run['id']}"]
+            if job["platform"]:
+                cmd += ["--platform", job["platform"]]
+            out.write(f"Running on Depot (project {project}) in {job['image'] or DEFAULT_RUN_IMAGE}\n")
+            return [cli, *cmd, str(src)]
+
+        return self._run_process(run, job, {**env, "DEPOT_PROJECT_ID": project}, out, argv)
+
+    def _depot_project(self, configured: str | None, env: dict, what: str = "A depot job needs") -> str:
+        if not env.get("DEPOT_TOKEN"):
+            raise StorageError(f"{what} the DEPOT_TOKEN secret: a Depot project token (project > Settings > "
+                               "Project tokens) or an organization token (organization Settings > API tokens), as a repo "
+                               "secret or a user secret for all your repos (`just depot-user-token`)")
+        project = _expand(configured, env) if configured else env.get("DEPOT_PROJECT_ID", "")
+        if not project:
+            raise StorageError("Set depot.project in the job, or a DEPOT_PROJECT_ID secret (the ID on the "
+                               "project's page at depot.dev)")
+        return project
 
     def _run_process(self, run: dict, job: dict, env: dict, out: _Output, argv, tools=(), after=None) -> int:
         """Run argv(src, home) in a fresh checkout of the run's commit, with the job's clean environment."""
@@ -799,23 +876,6 @@ class Jobs:
             return proc.returncode
         finally:
             shutil.rmtree(work, ignore_errors=True)
-
-    def release_cli(self) -> str:
-        """A `forge-release` command for jobs: fileapi's release client (git_credential.py release), which
-        reads FORGE_URL, FORGE_REPO and FORGE_TOKEN from the job's environment."""
-        import sys
-
-        dest = Path(self.tools_dir) / "forge-release" / "forge-release"
-        client = Path(__file__).with_name("git_credential.py")
-        script = f'#!/bin/sh\nexec "{sys.executable}" "{client}" release "$@"\n'
-        with self._tools_lock:
-            if not dest.is_file() or dest.read_text() != script:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                tmp = dest.with_name(f".forge-release.{os.getpid()}")
-                tmp.write_text(script)
-                tmp.chmod(0o755)
-                os.replace(tmp, dest)
-        return str(dest)
 
     # -- Depot --------------------------------------------------------------------------
     def depot_cli(self, out: _Output | None = None) -> str:
@@ -866,14 +926,7 @@ class Jobs:
 
     def _run_depot(self, run: dict, job: dict, env: dict, out: _Output) -> int:
         d = job["depot"]
-        if not env.get("DEPOT_TOKEN"):
-            raise StorageError("A depot job needs the DEPOT_TOKEN secret: a Depot project token (project > Settings > "
-                               "Project tokens) or an organization token (organization Settings > API tokens), as a repo "
-                               "secret or a user secret for all your repos (`just depot-user-token`)")
-        project = _expand(d["project"], env) if d["project"] else env.get("DEPOT_PROJECT_ID", "")
-        if not project:
-            raise StorageError("Set depot.project in the job, or a DEPOT_PROJECT_ID secret (the ID on the "
-                               "project's page at depot.dev)")
+        project = self._depot_project(d["project"], env)
         tags = [_expand(t, env) for t in d["tags"]]
         save = d["save"] if d["save"] is not None else not d["push"]
         cmd = ["build", "--project", project, "--progress", "plain"]

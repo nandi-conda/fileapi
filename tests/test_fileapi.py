@@ -20,6 +20,32 @@ from fileapi.storage import StorageError
 # Repo secrets are on in every test app (and the server processes they start) unless a test removes it.
 os.environ.setdefault("FILEAPI_SECRETS_KEY", "q2Vz1fVv0Hc0dWl3mT1tYk4cQyB3hGvKkq8xR0b8m3E=")
 
+# Run jobs run on Depot. In tests a stand-in for the Depot CLI does what that build would: runs the job's
+# script in the checkout with the env file the server passes as a BuildKit secret, forge-release on PATH.
+FAKE_DEPOT_RUN = """#!/bin/sh
+tools=""; envf=""; prev=""; ctx=""
+for a in "$@"; do
+  case "$prev" in --build-context) tools="${a#forge-tools=}";; --secret) envf="${a#*src=}";; esac
+  prev="$a"; ctx="$a"
+done
+[ -n "$tools" ] || { echo "fake depot: not a run job"; exit 2; }
+echo "Build: https://depot.dev/orgs/org1/projects/proj9/builds/run1"
+cd "$ctx" && exec env -i PATH="$tools/bin:$PATH" HOME="$HOME" sh -c 'set -a; . "$1"; set +a; exec bash -e "$2"' x "$envf" "$tools/job.sh"
+"""
+_fake_dir = Path(__import__("tempfile").mkdtemp(prefix="fake-depot-"))
+(_fake_dir / "depot").write_text(FAKE_DEPOT_RUN)
+(_fake_dir / "depot").chmod(0o755)
+os.environ.setdefault("FILEAPI_DEPOT_CLI", str(_fake_dir / "depot"))
+DEPOT_SECRETS = {"DEPOT_TOKEN": "depot-test-token", "DEPOT_PROJECT_ID": "proj9"}
+
+
+def depot_secrets(put) -> None:
+    """Give the signed-in owner the Depot user secrets run jobs need; put is client.put or httpx.put."""
+    for name, value in DEPOT_SECRETS.items():
+        r = put(f"/api/forge/user/secrets/{name}", json={"value": value}, headers=AUTH)
+        assert r.status_code in (200, 201), r.text
+
+
 TOKEN = "test-static-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 FILE_TOOLS = ["append_file", "create_file", "delete_file", "edit_file", "list_files", "move_file", "read_file", "write_file"]
@@ -1053,19 +1079,29 @@ def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
         r = client.post(f"{base}/runs", json={}, headers=AUTH)
         assert r.status_code == 404 and ".forge/jobs.toml" in r.json()["detail"]
 
-        # Committing the jobs file is a push: the main-branch jobs run.
-        sha = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": JOBS_TOML}, "add jobs")["commit"]
+        # Committing the jobs file is a push: the main-branch jobs run. Run scripts only ever run on Depot:
+        # without a Depot token the server refuses to run one itself.
+        forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": JOBS_TOML}, "add jobs")
         jobs.wait()
-        runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"]
+        runs = {r["job"]: r for r in client.get(f"{base}/runs", headers=AUTH).json()["runs"]}
+        assert runs["build"]["status"] == "error" and "run on Depot" in runs["build"]["error"]
+        assert "DEPOT_TOKEN" in runs["build"]["error"] and runs["hook"]["status"] == "success"
+        depot_secrets(client.put)
+        sha = forge.commit_files("nandi.uk/app", "main", {"app.py": "print('hi')\n", "b.txt": "b"}, "again")["commit"]
+        jobs.wait()
+        runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"][:2]
         assert sorted(r["job"] for r in runs) == ["build", "hook"]
         assert all(r["status"] == "success" and r["sha"] == sha and r["trigger"] == "push" for r in runs), [(r["job"], r["status"], r.get("error")) for r in runs]
         build = next(r for r in runs if r["job"] == "build")
         out = client.get(f"{base}/runs/{build['id']}", headers=AUTH).json()["output"]
         assert f"deploying nandi.uk/app main {sha}" in out and "print('hi')" in out and "env is clean" in out
+        assert build["kind"] == "run" and "Running on Depot (project proj9)" in out
+        assert build["depot"]["url"] == "https://depot.dev/orgs/org1/projects/proj9/builds/run1"
         assert "token=***" in out and "tok-12345" not in out
         hook_run = next(r for r in runs if r["job"] == "hook")
         out = client.get(f"{base}/runs/{hook_run['id']}", headers=AUTH).json()["output"]
         assert "HTTP 200" in out and "Bearer ***" in out and "tok-12345" not in out
+        sent = sent[1:]  # the first push's hook
         assert str(sent[0].url) == "https://deploy.example/hooks/srv-1"
         assert sent[0].headers["authorization"] == "Bearer tok-12345"
         assert sent[0].content == f'{{"sha": "{sha}"}}'.encode()
@@ -1091,7 +1127,7 @@ def test_repo_secrets_and_deploy_jobs(tmp_path, backend):
         base2 = "/api/forge/repos/nandi.uk/app2"
         names = [s["name"] for s in client.get(f"{base2}/secrets", headers=AUTH).json()["secrets"]]
         assert names == ["DEPLOY_TOKEN", "HOOK_ID"]
-        assert len(client.get(f"{base2}/runs", headers=AUTH).json()["runs"]) == 4
+        assert len(client.get(f"{base2}/runs", headers=AUTH).json()["runs"]) == 6
         assert client.delete(f"{base2}/secrets/HOOK_ID", headers=AUTH).status_code == 204
         assert client.delete(f"{base2}/secrets/HOOK_ID", headers=AUTH).status_code == 404
         assert client.delete(base2, headers=AUTH).status_code == 204
@@ -1130,6 +1166,7 @@ def test_user_secrets_apply_to_every_repo(tmp_path, backend):
         secrets = jobs.secrets
         assert secrets.values("nandi.uk/one") == {"SHARED_TOKEN": "user-wide-2", "REGION": "ams-user"}
         assert secrets.values("nandi.uk/two") == {"SHARED_TOKEN": "user-wide-2", "REGION": "fra-repo"}
+        depot_secrets(client.put)
         assert secrets.values("someone/else") == {}  # another owner's repo doesn't get them
 
         # A job sees the merged set, masked in its output.
@@ -1142,7 +1179,7 @@ def test_user_secrets_apply_to_every_repo(tmp_path, backend):
 
         # Deleting a repo leaves the user secrets alone.
         assert client.delete("/api/forge/repos/nandi.uk/one", headers=AUTH).status_code == 204
-        assert len(client.get(user, headers=AUTH).json()["secrets"]) == 2
+        assert len(client.get(user, headers=AUTH).json()["secrets"]) == 4
         assert client.delete(f"{user}/REGION", headers=AUTH).status_code == 204
         assert client.delete(f"{user}/REGION", headers=AUTH).status_code == 404
         assert secrets.values("nandi.uk/two")["REGION"] == "fra-repo"
@@ -1151,6 +1188,7 @@ def test_user_secrets_apply_to_every_repo(tmp_path, backend):
 FAKE_DEPOT = """#!/bin/sh
 # Stands in for the Depot CLI: records its arguments and environment, writes build metadata.
 printf '%s\\n' "$@" > "$FAKE_DEPOT_LOG"
+prev=""; for a in "$@"; do [ "$prev" = "--file" ] && cat "$a" >> "$FAKE_DEPOT_LOG"; prev="$a"; done
 echo "token=$DEPOT_TOKEN project=$DEPOT_PROJECT_ID" >> "$FAKE_DEPOT_LOG"
 cat "$HOME/.docker/config.json" >> "$FAKE_DEPOT_LOG" 2>/dev/null
 meta=""; prev=""
@@ -1226,15 +1264,23 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
         assert run["depot"]["image"] == "registry.depot.dev/pub7:b123" and "--project\npub7\n" in log.read_text()
         assert "--save\n.\n" in log.read_text()
 
-        # Shell jobs that use depot get it on PATH.
-        forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": "[[job]]\nname='sh'\nrun='depot build .'\n"}, "c")
+        # Run jobs are Depot builds of a generated Dockerfile; scripts that use depot get it installed there.
+        toml3 = "[[job]]\nname='sh'\nimage='alpine:3'\nplatform='linux/arm64'\nrun='depot build .'\n"
+        forge.commit_files("nandi.uk/img", "main", {".forge/jobs.toml": toml3}, "c")
         jobs.wait()
-        assert client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]["status"] == "success"
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["status"] == "success" and run["kind"] == "run", run
+        args = log.read_text()
+        assert "--build-context\nforge-tools=" in args and "--secret\nid=forge_env,src=" in args
+        assert f"--build-arg\nFORGE_RUN_ID={run['id']}\n" in args and "--platform\nlinux/arm64\n" in args
+        assert "FROM alpine:3" in args and "dl.depot.dev/cli/download/Linux/" in args and "job.sh" in args
+        assert "depot-tok-1" not in args.split("token=")[0]  # secrets go in the secret file, not the command line
 
         for bad, msg in (("depot = 3", "must be a table"), ("depot = { push = true }", "needs tags"),
                          ("depot = { colour = 'red' }", "unknown depot setting"),
                          ("depot = { context = '../x' }", "relative to the repo root"),
-                         ("depot = true\nrun = 'x'", "exactly one of")):
+                         ("depot = true\nrun = 'x'", "exactly one of"),
+                         ("depot = true\nimage = 'alpine'", "for run jobs"), ("run = 'x'\nimage = 3", "is a string")):
             with pytest.raises(StorageError, match=msg):
                 parse_jobs(f"[[job]]\nname = 'x'\n{bad}\n")
 
@@ -1262,6 +1308,7 @@ async def test_git_push_runs_deploy_job(server_url, tmp_path):
         assert "abcd-efgh" not in text(await c.call_tool("list_repo_secrets", {"repo": "site"}))
         assert "No runs yet" in text(await c.call_tool("deploy_runs", {"repo": "site"}))
 
+    depot_secrets(lambda path, **kw: httpx.put(server_url + path, **kw))
     work = tmp_path / "work"
     work.mkdir()
     git("init", "-b", "main", cwd=work)
@@ -1291,7 +1338,7 @@ async def test_git_push_runs_deploy_job(server_url, tmp_path):
         listing = text(await c.call_tool("list_repo_secrets", {"repo": "site"}))
         assert "ALL_REPOS" in listing and "every-where" not in listing
         assert not (await c.call_tool("delete_user_secret", {"name": "ALL_REPOS"})).is_error
-        assert "no user secrets" in text(await c.call_tool("list_user_secrets", {}))
+        assert "ALL_REPOS" not in text(await c.call_tool("list_user_secrets", {}))
 
 
 def test_depot_token_setup(tmp_path, monkeypatch):
@@ -1493,6 +1540,7 @@ async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
     see the result."""
     r = httpx.post(f"{server_url}/api/forge/repos", json={"name": "rel"}, headers=AUTH)
     assert r.status_code == 201, r.text
+    depot_secrets(lambda path, **kw: httpx.put(server_url + path, **kw))
     remote = server_url.replace("://", f"://x:{TOKEN}@") + "/git/nandi.uk/rel.git"
     work = tmp_path / "work"
     work.mkdir()
@@ -1576,6 +1624,7 @@ run = "echo deploying $FORGE_SHA"
     with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
         forge, jobs = client.app.state.forge, client.app.state.jobs
         forge.create("nandi.uk", "app")
+        depot_secrets(client.put)
         base = "/api/forge/repos/nandi.uk/app"
         sha = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": toml}, "jobs")["commit"]
         jobs.wait()

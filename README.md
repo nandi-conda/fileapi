@@ -141,13 +141,14 @@ Each repo can hold **secrets** (env-var names like `FLY_API_TOKEN`), set in the 
 
 **User secrets** work the same way but belong to you, not a repo: every repo you own gets them in its jobs, so a token like `DEPOT_TOKEN` or `FLY_API_TOKEN` is set once. Manage them on the web UI's **Settings** page (top bar), over the API, or with the `set_user_secret` / `list_user_secrets` / `delete_user_secret` MCP tools. A repo secret with the same name overrides the user secret for that repo; the repo's Secrets list shows the user secrets it inherits, dimmed, and struck through where overridden.
 
-A repo opts in to **auto-deploy** by committing `.forge/jobs.toml`. Every push (git, `push_bundle` or `commit_files`) reads it from the pushed commit and runs the jobs whose `branches` match, in the background on the server:
+A repo opts in to **auto-deploy** by committing `.forge/jobs.toml`. Every push (git, `push_bundle` or `commit_files`) reads it from the pushed commit and starts the jobs whose `branches` match. **No job runs on the fileapi server itself**: every script and build runs on [Depot](https://depot.dev), and the server only starts it and streams its output. That's why `run` jobs need the `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` secrets (user secrets cover every repo; see below).
 
 ```toml
-[[job]]                        # a shell script (sh -e), run in a checkout of the pushed commit
+[[job]]                        # a shell script (bash -e), run on Depot in a checkout of the pushed commit
 name = "deploy"
 branches = ["main"]            # default: the default branch. Globs work: ["release/*"], ["*"]
 timeout = 300                  # seconds (default 600, max 3600)
+image = "python:3.12-bookworm" # the container it runs in (the default); platform = "linux/arm64" also works
 run = """
 python scripts/deploy.py       # secrets are env vars, plus FORGE_REPO, FORGE_BRANCH, FORGE_SHA, FORGE_BEFORE...
 """
@@ -159,7 +160,9 @@ headers = { Authorization = "Bearer ${SOME_TOKEN}" }
 body = '{"sha": "${FORGE_SHA}"}'
 ```
 
-Jobs get a clean environment (only `PATH` from the server, never `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. A job that can't apply, like a mirror whose token secret isn't set, shows as `skipped`. Set `FILEAPI_JOBS=off` to turn jobs off.
+A `run` script becomes the last step of a Dockerfile the server generates (`FROM` the job's `image`, the commit copied into `/src`), built on Depot with nothing exported. Secrets and the `FORGE_*` variables reach that step as a BuildKit secret, so they never end up in an image layer, and each run's ID busts the cache so the script always runs. `post` and `mirror` jobs are the server's own HTTP request and git push (no repo code runs), so those stay on the server.
+
+Jobs get a clean environment (never the server's `DATABASE_URL` or the key), and secret values are masked as `***` in their output. The **Deploys** tab (and the `deploy_runs` / `run_deploy` MCP tools) shows the last 30 runs with their output and has **Run now**. A run lives in the replica that took the push, so a long job can be cut off if FastAPI Cloud scales that replica down; it then shows as `lost`. A job that can't apply, like a mirror whose token secret isn't set, shows as `skipped`. Set `FILEAPI_JOBS=off` to turn jobs off.
 
 #### Container builds on Depot
 
@@ -182,7 +185,7 @@ login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }  # r
 args = ["--no-cache"]            # any other `depot build` flags
 ```
 
-`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). For all your repos at once, `just depot-user-token [repo]` stores your Depot user token (`depot login token`, which can build in any project you can see) as the user secret `DEPOT_TOKEN`; with a repo it also sets that repo's `DEPOT_PROJECT_ID`. Each repo still needs its project: `project` in the job, a `DEPOT_PROJECT_ID` secret, or one run of that command per repo. By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Shell jobs whose script mentions `depot` get the CLI on `PATH` too, for `depot bake` or anything else.
+`depot = true` alone builds `./Dockerfile` and saves the image to the Depot registry as `registry.depot.dev/<project>:<build id>`. Every depot job needs the **`DEPOT_TOKEN`** secret. The easy way is `just depot-token <repo> [depot project]`: it signs you in to Depot and to fileapi in the browser, finds or creates the Depot project (default: named after the repo), creates a project token for it, and stores `DEPOT_TOKEN` and `DEPOT_PROJECT_ID` as the repo's secrets (`DEPOT_PROJECT_ID` isn't masked in output). For all your repos at once, `just depot-user-token [repo]` stores your Depot user token (`depot login token`, which can build in any project you can see) as the user secret `DEPOT_TOKEN`; with a repo it also sets that repo's `DEPOT_PROJECT_ID`. Each repo still needs its project: `project` in the job, a `DEPOT_PROJECT_ID` secret, or one run of that command per repo. By hand: a project token from Depot → the project → **Settings → Project tokens**, or an organization token from **Organization settings → API tokens**. The run's output shows the Depot build link, and the run record gets a `depot` object (`build_id`, `url`, `image`, `digest`). Run jobs whose script mentions `depot` get the CLI installed in their container too, for `depot bake`, nested builds or anything else.
 
 A `mirror` job pushes every branch and tag of the repo to another git host, say a backup on GitHub. Only fast-forwards and new refs go: a ref that moved on the other side is reported in the run and left alone (`force = true` overwrites instead). Nothing is deleted there. `token` is the HTTPS password (username `x-access-token` unless you set `username`; if the secret it names isn't set, the run is skipped); for GitHub, a fine-grained personal access token with **Contents: Read and write** on that one repo.
 
