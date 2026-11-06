@@ -100,7 +100,7 @@ def main() -> None:
     if not SITE:
         return
     say(f"Waiting for {SITE}/health to report {sha[:12]}...")
-    deadline = time.time() + 300
+    deadline = time.time() + 300  # 5 minutes
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(f"{SITE}/health", timeout=15) as resp:
@@ -111,7 +111,10 @@ def main() -> None:
         except (OSError, ValueError):
             pass
         time.sleep(5)
-    fail(f"Deployed, but {SITE}/health didn't report {sha[:12]} within 5 minutes.")
+    # fastapi deploy already waited for FastAPI Cloud's own verification, so this only warns: during a rolling
+    # deploy (or from inside the old replica) /health can keep answering from the previous version for a while.
+    say(f"::warning::FastAPI Cloud says the deploy succeeded, but {SITE}/health didn't report {sha[:12]} within "
+        "5 minutes (it may still be answering from the previous replica).")
 
 
 if __name__ == "__main__":
