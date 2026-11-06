@@ -12,6 +12,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -576,7 +577,7 @@ void ForgeWindow::setCompact(bool compact)
     m_fileSplit->setOrientation(compact ? Qt::Vertical : Qt::Horizontal);
     m_commits->setColumnHidden(1, compact);  // author
     m_commits->setColumnHidden(3, compact);  // sha
-    for (int c : {2, 3, 4, 6})              // branch, commit, started, trigger
+    for (int c : {2, 3, 4, 6})              // branch, commit, started, trigger (the Depot link stays)
         m_runs->setColumnHidden(c, compact);
     m_repoSecrets->setCompact(compact);
     m_releases->setCompact(compact);
@@ -1551,14 +1552,25 @@ QWidget *ForgeWindow::buildDeploys()
     lay->addLayout(row);
     auto *split = new QSplitter(Qt::Vertical);
     m_runs = new QTreeWidget;
-    m_runs->setHeaderLabels({"Status", "Job", "Branch", "Commit", "Started", "Time", "Trigger"});
+    m_runs->setHeaderLabels({"Status", "Job", "Branch", "Commit", "Started", "Time", "Trigger", "Depot"});
     m_runs->setRootIsDecorated(false);
     m_runs->setUniformRowHeights(true);
     m_runs->header()->setStretchLastSection(false);
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < 8; ++i)
         m_runs->header()->setSectionResizeMode(i, i == 1 ? QHeaderView::Stretch : QHeaderView::ResizeToContents);
     touchScroll(m_runs);
     split->addWidget(m_runs);
+    // The run's output, with a link to its Depot build (or Depot CI run) above it when it has one.
+    auto *detail = new QWidget;
+    auto *detailLay = new QVBoxLayout(detail);
+    detailLay->setContentsMargins(0, 0, 0, 0);
+    detailLay->setSpacing(4);
+    m_runLink = new QLabel;
+    m_runLink->setTextFormat(Qt::RichText);
+    m_runLink->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    m_runLink->setOpenExternalLinks(true);
+    m_runLink->setVisible(false);
+    detailLay->addWidget(m_runLink);
     m_runOutput = new QPlainTextEdit;
     m_runOutput->setReadOnly(true);
     m_runOutput->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
@@ -1568,12 +1580,19 @@ QWidget *ForgeWindow::buildDeploys()
         m_runOutput->setTextInteractionFlags(Qt::TextSelectableByKeyboard);
         touchScroll(m_runOutput);
     }
-    split->addWidget(m_runOutput);
+    detailLay->addWidget(m_runOutput, 1);
+    split->addWidget(detail);
     split->setStretchFactor(0, 1);
     split->setStretchFactor(1, 2);
     lay->addWidget(split, 1);
     connect(m_runNow, &QPushButton::clicked, this, &ForgeWindow::startRun);
     connect(refresh, &QPushButton::clicked, this, &ForgeWindow::loadRuns);
+    // Clicking a run's Depot cell opens the build on depot.dev.
+    connect(m_runs, &QTreeWidget::itemClicked, this, [](QTreeWidgetItem *it, int column) {
+        const QString url = it->data(7, PathRole).toString();
+        if (column == 7 && !url.isEmpty())
+            QDesktopServices::openUrl(QUrl(url));
+    });
     connect(m_runs, &QTreeWidget::itemSelectionChanged, this, [this] {
         const auto sel = m_runs->selectedItems();
         if (!sel.isEmpty() && !sel.first()->data(0, PathRole).toString().isEmpty()) {
@@ -1642,6 +1661,13 @@ void ForgeWindow::loadRuns()
             if (r.contains("duration"))
                 it->setText(5, QString::number(r.value("duration").toDouble(), 'f', 1) + " s");
             it->setText(6, r.value("trigger").toString());
+            const QString depotUrl = r.value("depot").toObject().value("url").toString();
+            if (!depotUrl.isEmpty()) {
+                it->setText(7, "Open");
+                it->setData(7, PathRole, depotUrl);
+                it->setForeground(7, palette().brush(QPalette::Link));
+                it->setToolTip(7, depotUrl);
+            }
             it->setData(0, PathRole, r.value("id").toString());
             if (r.value("id").toString() == keep)
                 it->setSelected(true);
@@ -1661,8 +1687,21 @@ void ForgeWindow::showRun(const QString &id)
     m_api->get(repoPath(repo) + "/runs/" + id, {}, this, [this, repo, id](const QJsonObject &r, const QString &error) {
         if (repo != m_repo || id != m_runShown)
             return;
-        if (!error.isEmpty())
+        if (!error.isEmpty()) {
+            m_runLink->setVisible(false);
             return m_runOutput->setPlainText("Couldn't load this run: " + error);
+        }
+        const QJsonObject depot = r.value("depot").toObject();
+        const QString depotUrl = depot.value("url").toString();
+        if (depotUrl.isEmpty()) {
+            m_runLink->setVisible(false);
+        } else {
+            const QString what = depot.contains("ci_run_id") ? "Depot CI run" : "Depot build";
+            m_runLink->setText(QStringLiteral("<a href=\"%1\">Open the %2 on depot.dev</a>")
+                                   .arg(depotUrl.toHtmlEscaped(), what));
+            m_runLink->setToolTip(depotUrl);
+            m_runLink->setVisible(true);
+        }
         QString text = QStringLiteral("%1 · %2 · %3@%4\n").arg(r.value("job").toString(), r.value("status").toString(),
                                                                 r.value("branch").toString(),
                                                                 r.value("sha").toString().left(12));

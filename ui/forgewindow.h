@@ -150,6 +150,7 @@ private:
     QWidget *m_deploys;
     QTreeWidget *m_runs;
     QPlainTextEdit *m_runOutput;
+    QLabel *m_runLink;  // "Open on Depot" for the run being shown
     QPushButton *m_runNow;
     QComboBox *m_runBranch;
     QLabel *m_runsNote;

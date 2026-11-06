@@ -716,7 +716,16 @@ class Jobs:
         out = _Output(masked)
         run.update(status="running", started=_now(), started_ts=time.time())
         self._save_run(run)
-        out.on_write = lambda: self._save_run({**run, "output": out.value()})
+        def progress() -> None:
+            # A Depot build link shows up in the output early: put it on the record right away, so the
+            # Deploys tab can link to the build while it's still going.
+            if not (run.get("depot") or {}).get("url"):
+                link = DEPOT_URL_RE.search("".join(out.parts))
+                if link:
+                    run["depot"] = {**(run.get("depot") or {}), "url": link.group(0)}
+            self._save_run({**run, "output": out.value()})
+
+        out.on_write = progress
         status, error, code = "failed", None, None
         try:
             if job["run"] is not None:
