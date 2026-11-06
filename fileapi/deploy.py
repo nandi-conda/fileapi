@@ -39,6 +39,29 @@ Deploy jobs
         push = true                   # push the tags; default: save to the Depot registry instead
         login = { server = "ghcr.io", username = "me", password = "${GHCR_TOKEN}" }
 
+        [[job]]                       # mirror every branch and tag to another git host (a backup on GitHub, say)
+        name = "github"
+        branches = ["*"]
+        tags = ["*"]
+        [job.mirror]
+        url = "https://github.com/me/app.git"
+        token = "${GITHUB_MIRROR_TOKEN}"   # HTTPS password; username defaults to x-access-token
+        force = false                 # default: only fast-forwards; a diverged ref is reported, not overwritten
+
+        [[job]]                       # start a Depot CI workflow (workflow_dispatch) and follow it
+        name = "deploy"
+        after = "github"              # run once that job (same push) succeeded, so GitHub has the commit
+        [job.depot_ci]
+        repo = "me/app"               # the GitHub repo Depot CI reads (installed Depot Code Access app)
+        workflow = "deploy.yml"       # .depot/workflows/deploy.yml
+        inputs = { sha = "${FORGE_SHA}" }
+        secrets = ["FASTAPI_TOKEN"]   # copied into Depot CI secrets for that repo before each dispatch
+
+    A depot_ci job's run lives on Depot, so it survives this server restarting (a deploy of the server itself
+    replaces the replica running the job): the Depot run ID is saved before waiting, and a restarted server
+    picks the wait back up. The run record keeps the Depot link (depot.url) and the output is saved as it
+    grows, so the link shows while the run is going.
+
     A depot job needs the DEPOT_TOKEN secret (a Depot project, organization or user token; repo or user secret). The server downloads the
     Depot CLI the first time it's needed; shell jobs whose script mentions `depot` get it on PATH too.
 
@@ -88,6 +111,10 @@ JOBS_FILE = ".forge/jobs.toml"
 RUNS_KEPT = 30
 MAX_OUTPUT = 64 * 1024
 DEFAULT_TIMEOUT = 600
+SAVE_EVERY = 2.0  # seconds between saves of a running job's output (the UI polls it)
+DEPOT_CI_POLL = 5.0
+DEPOT_CI_DONE = {"finished": "success", "failed": "failed", "cancelled": "cancelled"}
+WATCH_KEY = "forge_depot_ci_watch"  # depot_ci runs still being followed: a restarted server picks them up
 MAX_TIMEOUT = 3600
 DEPOT_CLI_VERSION = "2.103.9"  # FILEAPI_DEPOT_CLI_VERSION overrides ("latest" works too)
 UNMASKED = {"DEPOT_PROJECT_ID"}  # secrets for convenience, not secret: masking them would break build links
@@ -276,9 +303,13 @@ def parse_jobs(text: str) -> list[dict]:
             raise StorageError(f"{JOBS_FILE}: two jobs are named {name!r}")
         names.add(name)
         run, post, depot = j.get("run"), j.get("post"), j.get("depot")
-        if sum(x is not None for x in (run, post, depot)) != 1:
-            raise StorageError(f"{JOBS_FILE}: job {name!r} needs exactly one of run (a shell script), post (a URL) "
-                               "or depot (a container build)")
+        mirror, depot_ci = j.get("mirror"), j.get("depot_ci")
+        if sum(x is not None for x in (run, post, depot, mirror, depot_ci)) != 1:
+            raise StorageError(f"{JOBS_FILE}: job {name!r} needs exactly one of run (a shell script), post (a URL), "
+                               "depot (a container build), mirror (a git push elsewhere) or depot_ci (a Depot CI run)")
+        after = j.get("after")
+        if after is not None and (not isinstance(after, str) or not after):
+            raise StorageError(f"{JOBS_FILE}: job {name!r}: after must be another job's name")
         if run is not None and not isinstance(run, str):
             raise StorageError(f"{JOBS_FILE}: job {name!r}: run must be a string")
         if post is not None and not isinstance(post, str):
@@ -294,10 +325,76 @@ def parse_jobs(text: str) -> list[dict]:
             raise StorageError(f"{JOBS_FILE}: job {name!r}: timeout is whole seconds, 1 to {MAX_TIMEOUT}")
         if depot is not None:
             depot = _parse_depot(name, depot)
+        if mirror is not None:
+            mirror = _parse_mirror(name, mirror)
+        if depot_ci is not None:
+            depot_ci = _parse_depot_ci(name, depot_ci)
         jobs.append({"name": name, "branches": _as_list(j.get("branches"), "branches"),
                      "tags": _as_list(j.get("tags"), "tags"), "run": run, "post": post,
-                     "depot": depot, "headers": headers, "body": body, "timeout": timeout})
+                     "depot": depot, "mirror": mirror, "depot_ci": depot_ci, "after": after,
+                     "headers": headers, "body": body, "timeout": timeout})
+    by_name = {j["name"]: j for j in jobs}
+    for j in jobs:
+        seen, cur = {j["name"]}, j
+        while cur["after"]:
+            if cur["after"] not in by_name:
+                raise StorageError(f"{JOBS_FILE}: job {cur['name']!r}: after = {cur['after']!r}, but there's no such job")
+            if cur["after"] in seen:
+                raise StorageError(f"{JOBS_FILE}: jobs {', '.join(sorted(seen))} wait for each other (after)")
+            seen.add(cur["after"])
+            cur = by_name[cur["after"]]
     return jobs
+
+
+def _table(name: str, kind: str, d, keys: set[str]) -> dict:
+    if not isinstance(d, dict):
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: {kind} must be a table ([job.{kind}])")
+    unknown = set(d) - keys
+    if unknown:
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: unknown {kind} setting(s): {', '.join(sorted(unknown))} "
+                           f"(known: {', '.join(sorted(keys))})")
+    return d
+
+
+def _parse_mirror(name: str, d) -> dict:
+    """[job.mirror]: push every branch and tag of this repo to url."""
+    if isinstance(d, str):
+        d = {"url": d}
+    d = _table(name, "mirror", d, {"url", "token", "username", "force"})
+    url = d.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: mirror.url is the git URL to push to")
+    for k in ("token", "username"):
+        if d.get(k) is not None and not isinstance(d[k], str):
+            raise StorageError(f"{JOBS_FILE}: job {name!r}: mirror.{k} must be a string")
+    if d.get("force") is not None and not isinstance(d["force"], bool):
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: mirror.force must be true or false")
+    return {"url": url.strip(), "token": d.get("token"), "username": d.get("username") or "x-access-token",
+            "force": bool(d.get("force"))}
+
+
+def _parse_depot_ci(name: str, d) -> dict:
+    """[job.depot_ci]: dispatch a Depot CI workflow and wait for it."""
+    d = _table(name, "depot_ci", d, {"repo", "workflow", "ref", "inputs", "secrets", "org", "wait"})
+    for k in ("repo", "workflow"):
+        if not isinstance(d.get(k), str) or not d[k].strip():
+            raise StorageError(f"{JOBS_FILE}: job {name!r}: depot_ci.{k} is required (a string)")
+    for k in ("ref", "org"):
+        if d.get(k) is not None and not isinstance(d[k], str):
+            raise StorageError(f"{JOBS_FILE}: job {name!r}: depot_ci.{k} must be a string")
+    inputs = d.get("inputs") or {}
+    if not isinstance(inputs, dict) or not all(isinstance(v, str) for v in inputs.values()):
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: depot_ci.inputs must be a table of strings")
+    secrets = _as_list(d.get("secrets"), f"depot_ci.secrets of job {name!r}")
+    for s in secrets:
+        check_secret_name(s)
+    if d.get("wait") is not None and not isinstance(d["wait"], bool):
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: depot_ci.wait must be true or false")
+    workflow = d["workflow"].strip()
+    if "/" in workflow:
+        raise StorageError(f"{JOBS_FILE}: job {name!r}: depot_ci.workflow is the file's name (deploy.yml), not a path")
+    return {"repo": d["repo"].strip(), "workflow": workflow, "ref": d.get("ref"), "inputs": inputs,
+            "secrets": secrets, "org": d.get("org"), "wait": d.get("wait", True)}
 
 
 _DEPOT_KEYS = {"project", "file", "context", "platforms", "tags", "push", "save", "build_args", "target", "login",
@@ -367,7 +464,10 @@ def _expand(text: str, env: dict[str, str]) -> str:
 
 
 def _kind(job: dict) -> str:
-    return "run" if job["run"] is not None else "post" if job["post"] is not None else "depot"
+    for kind in ("run", "post", "mirror", "depot_ci"):
+        if job.get(kind) is not None:
+            return kind
+    return "depot"
 
 
 class _Output:
@@ -379,6 +479,8 @@ class _Output:
         self.truncated = False
         # Longest first, so a secret containing another is masked whole. Very short values would mask noise.
         self.masks = sorted({v for v in secrets.values() if len(v) >= 4}, key=len, reverse=True)
+        self.on_write = None  # called (at most every SAVE_EVERY s) as output grows: the run record saves it
+        self._saved = 0.0
 
     def mask(self, text: str) -> str:
         for v in self.masks:
@@ -393,6 +495,12 @@ class _Output:
             self.truncated = True
         self.parts.append(text)
         self.size += len(text)
+        if self.on_write is not None and time.time() - self._saved >= SAVE_EVERY:
+            self._saved = time.time()
+            try:
+                self.on_write()
+            except Exception:  # noqa: BLE001 - a failed progress save mustn't stop the job
+                pass
 
     def value(self) -> str:
         out = self.mask("".join(self.parts))
@@ -415,6 +523,7 @@ class Jobs:
         self._pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="forge-job")
         self._index_lock = threading.Lock()
         self._futures: set = set()
+        self._children: dict[str, list] = {}  # run id -> [(run, job)] waiting for it (`after`)
         self.http = httpx.Client(timeout=60, follow_redirects=False)
         # Set by the app: jobs get FORGE_TOKEN (a RepoPasses pass for their repo) and FORGE_URL/FORGE_API.
         self.passes = None
@@ -436,7 +545,7 @@ class Jobs:
     @staticmethod
     def _fresh(run: dict) -> dict:
         # A run whose process died (deploy, scale-down) would say "running" forever.
-        if run.get("status") in ("queued", "running"):
+        if run.get("status") in ("queued", "running", "waiting"):
             started = run.get("started_ts") or run.get("queued_ts") or 0
             if time.time() - started > run.get("timeout", DEFAULT_TIMEOUT) + 120:
                 run = {**run, "status": "lost", "error": "The server stopped before the job finished"}
@@ -544,18 +653,46 @@ class Jobs:
             jobs = [j for j in jobs if (j["branches"] or not j["tags"]) and _branch_matches(j["branches"], branch, default)]
             if not jobs:
                 raise NotFound(f"No job in {JOBS_FILE} runs for branch {branch}")
-        started = []
+        started, runs = [], {}
         for j in jobs:
             run = {"id": pysecrets.token_hex(8), "repo": repo, "job": j["name"], "kind": _kind(j),
                    "branch": branch, "tag": tag, "sha": sha, "before": before, "trigger": trigger, "status": "queued",
                    "queued": _now(), "queued_ts": time.time(), "timeout": j["timeout"]}
+            runs[j["name"]] = (run, j)
+        # `after`: a job waits for another job of this same start; one whose job isn't starting runs right away.
+        children: dict[str, list] = {}
+        for name, (run, j) in runs.items():
+            if j["after"] in runs:
+                run.update(status="waiting", after=j["after"])
+                children.setdefault(j["after"], []).append((run, j))
+        for run, j in runs.values():
             self._save_run(run)
             self._add_to_index(repo, run["id"])
-            fut = self._pool.submit(self._execute, run, j)
-            self._futures.add(fut)
-            fut.add_done_callback(self._futures.discard)
             started.append({k: v for k, v in run.items()})
+        for name, (run, j) in runs.items():
+            if name in children:
+                self._children[run["id"]] = children[name]
+            if run["status"] == "queued":
+                self._submit(run, j)
         return started
+
+    def _submit(self, run: dict, job: dict) -> None:
+        fut = self._pool.submit(self._execute, run, job)
+        self._futures.add(fut)
+        fut.add_done_callback(self._futures.discard)
+
+    def _release_children(self, run: dict) -> None:
+        """After a run ends: start the jobs waiting for it, or skip them if it didn't succeed."""
+        for child, job in self._children.pop(run["id"], []):
+            if run["status"] == "success":
+                child.update(status="queued", queued=_now(), queued_ts=time.time())
+                self._save_run(child)
+                self._submit(child, job)
+            else:
+                child.update(status="skipped", finished=_now(),
+                             error=f"Not run: {run['job']} ended with {run['status']}")
+                self._save_run(child)
+                self._release_children(child)
 
     # -- running ----------------------------------------------------------------------
     def _execute(self, run: dict, job: dict) -> None:
@@ -575,15 +712,20 @@ class Jobs:
         out = _Output(masked)
         run.update(status="running", started=_now(), started_ts=time.time())
         self._save_run(run)
+        out.on_write = lambda: self._save_run({**run, "output": out.value()})
         status, error, code = "failed", None, None
         try:
             if job["run"] is not None:
                 code = self._run_shell(run, job, env, out)
             elif job["depot"] is not None:
                 code = self._run_depot(run, job, env, out)
+            elif job["mirror"] is not None:
+                code = self._run_mirror(run, job, env, out)
+            elif job["depot_ci"] is not None:
+                code = self._run_depot_ci(run, job, env, out)
             else:
                 code = self._run_post(job, env, out)
-            status = "success" if code == 0 else "failed"
+            status = "success" if code == 0 else "cancelled" if code == 130 else "failed"
         except subprocess.TimeoutExpired:
             status, error = "timeout", f"Stopped after {job['timeout']} s"
         except Exception as e:  # noqa: BLE001 - every failure belongs in the run record
@@ -592,7 +734,9 @@ class Jobs:
                    duration=round(time.time() - run["started_ts"], 1), output=out.value())
         if error:
             run["error"] = error
+        out.on_write = None
         self._save_run(run)
+        self._release_children(run)
 
     def _run_shell(self, run: dict, job: dict, env: dict, out: _Output) -> int:
         sh = shutil.which("bash") or "/bin/sh"
@@ -766,6 +910,227 @@ class Jobs:
 
         return self._run_process(run, job, {**env, "DEPOT_PROJECT_ID": project}, out, argv, after=read_meta)
 
+    # -- mirror ------------------------------------------------------------------------
+    def _run_mirror(self, run: dict, job: dict, env: dict, out: _Output) -> int:
+        """Push every branch and tag to another git host. Without force, only fast-forwards (and new refs) go:
+        a ref that moved on the other side is reported and left alone, so nothing there is ever lost."""
+        from dulwich.client import get_transport_and_path
+        from dulwich.graph import can_fast_forward
+
+        m = job["mirror"]
+        url = _expand(m["url"], env)
+        token = _expand(m["token"], env) if m["token"] else None
+        if m["token"] and not token:
+            raise StorageError(f"mirror.token is empty: set the secret it names ({m['token']})")
+        kwargs = {"username": _expand(m["username"], env), "password": token} if token else {}
+        client, path = get_transport_and_path(url, **kwargs)
+        out.write(f"Mirroring {run['repo']} to {out.mask(url)}{' (force)' if m['force'] else ''}\n")
+        r = self.forge.open(run["repo"])
+        rejected: dict[bytes, str] = {}
+        try:
+            local = {k: v for k, v in r.refs.as_dict().items() if k.startswith((b"refs/heads/", b"refs/tags/"))}
+
+            def update_refs(remote: dict) -> dict:
+                wanted = dict(remote)
+                for ref, sha in local.items():
+                    have = remote.get(ref)
+                    if have == sha:
+                        continue
+                    if have and not m["force"]:
+                        if ref.startswith(b"refs/tags/"):
+                            rejected[ref] = "the tag points elsewhere there"
+                            continue
+                        if have not in r.object_store:
+                            rejected[ref] = "it has commits the forge doesn't have"
+                            continue
+                        if not can_fast_forward(r, have, sha):
+                            rejected[ref] = "the forge's branch doesn't contain it (not a fast-forward)"
+                            continue
+                    wanted[ref] = sha
+                return wanted
+
+            result = client.send_pack(path, update_refs, generate_pack_data=r.generate_pack_data)
+        finally:
+            r.close()
+        remote_refs = getattr(result, "refs", None) or {}
+        statuses = getattr(result, "ref_status", None) or {}
+        failed = False
+        for ref in sorted(local):
+            name = ref.decode()
+            if ref in rejected:
+                out.write(f"  ! {name}: kept as it is there, {rejected[ref]}\n")
+                failed = True
+            elif statuses.get(ref):
+                out.write(f"  ! {name}: {statuses[ref]}\n")
+                failed = True
+            elif ref in statuses:
+                out.write(f"  {name} -> {local[ref].decode()[:12]}\n")
+            elif remote_refs.get(ref) == local[ref] or not statuses:
+                out.write(f"  {name} up to date\n")
+        out.write("Mirror up to date.\n" if not failed else "Some refs weren't mirrored (see above).\n")
+        return 1 if failed else 0
+
+    # -- Depot CI -------------------------------------------------------------------------
+    def _depot_ci_env(self, env: dict, home: Path) -> dict:
+        path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+        return {"PATH": path, "HOME": str(home), "LANG": "C.UTF-8", "CI": "true",
+                "DEPOT_TOKEN": env.get("DEPOT_TOKEN", ""), "DEPOT_DISABLE_UPDATE_CHECK": "1"}
+
+    def _depot(self, cli: str, args: list[str], env: dict, home: Path, stdin: str | None = None,
+               timeout: float = 120) -> subprocess.CompletedProcess:
+        return subprocess.run([cli, *args], input=(stdin or "").encode(), capture_output=True, timeout=timeout,
+                              env=self._depot_ci_env(env, home), cwd=home)
+
+    def _run_depot_ci(self, run: dict, job: dict, env: dict, out: _Output) -> int:
+        d = job["depot_ci"]
+        if not env.get("DEPOT_TOKEN"):
+            raise StorageError("A depot_ci job needs the DEPOT_TOKEN secret: a Depot organization API token "
+                               "(organization Settings > API tokens) or your user token (`depot login token`), as "
+                               "a repo secret or a user secret. A project token can't start CI runs.")
+        cli = self.depot_cli(out)
+        org = ["--org", _expand(d["org"], env)] if d["org"] else []
+        repo = _expand(d["repo"], env)
+        ref = _expand(d["ref"], env) if d["ref"] else (run.get("tag") or run["branch"])
+        home = Path(tempfile.mkdtemp(prefix="forge-depot-ci-", dir=self.work_dir))
+        try:
+            for name in d["secrets"]:
+                if not env.get(name):
+                    raise StorageError(f"depot_ci.secrets names {name}, which isn't a secret of this repo or its owner")
+                p = self._depot(cli, ["ci", "secrets", "add", name, "--repo", repo, *org], env, home, stdin=env[name])
+                if p.returncode != 0:
+                    out.write(out.mask((p.stdout + p.stderr).decode("utf-8", "replace")))
+                    raise StorageError(f"Couldn't copy the secret {name} to Depot CI (depot ci secrets add)")
+                out.write(f"Depot CI secret {name} updated for {repo}\n")
+            args = ["ci", "dispatch", "--repo", repo, "--workflow", d["workflow"], "--ref", ref, "-o", "json", *org]
+            for k, v in d["inputs"].items():
+                args += ["--input", f"{k}={_expand(v, env)}"]
+            out.write(f"$ depot {' '.join(args)}\n")
+            p = self._depot(cli, args, env, home)
+            text = (p.stdout + p.stderr).decode("utf-8", "replace")
+            if p.returncode != 0:
+                out.write(out.mask(text))
+                raise StorageError("depot ci dispatch failed (see above)")
+            try:
+                answer = json.loads(p.stdout.decode())
+            except ValueError:
+                m = re.search(r'"run_id"\s*:\s*"([^"]+)"', text)
+                answer = {"run_id": m.group(1)} if m else {}
+            run_id = answer.get("run_id") or answer.get("runId")
+            if not run_id:
+                out.write(out.mask(text))
+                raise StorageError("depot ci dispatch didn't say which run it started")
+            org_id = answer.get("org_id") or answer.get("orgId") or (d["org"] and _expand(d["org"], env)) or ""
+            run["depot"] = {"ci_run_id": run_id, "org": org_id, "repo": repo, "workflow": d["workflow"], "ref": ref}
+            out.write(f"Depot CI run {run_id} started\n")
+            self._save_run({**run, "output": out.value()})
+            if not d["wait"]:
+                return 0
+            self._watch_add(run)
+            try:
+                return self._follow_depot_ci(run, cli, env, out, home)
+            finally:
+                self._watch_remove(run)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def _follow_depot_ci(self, run: dict, cli: str, env: dict, out: _Output, home: Path) -> int:
+        """Poll `depot ci status` until the run ends; returns 0 finished, 1 failed, 130 cancelled."""
+        dep = run["depot"]
+        org = ["--org", dep["org"]] if dep.get("org") else []
+        deadline = (run.get("started_ts") or time.time()) + run.get("timeout", DEFAULT_TIMEOUT)
+        last, seen_urls, errors = None, ({dep["url"]} if dep.get("url") else set()), 0
+        while True:
+            p = self._depot(cli, ["ci", "status", dep["ci_run_id"], "-o", "json", *org], env, home)
+            try:
+                status = json.loads(p.stdout.decode())
+                errors = 0
+            except ValueError:
+                errors += 1
+                if errors >= 6:
+                    out.write(out.mask((p.stdout + p.stderr).decode("utf-8", "replace")))
+                    raise StorageError("depot ci status keeps failing (see above)") from None
+                status = {}
+            state = status.get("status")
+            dep["org"] = dep.get("org") or status.get("org_id") or ""
+            for wf in status.get("workflows") or []:
+                if wf.get("workflow_id") and dep["org"]:
+                    url = f"https://depot.dev/orgs/{dep['org']}/workflows/{wf['workflow_id']}"
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        dep.setdefault("url", url)
+                        out.write(f"Depot CI {wf.get('name') or wf.get('workflow_path') or 'workflow'}: {url}\n")
+                        self._save_run({**run, "output": out.value()})
+                for jb in wf.get("jobs") or []:
+                    for at in jb.get("attempts") or []:
+                        url = at.get("view_url")
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            out.write(f"  {jb.get('job_display_name') or jb.get('job_key') or 'job'}: {url}\n")
+            if state and state != last:
+                out.write(f"Depot CI: {state}\n")
+                last = state
+                self._save_run({**run, "output": out.value()})
+            if state in DEPOT_CI_DONE:
+                return {"success": 0, "failed": 1, "cancelled": 130}[DEPOT_CI_DONE[state]]
+            if time.time() > deadline:
+                raise subprocess.TimeoutExpired(["depot", "ci", "status"], run.get("timeout", DEFAULT_TIMEOUT))
+            time.sleep(DEPOT_CI_POLL)
+
+    def _watch_add(self, run: dict) -> None:
+        with self._index_lock:
+            ids = [x for x in (self.kv.get(WATCH_KEY) or {}).get("runs", []) if x != run["id"]]
+            self.kv.put(WATCH_KEY, {"runs": [run["id"], *ids][:50]})
+
+    def _watch_remove(self, run: dict) -> None:
+        with self._index_lock:
+            ids = [x for x in (self.kv.get(WATCH_KEY) or {}).get("runs", []) if x != run["id"]]
+            self.kv.put(WATCH_KEY, {"runs": ids})
+
+    def resume(self) -> int:
+        """At startup: keep following the Depot CI runs that a stopped server (say, the one this deploy replaced)
+        was waiting on, so their outcome still lands in the run record. Returns how many were picked up."""
+        if not self.enabled:
+            return 0
+        n = 0
+        for run_id in (self.kv.get(WATCH_KEY) or {}).get("runs", []):
+            run = self.kv.get(f"forge_run_{run_id}")
+            if not run or run.get("status") not in ("running",) or not (run.get("depot") or {}).get("ci_run_id"):
+                self._watch_remove({"id": run_id})
+                continue
+            fut = self._pool.submit(self._resume_one, run)
+            self._futures.add(fut)
+            fut.add_done_callback(self._futures.discard)
+            n += 1
+        return n
+
+    def _resume_one(self, run: dict) -> None:
+        secrets = self.secrets.values(run["repo"])
+        out = _Output({k: v for k, v in secrets.items() if k not in UNMASKED})
+        out.write(run.get("output") or "")
+        out.write("\n(The server running this job restarted; a new one picked up the wait.)\n")
+        out.on_write = lambda: self._save_run({**run, "output": out.value()})
+        home = Path(tempfile.mkdtemp(prefix="forge-depot-ci-", dir=self.work_dir))
+        status, error, code = "failed", None, None
+        try:
+            code = self._follow_depot_ci(run, self.depot_cli(out), secrets, out, home)
+            status = "success" if code == 0 else "cancelled" if code == 130 else "failed"
+        except subprocess.TimeoutExpired:
+            status, error = "timeout", f"Stopped after {run.get('timeout')} s"
+        except Exception as e:  # noqa: BLE001
+            status, error = "error", out.mask(str(e))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            self._watch_remove(run)
+        latest = self.kv.get(f"forge_run_{run['id']}") or run
+        if latest.get("status") != "running":
+            return  # the original job (or another replica) already recorded the end
+        run.update(status=status, exit_code=code, finished=_now(),
+                   duration=round(time.time() - (run.get("started_ts") or time.time()), 1), output=out.value())
+        if error:
+            run["error"] = error
+        out.on_write = None
+        self._save_run(run)
+
     @staticmethod
     def _pump(proc, out: _Output) -> None:
         for chunk in iter(lambda: proc.stdout.read1(4096), b""):
@@ -820,6 +1185,10 @@ class Jobs:
         """Block until the jobs queued so far have finished (tests, and a clean shutdown)."""
         from concurrent.futures import wait
 
-        with self._index_lock:
-            pending = list(self._futures)
-        wait(pending, timeout=timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:  # jobs that ran `after` another are submitted as it ends: wait for those too
+            with self._index_lock:
+                pending = list(self._futures)
+            if not pending:
+                return
+            wait(pending, timeout=max(0.0, deadline - time.time()))

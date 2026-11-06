@@ -106,6 +106,13 @@ def _request_token(request: Request) -> str | None:
     return request.query_params.get("token") or None
 
 
+# The commit this server was deployed from: CI writes it to fileapi/BUILD before deploying (not in git).
+try:
+    BUILD = (Path(__file__).with_name("BUILD").read_text().strip() or None)
+except OSError:
+    BUILD = None
+
+
 def create_app(
     root: str | None = None,
     *,
@@ -183,6 +190,7 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
+        jobs.resume()  # Depot CI runs a replaced server was still following
         async with mcp.session_manager.run():
             yield
 
@@ -282,7 +290,8 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
 
     @app.get("/health")
     def health():
-        return {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend}
+        return {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend,
+                "build": BUILD}
 
     # ---- REST API ------------------------------------------------------
     authed = [Depends(require_token)]

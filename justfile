@@ -85,18 +85,27 @@ login:
 link app_id="": login
     {{fastapi}} cloud link {{app_id}}
 
-# git pull --ff-only, then deploy to FastAPI Cloud (ensures DATABASE_URL is set there first). deploy-only skips the pull.
-deploy:
+# Deploy through CI: push this branch's commit to main on the forge (nandi.uk/fileapi), which mirrors it to
+# GitHub and runs the FastAPI Cloud deploy on Depot CI (.forge/jobs.toml). Prints the CI run links and follows
+# them. Signs in through git-credential-fileapi (`just git-setup` once). `just deploy-only` deploys from here.
+deploy url=fileapi_url repo="nandi.uk/fileapi":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Pulling the latest code..."
-    if ! git pull --ff-only; then
-        echo "git pull couldn't fast-forward (local commits, or uncommitted changes in files the pull touches)." >&2
-        echo "Sort that out (git status), or run 'just deploy-only' to deploy what you have." >&2
+    base="{{url}}"; base="${base%/}"; base="${base%/mcp}"
+    forge="$base/git/{{repo}}.git"
+    git remote get-url forge >/dev/null 2>&1 || git remote add forge "$forge"
+    git fetch --quiet forge main
+    if ! git merge-base --is-ancestor FETCH_HEAD HEAD; then
+        echo "main on the forge has commits this branch doesn't: git pull --rebase forge main, then retry." >&2
         exit 1
     fi
-    just deploy-only
-    just forge-mirror || echo "Deployed, but mirroring to the forge failed (see above); rerun 'just forge-mirror'." >&2
+    sha=$(git rev-parse HEAD)
+    if [ "$(git rev-parse FETCH_HEAD)" = "$sha" ]; then
+        echo "The forge already has $sha on main. To deploy it again: Run now in the forge UI (Deploys tab)."
+        exit 0
+    fi
+    git push forge "$sha:refs/heads/main"
+    {{python}} -m fileapi.ci_watch --url "$base" "{{repo}}" "$sha"
 
 # Deploy to FastAPI Cloud without pulling first
 deploy-only: login
@@ -178,9 +187,10 @@ claude-add url=fileapi_url scope="user":
     claude mcp add --transport http --scope {{scope}} fileapi "$url/mcp"
     echo "Added fileapi to Claude Code ({{scope}} scope). Run /mcp in Claude Code and pick fileapi to sign in as nandi.uk."
 
-# Mirror this repo (every GitHub branch and tag) to the forge as <handle>/fileapi. GitHub stays primary.
-# Signs in through git-credential-fileapi (run `just git-setup` once). If one push of a branch fails, it
-# falls back to one commit at a time (kept as a safety net; the server now streams big pushes).
+# Copy GitHub's branches and tags to the forge as <handle>/fileapi. The forge is primary now (it mirrors itself
+# to GitHub on every push), so this is only for catching up commits that landed on GitHub first: fast-forwards
+# only, nothing on the forge is overwritten or deleted. Signs in through git-credential-fileapi (`just git-setup`).
+# If one push of a branch fails, it falls back to one commit at a time (a safety net; the server streams big pushes).
 forge-mirror url=fileapi_url repo="nandi.uk/fileapi":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -196,16 +206,15 @@ forge-mirror url=fileapi_url repo="nandi.uk/fileapi":
         tip=$(git rev-parse "refs/remotes/origin/$ref")
         remote=$(git ls-remote forge "refs/heads/$ref" | awk '{print $1}')
         [ "$remote" = "$tip" ] && continue
-        if git push --quiet --force forge "$tip:refs/heads/$ref" 2>/dev/null; then echo "  $ref"; continue; fi
+        if [ -n "$remote" ] && ! git merge-base --is-ancestor "$remote" "$tip" 2>/dev/null; then
+            echo "  $ref: skipped, the forge has commits GitHub doesn't" >&2; continue
+        fi
+        if git push --quiet forge "$tip:refs/heads/$ref" 2>/dev/null; then echo "  $ref"; continue; fi
         exclude=$(for h in $have; do git cat-file -e "$h" 2>/dev/null && echo "^$h"; done)
         for c in $(git rev-list --reverse --first-parent "$tip" $exclude); do
-            git push --quiet --force forge "$c:refs/heads/$ref"
+            git push --quiet forge "$c:refs/heads/$ref"
         done
         echo "  $ref (step by step)"
-    done
-    # Branches deleted on GitHub go away on the forge too.
-    for ref in $(git ls-remote forge 'refs/heads/*' | awk '{sub("refs/heads/","",$2); print $2}'); do
-        git show-ref --verify --quiet "refs/remotes/origin/$ref" || git push --quiet forge --delete "$ref"
     done
     git push --quiet forge --tags
     echo "Forge mirror up to date: $base/forge/#{{repo}}"

@@ -1545,3 +1545,147 @@ async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
         assert not (await c.call_tool("delete_release_asset", {"repo": "rel", "tag": "v2", "name": "sum.txt"})).is_error
         assert not (await c.call_tool("delete_release", {"repo": "rel", "tag": "v2"})).is_error
         assert (await c.call_tool("delete_release", {"repo": "rel", "tag": "v2"})).is_error
+
+
+def test_mirror_job_and_after(tmp_path, backend):
+    from dulwich.repo import Repo
+
+    target = tmp_path / "github.git"
+    Repo.init_bare(str(target), mkdir=True)
+    toml = f"""
+[[job]]
+name = "github"
+branches = ["*"]
+tags = ["*"]
+mirror = {{ url = "{target}" }}
+
+[[job]]
+name = "deploy"
+after = "github"
+run = "echo deploying $FORGE_SHA"
+"""
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge, jobs = client.app.state.forge, client.app.state.jobs
+        forge.create("nandi.uk", "app")
+        base = "/api/forge/repos/nandi.uk/app"
+        sha = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": toml}, "jobs")["commit"]
+        jobs.wait()
+        runs = {r["job"]: r for r in client.get(f"{base}/runs", headers=AUTH).json()["runs"]}
+        assert runs["github"]["status"] == "success" and runs["github"]["kind"] == "mirror", runs
+        assert runs["deploy"]["status"] == "success" and runs["deploy"]["after"] == "github"
+        mirrored = Repo(str(target))
+        assert mirrored.refs[b"refs/heads/main"] == sha.encode()
+
+        # Other branches mirror too (deploy only runs for main); a fast-forward goes through.
+        forge.commit_files("nandi.uk/app", "dev", {"a.txt": "a"}, "dev")
+        sha2 = forge.commit_files("nandi.uk/app", "main", {"b.txt": "b"}, "more")["commit"]
+        jobs.wait()
+        assert mirrored.refs[b"refs/heads/main"] == sha2.encode() and b"refs/heads/dev" in mirrored.refs.allkeys()
+
+        # GitHub moved on by itself: main there isn't overwritten, the mirror fails, deploy is skipped.
+        from dulwich.objects import Commit, Tree
+        tree = Tree()
+        mirrored.object_store.add_object(tree)
+        c = Commit()
+        c.tree, c.parents = tree.id, [sha2.encode()]
+        c.author = c.committer = b"x <x@x>"
+        c.author_time = c.commit_time = 0
+        c.author_timezone = c.commit_timezone = 0
+        c.message = b"made on github"
+        mirrored.object_store.add_object(c)
+        mirrored.refs[b"refs/heads/main"] = c.id
+        forge.commit_files("nandi.uk/app", "main", {"c.txt": "c"}, "diverged")
+        jobs.wait()
+        runs = client.get(f"{base}/runs", headers=AUTH).json()["runs"]
+        latest = {r["job"]: r for r in runs[:2]}
+        assert latest["github"]["status"] == "failed" and latest["deploy"]["status"] == "skipped"
+        out = client.get(f"{base}/runs/{latest['github']['id']}", headers=AUTH).json()["output"]
+        assert "refs/heads/main: kept as it is there" in out
+        assert Repo(str(target)).refs[b"refs/heads/main"] == c.id
+
+    for bad, msg in (("[[job]]\nname='a'\nafter='nope'\nrun='x'\n", "no such job"),
+                     ("[[job]]\nname='a'\nafter='b'\nrun='x'\n[[job]]\nname='b'\nafter='a'\nrun='x'\n", "wait for each other"),
+                     ("[[job]]\nname='a'\nmirror={colour='x'}\n", "unknown mirror setting"),
+                     ("[[job]]\nname='a'\ndepot_ci={repo='a/b'}\n", "depot_ci.workflow is required")):
+        with pytest.raises(StorageError, match=msg):
+            parse_jobs(bad)
+
+
+FAKE_DEPOT_CI = r"""#!/bin/sh
+echo "$@ token=$DEPOT_TOKEN" >> "$FAKE_LOG"
+case "$1 $2" in
+  "ci secrets") cat >> "$FAKE_LOG"; echo >> "$FAKE_LOG"; echo "ok" ;;
+  "ci dispatch") echo '{"org_id": "org1", "run_id": "run42"}' ;;
+  "ci status")
+    n=$(cat "$FAKE_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_STATE"
+    s=running; [ "$n" -ge "$FAKE_DONE_AFTER" ] && s="$FAKE_END"
+    echo "{\"org_id\":\"org1\",\"run_id\":\"run42\",\"status\":\"$s\",\"workflows\":[{\"workflow_id\":\"wf7\",\"name\":\"Deploy\",\"status\":\"$s\",\"jobs\":[{\"job_display_name\":\"deploy\",\"attempts\":[{\"view_url\":\"https://depot.dev/orgs/org1/workflows/wf7?job=j1\"}]}]}]}"
+    ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def test_depot_ci_job_and_resume(tmp_path, monkeypatch):
+    import fileapi.deploy as deploy
+
+    fake = tmp_path / "depot"
+    fake.write_text(FAKE_DEPOT_CI)
+    fake.chmod(0o755)
+    log, state = tmp_path / "depot.log", tmp_path / "ci-count"
+    monkeypatch.setenv("FILEAPI_DEPOT_CLI", str(fake))
+    monkeypatch.setattr(deploy, "DEPOT_CI_POLL", 0.01)
+    # The fake reads these from the job's environment, which is scrubbed: pass them through PATH's sibling vars.
+    real_env = deploy.Jobs._depot_ci_env
+    monkeypatch.setattr(deploy.Jobs, "_depot_ci_env", lambda self, env, home: {
+        **real_env(self, env, home), "FAKE_LOG": str(log), "FAKE_STATE": str(state),
+        "FAKE_DONE_AFTER": os.environ.get("FAKE_DONE_AFTER", "3"), "FAKE_END": os.environ.get("FAKE_END", "finished")})
+    toml = """
+[[job]]
+name = "deploy"
+[job.depot_ci]
+repo = "me/app"
+workflow = "deploy.yml"
+inputs = { sha = "${FORGE_SHA}" }
+secrets = ["FASTAPI_TOKEN"]
+"""
+    with TestClient(app_for(tmp_path)) as client:
+        forge, jobs = client.app.state.forge, client.app.state.jobs
+        forge.create("nandi.uk", "app")
+        base = "/api/forge/repos/nandi.uk/app"
+        for name, value in (("DEPOT_TOKEN", "depot-org-tok"), ("FASTAPI_TOKEN", "fastapi-deploy-tok")):
+            assert client.put(f"{base}/secrets/{name}", json={"value": value}, headers=AUTH).status_code == 201
+        sha = forge.commit_files("nandi.uk/app", "main", {".forge/jobs.toml": toml}, "jobs")["commit"]
+        jobs.wait()
+        run = client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]
+        assert run["status"] == "success" and run["kind"] == "depot_ci", run
+        assert run["depot"]["ci_run_id"] == "run42" and run["depot"]["url"] == "https://depot.dev/orgs/org1/workflows/wf7"
+        calls = log.read_text()
+        assert "ci secrets add FASTAPI_TOKEN --repo me/app token=depot-org-tok\nfastapi-deploy-tok\n" in calls
+        assert f"ci dispatch --repo me/app --workflow deploy.yml --ref main -o json --input sha={sha}" in calls
+        out = client.get(f"{base}/runs/{run['id']}", headers=AUTH).json()["output"]
+        assert "https://depot.dev/orgs/org1/workflows/wf7" in out and "Depot CI: finished" in out
+        assert "fastapi-deploy-tok" not in out and "depot-org-tok" not in out
+        assert (jobs.kv.get(deploy.WATCH_KEY) or {}).get("runs") == []
+
+        # A failed Depot run fails the forge run.
+        state.unlink()
+        monkeypatch.setenv("FAKE_END", "failed")
+        client.post(f"{base}/runs", json={}, headers=AUTH)
+        jobs.wait()
+        assert client.get(f"{base}/runs", headers=AUTH).json()["runs"][0]["status"] == "failed"
+
+        # The server following a run stopped (it deployed itself): the next one picks the wait back up.
+        monkeypatch.setenv("FAKE_END", "finished")
+        state.unlink()
+        stuck = {"id": "ab" * 8, "repo": "nandi.uk/app", "job": "deploy", "kind": "depot_ci", "status": "running",
+                 "started_ts": time.time(), "timeout": 600, "output": "Depot CI run run42 started\n",
+                 "depot": {"ci_run_id": "run42", "org": "org1", "url": "https://depot.dev/orgs/org1/workflows/wf7"}}
+        jobs.kv.put(f"forge_run_{stuck['id']}", stuck)
+        jobs._add_to_index("nandi.uk/app", stuck["id"])
+        jobs._watch_add(stuck)
+        assert jobs.resume() == 1
+        jobs.wait()
+        got = client.get(f"{base}/runs/{stuck['id']}", headers=AUTH).json()
+        assert got["status"] == "success" and "picked up the wait" in got["output"]
+        assert jobs.resume() == 0

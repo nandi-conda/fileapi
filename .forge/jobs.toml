@@ -1,0 +1,26 @@
+# CI for fileapi on its own forge (nandi.uk/fileapi). See "Deploy jobs" in README.md.
+# Needs secrets: GITHUB_MIRROR_TOKEN (repo), DEPOT_TOKEN (user or repo), FASTAPI_TOKEN (repo).
+
+# Every push (branches and tags) goes to GitHub as a backup. Only fast-forwards: if GitHub has commits the
+# forge doesn't, that ref is reported and left alone.
+[[job]]
+name = "github-mirror"
+branches = ["*"]
+tags = ["*"]
+timeout = 900
+[job.mirror]
+url = "https://github.com/nandi-conda/fileapi.git"
+token = "${GITHUB_MIRROR_TOKEN}"
+
+# Pushes to main deploy to FastAPI Cloud on Depot CI (.depot/workflows/deploy.yml), once GitHub has the
+# commit. The Depot run is followed here; it keeps going if this server is replaced mid-deploy.
+[[job]]
+name = "deploy"
+branches = ["main"]
+after = "github-mirror"
+timeout = 1800
+[job.depot_ci]
+repo = "nandi-conda/fileapi"
+workflow = "deploy.yml"
+inputs = { sha = "${FORGE_SHA}", forge_run = "${FORGE_URL}/forge/#${FORGE_REPO}/-/deploys/${FORGE_RUN_ID}" }
+secrets = ["FASTAPI_TOKEN"]
