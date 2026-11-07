@@ -72,6 +72,8 @@ private:
     QLabel *m_title;
     QLabel *m_meta;
     QTextBrowser *m_notes;
+    QLabel *m_changesHeading;
+    QTextBrowser *m_changes;
     QTreeWidget *m_assets;
     QBoxLayout *m_assetButtons;
     QPushButton *m_download;

@@ -18,6 +18,7 @@
 #include <QLocale>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QTextDocument>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStyle>
@@ -99,6 +100,19 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_notes->setMinimumHeight(80);
     touchScroll(m_notes);
     vl->addWidget(m_notes, 2);
+    // The changelog is made by the server when the release is, and kept apart from the notes.
+    m_changesHeading = new QLabel;
+    QFont hf = font();
+    hf.setBold(true);
+    m_changesHeading->setFont(hf);
+    m_changesHeading->setContentsMargins(0, 6, 0, 0);
+    m_changesHeading->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    vl->addWidget(m_changesHeading);
+    m_changes = new QTextBrowser;
+    m_changes->setOpenExternalLinks(true);
+    m_changes->setMinimumHeight(80);
+    touchScroll(m_changes);
+    vl->addWidget(m_changes, 2);
     m_assets = new QTreeWidget;
     m_assets->setHeaderLabels({"File", "Size", "Downloads"});
     m_assets->setRootIsDecorated(false);
@@ -167,7 +181,7 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     form->addRow("Title:", m_editName);
     el->addLayout(form);
     m_editNotes = new QPlainTextEdit;
-    m_editNotes->setPlaceholderText("Release notes (Markdown). Leave empty and a changelog of the commits since the previous release is written for you.");
+    m_editNotes->setPlaceholderText("Release notes (Markdown). The changelog of commits is added separately.");
     el->addWidget(m_editNotes, 1);
     auto *flags = new QHBoxLayout;
     m_editPre = new QCheckBox("Prerelease");
@@ -383,11 +397,29 @@ void ReleasesPanel::showRelease(const QJsonObject &rel)
         meta << "prerelease";
     m_meta->setText(meta.join("  ·  "));
     const QString notes = rel.value("notes").toString();
+    const QString changes = rel.value("changelog").toString();
+    const QString since = rel.value("changelog_since").toString();
+    // Without notes the changelog gets the room; without either, the notes box says so.
+    m_notes->setVisible(!notes.trimmed().isEmpty() || changes.isEmpty());
+    m_changesHeading->setVisible(!changes.isEmpty());
+    m_changes->setVisible(!changes.isEmpty());
+    m_changesHeading->setText(since.isEmpty() ? QStringLiteral("Changelog") : "Changelog since " + since);
 #if QT_CONFIG(textmarkdownreader)
     m_notes->setMarkdown(notes.isEmpty() ? QStringLiteral("*No release notes.*") : notes);
+    m_changes->setMarkdown(changes);
 #else
     m_notes->setPlainText(notes.isEmpty() ? QStringLiteral("No release notes.") : notes);
+    m_changes->setPlainText(changes);
 #endif
+    // Notes beside a changelog take only the height they need, so the changelog and files stay in view.
+    if (changes.isEmpty()) {
+        m_notes->setMaximumHeight(QWIDGETSIZE_MAX);
+    } else {
+        QTextDocument *doc = m_notes->document();
+        doc->setTextWidth(qMax(200, m_notes->viewport()->width()));
+        const int h = int(doc->size().height()) + 2 * m_notes->frameWidth() + 8;
+        m_notes->setMaximumHeight(qBound(48, h, 240));
+    }
     m_assets->clear();
     const QJsonArray assets = rel.value("assets").toArray();
     if (assets.isEmpty())

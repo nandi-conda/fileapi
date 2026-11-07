@@ -60,7 +60,7 @@ def _subject(message: str) -> str:
 
 
 def format_changelog(commits: list[dict], tag: str, previous: str | None, link: Callable[[str], str] | None = None) -> str:
-    """Markdown release notes from commits (newest first). Conventional-commit prefixes (feat:, fix:, ...)
+    """A release's changelog in Markdown from its commits (newest first). Conventional-commit prefixes (feat:, fix:, ...)
     sort them under headings; plain messages make one list."""
     if not commits:
         return f"No changes since {previous}." if previous else "No commits."
@@ -71,9 +71,8 @@ def format_changelog(commits: list[dict], tag: str, previous: str | None, link: 
         return f"- {text} ({ref})"
 
     parsed = [(c, _CONVENTIONAL.match(_subject(c["message"]))) for c in commits]
-    lines = ["## What's changed", ""]
     if not any(m for _, m in parsed):
-        lines += [item(c, _subject(c["message"])) for c in commits]
+        lines = [item(c, _subject(c["message"])) for c in commits]
     else:
         groups: dict[str, list[str]] = {name: [] for name, _ in _SECTIONS}
         for c, m in parsed:
@@ -86,12 +85,18 @@ def format_changelog(commits: list[dict], tag: str, previous: str | None, link: 
             section = "Breaking changes" if breaking else next(
                 (name for name, kinds in _SECTIONS if kind in kinds), "Other changes")
             groups[section].append(item(c, text))
-        lines = ["## What's changed"]
+        lines = []
         for name, _ in _SECTIONS:
             if groups[name]:
-                lines += ["", f"### {name}", "", *groups[name]]
-    lines += ["", f"**Full changelog:** {previous}...{tag}" if previous else f"**Full changelog:** {len(commits)} commits up to {tag}"]
+                lines += ["" if lines else None, f"### {name}", "", *groups[name]]
+        lines = [x for x in lines if x is not None]
+    lines += ["", f"**Full changelog:** {previous}...{tag}" if previous else f"**Full changelog:** {len(commits)} commit{'' if len(commits) == 1 else 's'} up to {tag}"]
     return "\n".join(lines)
+
+
+# What an earlier version wrote into the notes field (before the changelog got a field of its own).
+_OLD_GENERATED = re.compile(r"(?:\A|\n\n)## What's changed\n.*?\*\*Full changelog:\*\*[^\n]*"
+                            r"(?:\n\n_Only the newest \d+ commits are listed\._)?\s*\Z", re.S)
 
 
 def _now() -> str:
@@ -303,7 +308,9 @@ def _asset(rel: dict, name: str) -> dict:
 
 
 def _public(rel: dict) -> dict:
-    out = {k: v for k, v in rel.items() if k not in ("assets", "notes_filled")}
+    out = {k: v for k, v in rel.items() if k != "assets"}
+    out.setdefault("changelog", "")
+    out.setdefault("changelog_since", None)
     out["assets"] = [{k: v for k, v in a.items() if k != "blob"} for a in rel["assets"]]
     return out
 
@@ -325,23 +332,28 @@ class Releases:
 
     # -- reading --------------------------------------------------------------
     def _backfill(self, repo: str, doc: dict) -> dict:
-        """Releases made before changelogs existed (or with their notes cleared) get one, saved, on first view.
-        A few per call, so a repo with hundreds of old releases fills in over a few page loads."""
-        todo = [r["tag"] for r in reversed(doc["releases"])
-                if not (r.get("notes") or "").strip() and r.get("target") and not r.get("notes_filled")][:10]
+        """Releases made before the changelog had its own field get one on first view (a few per call, saved).
+        Changelog text an earlier version put into the notes moves out of them, leaving the notes as written."""
+        todo = [r["tag"] for r in reversed(doc["releases"]) if "changelog" not in r][:10]
         if not todo:
             return doc
         made = {}
         for tag in todo:
             try:
-                made[tag] = self.changelog(repo, tag)["notes"]
+                log = self.changelog(repo, tag)
+                made[tag] = (log["changelog"], log["previous"])
             except Exception:
-                made[tag] = ""
+                made[tag] = ("", None)
 
         def fill(d):
             for r in d["releases"]:
-                if r["tag"] in made and not (r.get("notes") or "").strip():
-                    r["notes"], r["notes_filled"] = made[r["tag"]], True
+                if r["tag"] in made and "changelog" not in r:
+                    r["changelog"], r["changelog_since"] = made[r["tag"]]
+                    notes = _OLD_GENERATED.sub("", r.get("notes") or "").rstrip()
+                    if r.get("notes_filled") and re.fullmatch(r"No changes since \S+\.|No commits\.", notes):
+                        notes = ""  # an earlier version's changelog for a release with no new commits
+                    r["notes"] = notes
+                    r.pop("notes_filled", None)
             return d
 
         try:
@@ -393,14 +405,14 @@ class Releases:
     def changelog(self, repo: str, tag: str, ref: str | None = None, since: str | None = None,
                   link: Callable[[str], str] | None = None) -> dict:
         """The commits a release brings: from its commit back to the previous release or git tag (or `since`),
-        plus Markdown notes listing them. Works before the release exists (it then points where create would)."""
+        plus a Markdown changelog listing them. Works before the release exists (it then points where create would)."""
         tag = check_tag(tag)
         doc = self.store.load(*self._parts(repo))
         rel = next((x for x in doc["releases"] if x["tag"] == tag), None)
         target = rel["target"] if rel and rel.get("target") else self._target(repo, tag, (ref or "").strip() or None)[0]
         out = {"tag": tag, "target": target, "previous": None, "previous_sha": None, "commits": [], "truncated": False}
         if not target:
-            out["notes"] = format_changelog([], tag, None)
+            out["changelog"] = format_changelog([], tag, None)
             return out
         r = self.forge.open(repo)
         try:
@@ -446,22 +458,23 @@ class Releases:
         out["truncated"] = len(commits) > MAX_CHANGELOG
         out["commits"] = commits[:MAX_CHANGELOG]
         out["previous"], out["previous_sha"] = prev_name, prev_sha.decode() if prev_sha else None
-        out["notes"] = format_changelog(out["commits"], tag, prev_name, link or self._link(repo))
+        out["changelog"] = format_changelog(out["commits"], tag, prev_name, link or self._link(repo))
         if out["truncated"]:
-            out["notes"] += f"\n\n_Only the newest {MAX_CHANGELOG} commits are listed._"
+            out["changelog"] += f"\n\n_Only the newest {MAX_CHANGELOG} commits are listed._"
         return out
 
+    def _changelog_for(self, repo: str, tag: str, ref: str | None, link=None) -> tuple[str, str | None]:
+        try:
+            log = self.changelog(repo, tag, ref, link=link)
+            return log["changelog"], log["previous"]
+        except Exception:  # never let the changelog stop a release from being made
+            return "", None
+
     def create(self, repo: str, tag: str, name: str = "", notes: str = "", ref: str | None = None,
-               prerelease: bool = False, draft: bool = False, generate_notes: bool | None = None,
-               link: Callable[[str], str] | None = None) -> dict:
-        """generate_notes: None (default) = a changelog when no notes are given; True = also after given notes."""
+               prerelease: bool = False, draft: bool = False, link: Callable[[str], str] | None = None) -> dict:
+        """Making a release also writes its changelog (the commits since the previous release or tag), kept
+        apart from the notes, which stay exactly as given."""
         tag = check_tag(tag)
-        opted_out = generate_notes is False
-        if generate_notes is None:
-            generate_notes = not (notes or "").strip()
-        if generate_notes:
-            generated = self.changelog(repo, tag, ref, link=link or self._link(repo))["notes"]
-            notes = f"{notes.rstrip()}\n\n{generated}" if (notes or "").strip() else generated
         if len(notes) > MAX_NOTES:
             raise StorageError(f"Release notes are limited to {MAX_NOTES} characters")
         target, tagged = self._target(repo, tag, (ref or "").strip() or None)
@@ -469,8 +482,7 @@ class Releases:
         rel = {"tag": tag, "name": (name or "").strip() or tag, "notes": notes or "", "target": target,
                "tagged": tagged, "prerelease": bool(prerelease), "draft": bool(draft), "created": now,
                "updated": now, "assets": []}
-        if opted_out:
-            rel["notes_filled"] = True  # empty on purpose: don't fill it in later
+        rel["changelog"], rel["changelog_since"] = self._changelog_for(repo, tag, ref, link)
 
         def add(doc):
             if any(r["tag"] == tag for r in doc["releases"]):
@@ -488,6 +500,7 @@ class Releases:
             raise StorageError(f"Release notes are limited to {MAX_NOTES} characters")
         new_tag = check_tag(new_tag) if new_tag and new_tag != tag else None
         target = self._target(repo, new_tag, None) if new_tag else None
+        relog = self._changelog_for(repo, new_tag, None) if target and target[1] else None
 
         def change(doc):
             rel = _find(doc, tag)
@@ -497,11 +510,11 @@ class Releases:
                 rel["tag"] = new_tag
                 if target and target[1]:  # the new name is a git tag: point at what it tags
                     rel["target"], rel["tagged"] = target
+                    rel["changelog"], rel["changelog_since"] = relog
             if name is not None:
                 rel["name"] = name.strip() or rel["tag"]
             if notes is not None:
                 rel["notes"] = notes
-                rel["notes_filled"] = True  # whatever they're set to now is deliberate, even empty
             if prerelease is not None:
                 rel["prerelease"] = bool(prerelease)
             if draft is not None:

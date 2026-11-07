@@ -1667,7 +1667,7 @@ async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
     assert run("publish", "v1.1").returncode == 0
     assert run("upload", "nope", str(big)).returncode == 1
     r = run("changelog", "v9")
-    assert r.returncode == 0 and "## What's changed" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 0 and "Full changelog" in r.stdout, (r.stdout, r.stderr)
 
     async with connect(server_url, TOKEN) as c:
         listing = text(await c.call_tool("list_releases", {"repo": "rel"}))
@@ -2300,51 +2300,53 @@ def test_release_changelog(tmp_path, backend):
         c4 = forge.commit_files(repo, "main", {"a": "4"}, "Tidy the README")["commit"]
         base = "/api/forge/repos/nandi.uk/cl/releases"
 
-        # A release that doesn't exist yet: the commits since the git tag v0.1.0, grouped.
+        # Preview for a release that doesn't exist yet: the commits since the git tag v0.1.0, grouped.
         r = client.get(f"{base}/v0.2.0/changelog", headers=AUTH)
         assert r.status_code == 200, r.text
         log = r.json()
         assert log["previous"] == "v0.1.0" and log["previous_sha"] == c1 and log["target"] == c4
         assert [c["sha"] for c in log["commits"]] == [c4, c3, c2]
-        notes = log["notes"]
-        assert "### Features" in notes and "**ui:** dark mode" in notes and "### Fixes" in notes
-        assert "### Other changes" in notes and "Tidy the README" in notes and "v0.1.0...v0.2.0" in notes
-        assert f"/forge/nandi.uk/cl/-/commits/{c2}" in notes
+        text = log["changelog"]
+        assert text.startswith("### Features") and "**ui:** dark mode" in text and "### Fixes" in text
+        assert "### Other changes" in text and "Tidy the README" in text and "v0.1.0...v0.2.0" in text
+        assert f"/forge/nandi.uk/cl/-/commits/{c2}" in text
         assert client.get(f"{base}/v0.2.0/changelog").status_code == 404  # private repo
 
-        # Creating with generate_notes appends it to the given notes; the next release starts from this one.
-        r = client.post(base, json={"tag": "v0.2.0", "notes": "Hand-written intro.", "generate_notes": True},
-                        headers=AUTH)
+        # Making a release writes its changelog in its own field; the notes stay as given.
+        r = client.post(base, json={"tag": "v0.2.0", "notes": "Hand-written intro."}, headers=AUTH)
         assert r.status_code == 201, r.text
-        assert r.json()["notes"].startswith("Hand-written intro.\n\n## What's changed")
+        rel = r.json()
+        assert rel["notes"] == "Hand-written intro." and rel["changelog_since"] == "v0.1.0"
+        assert "dark mode" in rel["changelog"] and "What's changed" not in rel["changelog"]
+        assert client.get(f"{base}/v0.2.0", headers=AUTH).json()["changelog"] == rel["changelog"]
         c5 = forge.commit_files(repo, "main", {"a": "5"}, "Plain change")["commit"]
-        log = client.get(f"{base}/v0.3.0/changelog", headers=AUTH).json()
-        assert log["previous"] == "v0.2.0" and [c["sha"] for c in log["commits"]] == [c5]
-        assert "### " not in log["notes"] and "- Plain change" in log["notes"]
-        # An existing release's changelog stays fixed at its own commit; since= overrides the start.
+        rel = client.post(base, json={"tag": "v0.3.0"}, headers=AUTH).json()
+        assert rel["notes"] == "" and rel["changelog"].startswith("- Plain change") and "### " not in rel["changelog"]
         log = client.get(f"{base}/v0.2.0/changelog", params={"since": c3}, headers=AUTH).json()
         assert [c["sha"] for c in log["commits"]] == [c4]
-        # No earlier tag or release: everything up to the commit.
         log = client.get(f"{base}/v0.1.0/changelog", headers=AUTH).json()
         assert log["previous"] is None and [c["sha"] for c in log["commits"]] == [c1]
-
-        # Automatic: no notes -> a changelog; explicit false -> stays empty; given notes are kept as they are.
-        rel = client.post(base, json={"tag": "v0.3.0"}, headers=AUTH).json()
-        assert "- Plain change" in rel["notes"] and "v0.2.0...v0.3.0" in rel["notes"]
-        assert "notes_filled" not in rel
-        assert client.post(base, json={"tag": "v0.3.1", "generate_notes": False}, headers=AUTH).json()["notes"] == ""
-        assert client.post(base, json={"tag": "v0.3.2", "notes": "Mine"}, headers=AUTH).json()["notes"] == "Mine"
         # Uploading with create=true makes one with a changelog too.
         forge.commit_files(repo, "main", {"a": "6"}, "Another change")
         client.put(f"{base}/v0.4.0/assets/x.txt", params={"create": "true"}, content=b"x", headers=AUTH)
-        assert "- Another change" in client.get(f"{base}/v0.4.0", headers=AUTH).json()["notes"]
+        rel = client.get(f"{base}/v0.4.0", headers=AUTH).json()
+        assert rel["notes"] == "" and "- Another change" in rel["changelog"]
 
-        # Old releases with empty notes get one on first view; opted-out or cleared ones don't.
+        # Releases from before the field get a changelog on first view, and changelog text an earlier
+        # version wrote into their notes moves out.
         releases = client.app.state.releases
-        releases.store.update("nandi.uk", "cl", lambda d: [r.update(notes="") for r in d["releases"]
-                                                            if r["tag"] == "v0.2.0"])
-        client.patch(f"{base}/v0.3.2", json={"notes": ""}, headers=AUTH)
-        listed = {r["tag"]: r["notes"] for r in client.get(base, headers=AUTH).json()["releases"]}
-        assert "dark mode" in listed["v0.2.0"] and listed["v0.3.1"] == "" and listed["v0.3.2"] == ""
+        old = "Intro line.\n\n## What's changed\n\n- Plain change ([`abc`](x))\n\n**Full changelog:** v0.2.0...v0.3.0"
+
+        def make_old(d):
+            for r in d["releases"]:
+                if r["tag"] in ("v0.2.0", "v0.3.0"):
+                    r.pop("changelog"), r.pop("changelog_since")
+                    r["notes"] = old if r["tag"] == "v0.3.0" else ""
+                    r["notes_filled"] = True
+
+        releases.store.update("nandi.uk", "cl", make_old)
+        listed = {r["tag"]: r for r in client.get(base, headers=AUTH).json()["releases"]}
+        assert listed["v0.3.0"]["notes"] == "Intro line." and "- Plain change" in listed["v0.3.0"]["changelog"]
+        assert listed["v0.2.0"]["notes"] == "" and "dark mode" in listed["v0.2.0"]["changelog"]
         stored = {r["tag"]: r for r in releases.store.load("nandi.uk", "cl")["releases"]}
-        assert "dark mode" in stored["v0.2.0"]["notes"]
+        assert stored["v0.3.0"]["notes"] == "Intro line." and "notes_filled" not in stored["v0.3.0"]

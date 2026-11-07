@@ -591,7 +591,9 @@ def _register_release_tools(mcp: MCPServer, forge: Forge, releases, passes, guar
         full = guard(ctx, lambda: full_name(ctx, repo))
         if tag.strip():
             rel = guard(ctx, lambda: releases.get(full, tag.strip()))
-            return describe(ctx, full, rel) + "\n\n" + (rel["notes"] or "(no notes)")
+            return (describe(ctx, full, rel) + "\n\nNotes:\n" + (rel["notes"] or "(no notes)")
+                    + "\n\nChangelog" + (f" (since {rel['changelog_since']})" if rel.get("changelog_since") else "")
+                    + ":\n" + (rel.get("changelog") or "(none)"))
         rels = guard(ctx, lambda: releases.list(full))
         if not rels:
             return f"{full} has no releases. Make one with create_release."
@@ -607,15 +609,12 @@ def _register_release_tools(mcp: MCPServer, forge: Forge, releases, passes, guar
         ref: Annotated[str, Field(description="Commit to point at when the tag isn't in git; default: the default branch")] = "",
         prerelease: bool = False,
         draft: Annotated[bool, Field(description="Hidden from anyone not signed in until published")] = False,
-        generate_notes: Annotated[bool | None, Field(description="Changelog of the commits since the previous "
-                                                                 "release or git tag. Default: when `notes` is empty; "
-                                                                 "true: after `notes` too; false: never")] = None,
-    ) -> str:
+) -> str:
         """Create a release. Then add files with upload_release_asset (small) or release_upload_url (big)."""
         full = guard(ctx, lambda: full_name(ctx, repo))
         rel = guard(ctx, lambda: releases.create(full, tag, name, notes, ref.strip() or None, prerelease, draft,
-                                                 generate_notes, commit_link(ctx, full)))
-        return "Created release:\n" + describe(ctx, full, rel) + ("\n\n" + rel["notes"] if rel["notes"] else "")
+                                                 link=commit_link(ctx, full)))
+        return "Created release:\n" + describe(ctx, full, rel) + "\n\nChangelog:\n" + (rel["changelog"] or "(none)")
 
     def commit_link(ctx: Context, full: str):
         base = f"{_base_url(ctx, public_url)}/forge/{full}/-/commits/"
@@ -631,13 +630,14 @@ def _register_release_tools(mcp: MCPServer, forge: Forge, releases, passes, guar
         ref: Annotated[str, Field(description="For a release not made yet whose tag isn't in git: the commit "
                                               "it would point at; default: the default branch")] = "",
     ) -> str:
-        """Markdown release notes listing the commits a release brings (it needn't exist yet). Conventional
-        commit prefixes (feat:, fix:) group them. Save with update_release(notes=...) or create_release."""
+        """Preview a changelog: the commits a release brings (it needn't exist yet), as Markdown. Conventional
+        commit prefixes (feat:, fix:) group them. Every release gets one stored when it's made (list_releases
+        with a tag shows it), separate from its notes."""
         full = guard(ctx, lambda: full_name(ctx, repo))
         log = guard(ctx, lambda: releases.changelog(full, tag, ref.strip() or None, since.strip() or None,
                                                     commit_link(ctx, full)))
         head = f"{len(log['commits'])} commits from {log['previous'] or 'the first commit'} to {tag}"
-        return head + ":\n\n" + log["notes"]
+        return head + ":\n\n" + log["changelog"]
 
     @mcp.tool(structured_output=False)
     def update_release(

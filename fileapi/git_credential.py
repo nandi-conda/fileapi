@@ -30,7 +30,6 @@ creates releases and uploads assets, splitting big files into pieces:
 
     fileapi-release upload --create v1.2.0 dist/*      # makes the release if needed, uploads the files
     fileapi-release create v1.2.0 --notes-file CHANGES.md [--title ...] [--draft] [--prerelease]
-    fileapi-release create v1.2.0                           # no notes = a changelog since the previous release/tag
     fileapi-release changelog v1.2.0 [--since v1.1.0]       # just print that changelog
     fileapi-release list | download v1.2.0 [NAME...] [-o DIR] | publish v1.2.0 | delete v1.2.0 [NAME]
 
@@ -584,11 +583,7 @@ def release_main(argv: list[str]) -> int:
     c.add_argument("--ref", help="commit to point at when the tag isn't in git (default: the default branch)")
     c.add_argument("--prerelease", action="store_true")
     c.add_argument("--draft", action="store_true")
-    c.add_argument("--generate-notes", action="store_true", default=None,
-                   help="add the changelog after --notes too (it's automatic when there are no notes)")
-    c.add_argument("--no-generate-notes", dest="generate_notes", action="store_false",
-                   help="leave the notes empty instead of generating a changelog")
-    g = sub.add_parser("changelog", help="print Markdown notes for the commits a release brings")
+    g = sub.add_parser("changelog", help="print the changelog for the commits a release brings")
     g.add_argument("tag")
     g.add_argument("--since", help="start after this tag/branch/commit (default: the previous release or tag)")
     g.add_argument("--ref", help="for a tag not in git yet: the commit it would point at")
@@ -621,12 +616,11 @@ def release_main(argv: list[str]) -> int:
         elif a.cmd == "create":
             notes = open(a.notes_file).read() if a.notes_file else a.notes
             r = cl.call("POST", body={"tag": a.tag, "name": a.title, "notes": notes, "ref": a.ref,
-                                      "prerelease": a.prerelease, "draft": a.draft,
-                                      "generate_notes": a.generate_notes})
+                                      "prerelease": a.prerelease, "draft": a.draft})
             _log(f"created release {r['tag']} at {(r.get('target') or 'no commit')[:12]}")
         elif a.cmd == "changelog":
             query = {k: v for k, v in (("since", a.since), ("ref", a.ref)) if v}
-            print(cl.call("GET", q(a.tag) + "/changelog", query=query or None)["notes"])
+            print(cl.call("GET", q(a.tag) + "/changelog", query=query or None)["changelog"])
         elif a.cmd == "upload":
             piece = _parse_size(a.piece) or RELEASE_PIECE
             if a.create:

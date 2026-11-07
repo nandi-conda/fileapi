@@ -254,13 +254,13 @@ and go with deletes. Up to `FILEAPI_RELEASE_MAX_ASSET` bytes each (default 2 GiB
 pieces (`offset`, `final=false`), which keeps each request small however big the file; mind the Postgres
 plan's storage quota.
 
-**Changelogs.** A release made without notes gets a changelog written for it: the commits since the
-previous release or git tag behind it, merges left out, each linked to its diff in the web UI. That covers
-every way of making one (the UI, the API, MCP, `fileapi-release`, `upload --create` and tag jobs).
-Conventional-commit prefixes (`feat:`, `fix:`, `perf:`, `docs:`, `!` for breaking) sort them under
-headings; plain messages make one list. Releases from before this, with empty notes, get theirs the first
-time they're viewed. `generate_notes: false` keeps a new release's notes empty, `true` adds the changelog
-after notes you give, and `GET …/releases/<tag>/changelog?since=` previews one (even before the release exists).
+**Changelogs.** Making a release also writes its changelog, kept in its own `changelog` field apart from the
+notes (which stay exactly as you wrote them): the commits since the previous release or git tag behind it
+(`changelog_since`), merges left out, each linked to its diff in the web UI. That happens however the
+release is made (the UI, the API, MCP, `fileapi-release`, `upload --create`, tag jobs), and the release page
+shows it as its own section. Conventional-commit prefixes (`feat:`, `fix:`, `perf:`, `docs:`, `!` for
+breaking) sort them under headings; plain messages make one list. Releases from before this get theirs the
+first time they're viewed. `GET …/releases/<tag>/changelog?since=` previews one, even before the release exists.
 
 ```sh
 # curl: the body is the file (Bearer = your access token, or a repo pass / FORGE_TOKEN)
@@ -269,8 +269,7 @@ curl -H "Authorization: Bearer $TOKEN" -T dist/app.tar.gz \
 # the client (`just git-setup` installs it as fileapi-release): splits big files, signs in in the browser
 fileapi-release upload --create v1.2.0 dist/*
 fileapi-release create v1.3.0 --notes-file CHANGES.md --draft
-fileapi-release create v1.4.0                     # notes = the commits since v1.3.0
-fileapi-release changelog v1.4.0 --since v1.2.0  # just print them
+fileapi-release changelog v1.4.0 --since v1.2.0  # preview a changelog
 fileapi-release download latest -o ./bin
 ```
 
@@ -284,15 +283,15 @@ tags = ["v*"]
 run = "make dist && forge-release upload --create $FORGE_TAG dist/*"
 ```
 
-MCP: `list_releases`, `create_release` (`generate_notes`), `release_changelog`, `update_release`, `delete_release`, `upload_release_asset` (small
+MCP: `list_releases`, `create_release`, `release_changelog` (preview), `update_release`, `delete_release`, `upload_release_asset` (small
 files, base64 or text), `delete_release_asset`, and `release_upload_url` (a short-lived credential plus
 curl commands for big files).
 
 | Endpoint | |
 |---|---|
 | `GET /api/forge/repos/<owner>/<repo>/releases[/<tag>]` | Releases (newest first), or one; `latest` works |
-| `POST /api/forge/repos/<owner>/<repo>/releases` | `{"tag", "name"?, "notes"?, "ref"?, "prerelease"?, "draft"?, "generate_notes"?}` |
-| `GET .../releases/<tag>/changelog?since=&ref=` | `{previous, commits, notes}`: the commits since the previous release/tag, as Markdown too |
+| `POST /api/forge/repos/<owner>/<repo>/releases` | `{"tag", "name"?, "notes"?, "ref"?, "prerelease"?, "draft"?}` (the changelog is made too) |
+| `GET .../releases/<tag>/changelog?since=&ref=` | `{previous, commits, changelog}`: preview the commits since the previous release/tag |
 | `PATCH /api/forge/repos/<owner>/<repo>/releases/<tag>` | Change `tag`, `name`, `notes`, `prerelease`, `draft` |
 | `DELETE /api/forge/repos/<owner>/<repo>/releases/<tag>` | Delete it and its files |
 | `PUT .../releases/<tag>/assets/<name>?offset=&final=&sha256=&create=` | Upload (raw body) |
