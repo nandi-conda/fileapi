@@ -30,6 +30,8 @@ creates releases and uploads assets, splitting big files into pieces:
 
     fileapi-release upload --create v1.2.0 dist/*      # makes the release if needed, uploads the files
     fileapi-release create v1.2.0 --notes-file CHANGES.md [--title ...] [--draft] [--prerelease]
+    fileapi-release create v1.2.0 --generate-notes          # notes = commits since the previous release/tag
+    fileapi-release changelog v1.2.0 [--since v1.1.0]       # just print that changelog
     fileapi-release list | download v1.2.0 [NAME...] [-o DIR] | publish v1.2.0 | delete v1.2.0 [NAME]
 
 The repo comes from --repo owner/name, $FORGE_REPO, or the current git repo's fileapi remote; the server
@@ -582,6 +584,12 @@ def release_main(argv: list[str]) -> int:
     c.add_argument("--ref", help="commit to point at when the tag isn't in git (default: the default branch)")
     c.add_argument("--prerelease", action="store_true")
     c.add_argument("--draft", action="store_true")
+    c.add_argument("--generate-notes", action="store_true",
+                   help="add a changelog of the commits since the previous release or tag")
+    g = sub.add_parser("changelog", help="print Markdown notes for the commits a release brings")
+    g.add_argument("tag")
+    g.add_argument("--since", help="start after this tag/branch/commit (default: the previous release or tag)")
+    g.add_argument("--ref", help="for a tag not in git yet: the commit it would point at")
     u = sub.add_parser("upload", help="upload files (replacing ones of the same name)")
     u.add_argument("tag")
     u.add_argument("files", nargs="+")
@@ -611,8 +619,12 @@ def release_main(argv: list[str]) -> int:
         elif a.cmd == "create":
             notes = open(a.notes_file).read() if a.notes_file else a.notes
             r = cl.call("POST", body={"tag": a.tag, "name": a.title, "notes": notes, "ref": a.ref,
-                                      "prerelease": a.prerelease, "draft": a.draft})
+                                      "prerelease": a.prerelease, "draft": a.draft,
+                                      "generate_notes": a.generate_notes})
             _log(f"created release {r['tag']} at {(r.get('target') or 'no commit')[:12]}")
+        elif a.cmd == "changelog":
+            query = {k: v for k, v in (("since", a.since), ("ref", a.ref)) if v}
+            print(cl.call("GET", q(a.tag) + "/changelog", query=query or None)["notes"])
         elif a.cmd == "upload":
             piece = _parse_size(a.piece) or RELEASE_PIECE
             if a.create:

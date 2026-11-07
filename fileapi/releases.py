@@ -43,6 +43,55 @@ CHUNK = 4 * 1024 * 1024
 MAX_RELEASES = 500
 MAX_ASSETS = 100
 MAX_NOTES = 100_000
+MAX_CHANGELOG = 500  # commits listed in a generated changelog
+_CONVENTIONAL = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?:\s*(?P<rest>.+)$")
+_SECTIONS = [  # conventional-commit types -> changelog headings, in this order
+    ("Breaking changes", ()),
+    ("Features", ("feat", "feature")),
+    ("Fixes", ("fix", "bugfix", "hotfix")),
+    ("Performance", ("perf",)),
+    ("Documentation", ("docs", "doc")),
+    ("Other changes", ()),
+]
+
+
+def _subject(message: str) -> str:
+    return (message.strip().splitlines() or [""])[0].strip()
+
+
+def format_changelog(commits: list[dict], tag: str, previous: str | None, link: Callable[[str], str] | None = None) -> str:
+    """Markdown release notes from commits (newest first). Conventional-commit prefixes (feat:, fix:, ...)
+    sort them under headings; plain messages make one list."""
+    if not commits:
+        return f"No changes since {previous}." if previous else "No commits."
+
+    def item(c: dict, text: str) -> str:
+        short = c["sha"][:7]
+        ref = f"[`{short}`]({link(c['sha'])})" if link else f"`{short}`"
+        return f"- {text} ({ref})"
+
+    parsed = [(c, _CONVENTIONAL.match(_subject(c["message"]))) for c in commits]
+    lines = ["## What's changed", ""]
+    if not any(m for _, m in parsed):
+        lines += [item(c, _subject(c["message"])) for c in commits]
+    else:
+        groups: dict[str, list[str]] = {name: [] for name, _ in _SECTIONS}
+        for c, m in parsed:
+            if not m:
+                groups["Other changes"].append(item(c, _subject(c["message"])))
+                continue
+            kind = m["type"].lower()
+            text = (f"**{m['scope']}:** " if m["scope"] else "") + m["rest"]
+            breaking = m["bang"] or "BREAKING CHANGE" in c["message"]
+            section = "Breaking changes" if breaking else next(
+                (name for name, kinds in _SECTIONS if kind in kinds), "Other changes")
+            groups[section].append(item(c, text))
+        lines = ["## What's changed"]
+        for name, _ in _SECTIONS:
+            if groups[name]:
+                lines += ["", f"### {name}", "", *groups[name]]
+    lines += ["", f"**Full changelog:** {previous}...{tag}" if previous else f"**Full changelog:** {len(commits)} commits up to {tag}"]
+    return "\n".join(lines)
 
 
 def _now() -> str:
@@ -311,9 +360,74 @@ class Releases:
         finally:
             r.close()
 
-    def create(self, repo: str, tag: str, name: str = "", notes: str = "", ref: str | None = None,
-               prerelease: bool = False, draft: bool = False) -> dict:
+    def changelog(self, repo: str, tag: str, ref: str | None = None, since: str | None = None,
+                  link: Callable[[str], str] | None = None) -> dict:
+        """The commits a release brings: from its commit back to the previous release or git tag (or `since`),
+        plus Markdown notes listing them. Works before the release exists (it then points where create would)."""
         tag = check_tag(tag)
+        doc = self.store.load(*self._parts(repo))
+        rel = next((x for x in doc["releases"] if x["tag"] == tag), None)
+        target = rel["target"] if rel and rel.get("target") else self._target(repo, tag, (ref or "").strip() or None)[0]
+        out = {"tag": tag, "target": target, "previous": None, "previous_sha": None, "commits": [], "truncated": False}
+        if not target:
+            out["notes"] = format_changelog([], tag, None)
+            return out
+        r = self.forge.open(repo)
+        try:
+            peel = self.forge._peel_commit
+            head = target.encode()
+            prev_name, prev_sha = None, None
+            if since and since.strip():
+                prev_sha = peel(r, self.forge._resolve(r, since.strip())).id
+                prev_name = since.strip()
+            else:
+                # Every other release and git tag marks a boundary; the nearest one behind this commit wins.
+                marks: dict[bytes, str] = {}
+                for k, v in r.refs.as_dict().items():
+                    if not k.startswith(b"refs/tags/"):
+                        continue
+                    name = k[10:].decode(errors="replace")
+                    if name == tag:
+                        continue
+                    try:
+                        marks.setdefault(peel(r, v).id, name)
+                    except Exception:
+                        continue
+                for x in doc["releases"]:  # release names win over a plain git tag on the same commit
+                    if x["tag"] != tag and x.get("target") and not x.get("draft"):
+                        marks[x["target"].encode()] = x["tag"]
+                marks.pop(head, None)
+                if marks:
+                    for entry in r.get_walker(include=[head], max_entries=20_000):
+                        if entry.commit.id in marks:
+                            prev_sha, prev_name = entry.commit.id, marks[entry.commit.id]
+                            break
+            commits = []
+            for entry in r.get_walker(include=[head], exclude=[prev_sha] if prev_sha else None,
+                                      max_entries=MAX_CHANGELOG + 1):
+                c = entry.commit
+                if len(c.parents) > 1:  # merges repeat what they bring in
+                    continue
+                commits.append({"sha": c.id.decode(), "author": c.author.decode(errors="replace"),
+                                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(c.author_time)),
+                                "message": c.message.decode(errors="replace").strip()})
+        finally:
+            r.close()
+        out["truncated"] = len(commits) > MAX_CHANGELOG
+        out["commits"] = commits[:MAX_CHANGELOG]
+        out["previous"], out["previous_sha"] = prev_name, prev_sha.decode() if prev_sha else None
+        out["notes"] = format_changelog(out["commits"], tag, prev_name, link)
+        if out["truncated"]:
+            out["notes"] += f"\n\n_Only the newest {MAX_CHANGELOG} commits are listed._"
+        return out
+
+    def create(self, repo: str, tag: str, name: str = "", notes: str = "", ref: str | None = None,
+               prerelease: bool = False, draft: bool = False, generate_notes: bool = False,
+               link: Callable[[str], str] | None = None) -> dict:
+        tag = check_tag(tag)
+        if generate_notes:
+            generated = self.changelog(repo, tag, ref, link=link)["notes"]
+            notes = f"{notes.rstrip()}\n\n{generated}" if (notes or "").strip() else generated
         if len(notes) > MAX_NOTES:
             raise StorageError(f"Release notes are limited to {MAX_NOTES} characters")
         target, tagged = self._target(repo, tag, (ref or "").strip() or None)

@@ -607,11 +607,36 @@ def _register_release_tools(mcp: MCPServer, forge: Forge, releases, passes, guar
         ref: Annotated[str, Field(description="Commit to point at when the tag isn't in git; default: the default branch")] = "",
         prerelease: bool = False,
         draft: Annotated[bool, Field(description="Hidden from anyone not signed in until published")] = False,
+        generate_notes: Annotated[bool, Field(description="Add a changelog of the commits since the previous "
+                                                          "release or git tag (after `notes`, if given)")] = False,
     ) -> str:
         """Create a release. Then add files with upload_release_asset (small) or release_upload_url (big)."""
         full = guard(ctx, lambda: full_name(ctx, repo))
-        rel = guard(ctx, lambda: releases.create(full, tag, name, notes, ref.strip() or None, prerelease, draft))
-        return "Created release:\n" + describe(ctx, full, rel)
+        rel = guard(ctx, lambda: releases.create(full, tag, name, notes, ref.strip() or None, prerelease, draft,
+                                                 generate_notes, commit_link(ctx, full)))
+        return "Created release:\n" + describe(ctx, full, rel) + ("\n\n" + rel["notes"] if generate_notes else "")
+
+    def commit_link(ctx: Context, full: str):
+        base = f"{_base_url(ctx, public_url)}/forge/{full}/-/commits/"
+        return lambda sha: base + sha
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True), structured_output=False)
+    def release_changelog(
+        ctx: Context,
+        repo: RepoArg,
+        tag: TagArg,
+        since: Annotated[str, Field(description="Start after this tag/branch/commit; default: the previous "
+                                                "release or git tag behind this one")] = "",
+        ref: Annotated[str, Field(description="For a release not made yet whose tag isn't in git: the commit "
+                                              "it would point at; default: the default branch")] = "",
+    ) -> str:
+        """Markdown release notes listing the commits a release brings (it needn't exist yet). Conventional
+        commit prefixes (feat:, fix:) group them. Save with update_release(notes=...) or create_release."""
+        full = guard(ctx, lambda: full_name(ctx, repo))
+        log = guard(ctx, lambda: releases.changelog(full, tag, ref.strip() or None, since.strip() or None,
+                                                    commit_link(ctx, full)))
+        head = f"{len(log['commits'])} commits from {log['previous'] or 'the first commit'} to {tag}"
+        return head + ":\n\n" + log["notes"]
 
     @mcp.tool(structured_output=False)
     def update_release(

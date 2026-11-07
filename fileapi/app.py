@@ -78,6 +78,7 @@ class NewReleaseBody(BaseModel):
     ref: str | None = None  # commit to point at when the tag isn't in git (default: the default branch)
     prerelease: bool = False
     draft: bool = False
+    generate_notes: bool = False  # add a changelog: the commits since the previous release or tag
 
 
 class ReleaseUpdateBody(BaseModel):
@@ -779,8 +780,23 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def forge_create_release(request: Request, project: str, repo: str, body: NewReleaseBody):
         """Create a release. If the tag exists in git it points at that commit, else at `ref`'s."""
         full = release_writer(request, project, repo)
-        rel = releases.create(full, body.tag, body.name, body.notes, body.ref, body.prerelease, body.draft)
+        rel = releases.create(full, body.tag, body.name, body.notes, body.ref, body.prerelease, body.draft,
+                              body.generate_notes, commit_link(request, full))
         return with_links(request, full, rel)
+
+    def commit_link(request: Request, full: str):
+        base = f"{oauth.base_url(request, public_url)}/forge/{full}/-/commits/"
+        return lambda sha: base + sha
+
+    @app.get("/api/forge/repos/{project}/{repo}/releases/{tag}/changelog", tags=["forge"])
+    def forge_release_changelog(request: Request, project: str, repo: str, tag: str, ref: str | None = None,
+                                since: str | None = None):
+        """The commits a release (existing or not yet made) brings since the previous release or git tag
+        (or `since`), with Markdown notes listing them. `ref` = where a new release would point."""
+        full, _ = release_reader(request, project, repo)
+        if tag.lower() == "latest":
+            tag = releases.resolve_tag(full, tag)
+        return releases.changelog(full, tag, ref, since, commit_link(request, full))
 
     @app.get("/api/forge/repos/{project}/{repo}/releases/{tag}", tags=["forge"])
     def forge_release(request: Request, project: str, repo: str, tag: str):

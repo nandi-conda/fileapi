@@ -254,6 +254,13 @@ and go with deletes. Up to `FILEAPI_RELEASE_MAX_ASSET` bytes each (default 2 GiB
 pieces (`offset`, `final=false`), which keeps each request small however big the file; mind the Postgres
 plan's storage quota.
 
+**Changelogs.** A release's notes can be generated from git: the commits since the previous release or git
+tag behind it (or `since=` any tag/branch/commit), merges left out, each linked to its diff in the web UI.
+Conventional-commit prefixes (`feat:`, `fix:`, `perf:`, `docs:`, `!` for breaking) sort them under
+headings; plain messages make one list. In the UI it's **Generate changelog** in the release editor (you can
+edit the result before saving); from the API `generate_notes: true` on create (added after any `notes`
+you give) or `GET …/releases/<tag>/changelog` to preview, which works before the release exists.
+
 ```sh
 # curl: the body is the file (Bearer = your access token, or a repo pass / FORGE_TOKEN)
 curl -H "Authorization: Bearer $TOKEN" -T dist/app.tar.gz \
@@ -261,6 +268,8 @@ curl -H "Authorization: Bearer $TOKEN" -T dist/app.tar.gz \
 # the client (`just git-setup` installs it as fileapi-release): splits big files, signs in in the browser
 fileapi-release upload --create v1.2.0 dist/*
 fileapi-release create v1.3.0 --notes-file CHANGES.md --draft
+fileapi-release create v1.4.0 --generate-notes    # notes = the commits since v1.3.0
+fileapi-release changelog v1.4.0 --since v1.2.0  # just print them
 fileapi-release download latest -o ./bin
 ```
 
@@ -271,17 +280,18 @@ From CI: a job with `tags` runs when a matching tag is pushed, and every job get
 [[job]]
 name = "release"
 tags = ["v*"]
-run = "make dist && forge-release upload --create $FORGE_TAG dist/*"
+run = "make dist && forge-release create $FORGE_TAG --generate-notes && forge-release upload $FORGE_TAG dist/*"
 ```
 
-MCP: `list_releases`, `create_release`, `update_release`, `delete_release`, `upload_release_asset` (small
+MCP: `list_releases`, `create_release` (`generate_notes`), `release_changelog`, `update_release`, `delete_release`, `upload_release_asset` (small
 files, base64 or text), `delete_release_asset`, and `release_upload_url` (a short-lived credential plus
 curl commands for big files).
 
 | Endpoint | |
 |---|---|
 | `GET /api/forge/repos/<owner>/<repo>/releases[/<tag>]` | Releases (newest first), or one; `latest` works |
-| `POST /api/forge/repos/<owner>/<repo>/releases` | `{"tag", "name"?, "notes"?, "ref"?, "prerelease"?, "draft"?}` |
+| `POST /api/forge/repos/<owner>/<repo>/releases` | `{"tag", "name"?, "notes"?, "ref"?, "prerelease"?, "draft"?, "generate_notes"?}` |
+| `GET .../releases/<tag>/changelog?since=&ref=` | `{previous, commits, notes}`: the commits since the previous release/tag, as Markdown too |
 | `PATCH /api/forge/repos/<owner>/<repo>/releases/<tag>` | Change `tag`, `name`, `notes`, `prerelease`, `draft` |
 | `DELETE /api/forge/repos/<owner>/<repo>/releases/<tag>` | Delete it and its files |
 | `PUT .../releases/<tag>/assets/<name>?offset=&final=&sha256=&create=` | Upload (raw body) |

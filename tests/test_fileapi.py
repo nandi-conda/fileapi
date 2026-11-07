@@ -1666,6 +1666,8 @@ async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
     assert (tmp_path / "dl" / "big.bin").read_bytes() == big.read_bytes()
     assert run("publish", "v1.1").returncode == 0
     assert run("upload", "nope", str(big)).returncode == 1
+    r = run("changelog", "v9")
+    assert r.returncode == 0 and "## What's changed" in r.stdout, (r.stdout, r.stderr)
 
     async with connect(server_url, TOKEN) as c:
         listing = text(await c.call_tool("list_releases", {"repo": "rel"}))
@@ -1674,6 +1676,8 @@ async def test_releases_from_tag_jobs_cli_and_mcp(server_url, tmp_path):
                                                        "text": "abc\n", "create": True})
         assert not r.is_error, text(r)
         assert "Bearer fg_" in text(await c.call_tool("release_upload_url", {"repo": "rel", "tag": "v2"}))
+        log = text(await c.call_tool("release_changelog", {"repo": "rel", "tag": "v3", "since": "v1.0"}))
+        assert "0 commits from v1.0 to v3" in log and "No changes since v1.0." in log, log
         assert "Done" in text(await c.call_tool("update_release", {"repo": "rel", "tag": "v2", "name": "Done"}))
         assert not (await c.call_tool("delete_release_asset", {"repo": "rel", "tag": "v2", "name": "sum.txt"})).is_error
         assert not (await c.call_tool("delete_release", {"repo": "rel", "tag": "v2"})).is_error
@@ -2278,3 +2282,48 @@ def test_forge_url_survives_restart(tmp_path, backend):
         assert client.app.state.jobs.base_url == "https://forge.example"
     with TestClient(app_for(tmp_path, database_url=db)) as client:
         assert client.app.state.jobs.base_url == "https://forge.example"
+
+
+def test_release_changelog(tmp_path, backend):
+    with TestClient(app_for(tmp_path, database_url=backend.get("DATABASE_URL", ""))) as client:
+        forge = client.app.state.forge
+        forge.create("nandi.uk", "cl")
+        repo = "nandi.uk/cl"
+        c1 = forge.commit_files(repo, "main", {"a": "1"}, "Initial import")["commit"]
+        r = forge.open(repo)
+        try:
+            r.refs[b"refs/tags/v0.1.0"] = c1.encode()
+        finally:
+            r.close()
+        c2 = forge.commit_files(repo, "main", {"a": "2"}, "feat(ui): dark mode\n\nbody")["commit"]
+        c3 = forge.commit_files(repo, "main", {"a": "3"}, "fix: crash on empty repo")["commit"]
+        c4 = forge.commit_files(repo, "main", {"a": "4"}, "Tidy the README")["commit"]
+        base = "/api/forge/repos/nandi.uk/cl/releases"
+
+        # A release that doesn't exist yet: the commits since the git tag v0.1.0, grouped.
+        r = client.get(f"{base}/v0.2.0/changelog", headers=AUTH)
+        assert r.status_code == 200, r.text
+        log = r.json()
+        assert log["previous"] == "v0.1.0" and log["previous_sha"] == c1 and log["target"] == c4
+        assert [c["sha"] for c in log["commits"]] == [c4, c3, c2]
+        notes = log["notes"]
+        assert "### Features" in notes and "**ui:** dark mode" in notes and "### Fixes" in notes
+        assert "### Other changes" in notes and "Tidy the README" in notes and "v0.1.0...v0.2.0" in notes
+        assert f"/forge/nandi.uk/cl/-/commits/{c2}" in notes
+        assert client.get(f"{base}/v0.2.0/changelog").status_code == 404  # private repo
+
+        # Creating with generate_notes appends it to the given notes; the next release starts from this one.
+        r = client.post(base, json={"tag": "v0.2.0", "notes": "Hand-written intro.", "generate_notes": True},
+                        headers=AUTH)
+        assert r.status_code == 201, r.text
+        assert r.json()["notes"].startswith("Hand-written intro.\n\n## What's changed")
+        c5 = forge.commit_files(repo, "main", {"a": "5"}, "Plain change")["commit"]
+        log = client.get(f"{base}/v0.3.0/changelog", headers=AUTH).json()
+        assert log["previous"] == "v0.2.0" and [c["sha"] for c in log["commits"]] == [c5]
+        assert "### " not in log["notes"] and "- Plain change" in log["notes"]
+        # An existing release's changelog stays fixed at its own commit; since= overrides the start.
+        log = client.get(f"{base}/v0.2.0/changelog", params={"since": c3}, headers=AUTH).json()
+        assert [c["sha"] for c in log["commits"]] == [c4]
+        # No earlier tag or release: everything up to the commit.
+        log = client.get(f"{base}/v0.1.0/changelog", headers=AUTH).json()
+        assert log["previous"] is None and [c["sha"] for c in log["commits"]] == [c1]

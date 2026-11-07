@@ -43,6 +43,7 @@ private:
     QJsonObject current() const;
     void openEditor(const QJsonObject &rel);  // empty = a new release
     void saveEditor();
+    void generateNotes();  // fill the notes with the commits since the previous release or tag
     void upload();
     void sendPiece(const QString &tag, const QString &name, const QByteArray &data, qint64 offset);
     void downloadAsset();
@@ -92,4 +93,5 @@ private:
     QCheckBox *m_editPre;
     QCheckBox *m_editDraft;
     QPushButton *m_editSave;
+    QPushButton *m_editGenerate;
 };
