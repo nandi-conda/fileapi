@@ -96,7 +96,6 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_meta->setTextInteractionFlags(Qt::TextSelectableByMouse);
     vl->addWidget(m_meta);
     m_notes = new QTextBrowser;
-    m_notes->setOpenExternalLinks(true);
     m_notes->setMinimumHeight(80);
     touchScroll(m_notes);
     vl->addWidget(m_notes, 2);
@@ -109,7 +108,6 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_changesHeading->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     vl->addWidget(m_changesHeading);
     m_changes = new QTextBrowser;
-    m_changes->setOpenExternalLinks(true);
     m_changes->setMinimumHeight(80);
     touchScroll(m_changes);
     vl->addWidget(m_changes, 2);
@@ -124,6 +122,24 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_assets->setToolTip("Double-click (or tap) a file to download it.");
     touchScroll(m_assets);
     vl->addWidget(m_assets, 1);
+    // Links into this forge (the changelog's commits) navigate in place; other sites open in a new tab.
+    for (QTextBrowser *b : {m_notes, m_changes}) {
+        b->setOpenLinks(false);
+        connect(b, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
+            const QUrl own(m_api->baseUrl());
+            if ((url.isRelative() || (url.scheme() == own.scheme() && url.host() == own.host() && url.port() == own.port()))
+                && url.path().startsWith(QStringLiteral("/forge/")) && url.path().size() > 7) {
+                QString route = url.path(QUrl::FullyDecoded).mid(7);
+                if (url.hasQuery())
+                    route += "?" + url.query(QUrl::FullyDecoded);
+                if (url.hasFragment())
+                    route += "#" + url.fragment(QUrl::FullyDecoded);
+                emit openRoute(route);
+            } else if (url.scheme() == "http" || url.scheme() == "https" || url.scheme() == "mailto") {
+                QDesktopServices::openUrl(url);
+            }
+        });
+    }
     m_assetButtons = new QBoxLayout(QBoxLayout::LeftToRight);
     m_download = new QPushButton("Download");
     m_download->setIcon(style()->standardIcon(QStyle::SP_ArrowDown));

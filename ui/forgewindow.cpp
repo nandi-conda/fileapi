@@ -492,6 +492,10 @@ ForgeWindow::ForgeWindow(QWidget *parent) : QMainWindow(parent), m_api(new Api(t
     m_releases = new ReleasesPanel(m_api);
     connect(m_releases, &ReleasesPanel::statusText, this, [this](const QString &t, bool e) { status(t, e); });
     connect(m_releases, &ReleasesPanel::tagPicked, this, [this] { updateHash(Nav::Push); });
+    connect(m_releases, &ReleasesPanel::openRoute, this, [this](const QString &route) {
+        m_api->setLocationHash(route, true);  // a history entry, so Back returns to the release
+        applyRoute(route);
+    });
     auto *releasesScroll = new QScrollArea;  // a phone's stacked buttons can run past the screen
     releasesScroll->setWidget(m_releases);
     releasesScroll->setWidgetResizable(true);

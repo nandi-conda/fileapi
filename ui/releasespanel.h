@@ -35,7 +35,8 @@ public:
 signals:
     void statusText(const QString &text, bool error);
     void countChanged(int releases);
-    void tagPicked(const QString &tag);  // the user selected a release in the list
+    void tagPicked(const QString &tag);
+    void openRoute(const QString &route);  // a link to somewhere in the forge, e.g. a changelog commit  // the user selected a release in the list
 
 private:
     void fillList(const QString &select);
