@@ -82,6 +82,7 @@ private:
     QPushButton *m_deleteAsset;
     QBoxLayout *m_releaseButtons;
     QPushButton *m_edit;
+    QPushButton *m_changelog;  // opens the editor with a generated changelog
     QPushButton *m_publish;
     QPushButton *m_deleteRelease;
 

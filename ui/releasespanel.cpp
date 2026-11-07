@@ -137,6 +137,10 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_edit = new QPushButton("Edit");
     m_edit->setIcon(style()->standardIcon(QStyle::SP_FileDialogContentsView));
     m_releaseButtons->addWidget(m_edit);
+    m_changelog = new QPushButton("Generate changelog");
+    m_changelog->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+    m_changelog->setToolTip("Open the editor with the commits since the previous release or tag added to the notes");
+    m_releaseButtons->addWidget(m_changelog);
     m_publish = new QPushButton("Publish");
     m_publish->setIcon(style()->standardIcon(QStyle::SP_DialogApplyButton));
     m_publish->setToolTip("Make this draft visible to everyone who can see the repo");
@@ -233,6 +237,10 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     connect(m_upload, &QPushButton::clicked, this, &ReleasesPanel::upload);
     connect(m_deleteAsset, &QPushButton::clicked, this, &ReleasesPanel::deleteAsset);
     connect(m_edit, &QPushButton::clicked, this, [this] { openEditor(current()); });
+    connect(m_changelog, &QPushButton::clicked, this, [this] {
+        openEditor(current());
+        generateNotes();
+    });
     connect(m_publish, &QPushButton::clicked, this, &ReleasesPanel::publish);
     connect(m_deleteRelease, &QPushButton::clicked, this, &ReleasesPanel::deleteRelease);
     connect(m_editSave, &QPushButton::clicked, this, &ReleasesPanel::saveEditor);
@@ -413,7 +421,7 @@ void ReleasesPanel::showRelease(const QJsonObject &rel)
     m_download->setEnabled(false);
     m_copyAsset->setEnabled(false);
     m_deleteAsset->setEnabled(false);
-    for (QPushButton *b : {m_upload, m_edit, m_deleteRelease})
+    for (QPushButton *b : {m_upload, m_edit, m_changelog, m_deleteRelease})
         b->setVisible(m_canEdit);
     m_deleteAsset->setVisible(m_canEdit);
     m_publish->setVisible(m_canEdit && rel.value("draft").toBool());
