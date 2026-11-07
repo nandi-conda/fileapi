@@ -6,8 +6,10 @@ some file lives under it, so there are no empty directories.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
+import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
@@ -40,15 +42,35 @@ class PostgresStorage:
         # can be dead by the time a request borrows it, which used to surface as a 500 on the first request
         # after a quiet spell. check= pings each connection on checkout and replaces a dead one; max_idle
         # retires connections before the server-side idle timeout; TCP keepalives catch silent drops.
+        # connect_timeout + a short checkout timeout: when the database is unreachable, requests fail in seconds
+        # with a 503 instead of piling up in the thread pool until the whole server stops answering.
+        self.dsn = dsn
         self.pool = pool or ConnectionPool(
             dsn, min_size=1, max_size=5, open=True, check=ConnectionPool.check_connection, max_idle=120,
-            kwargs={"autocommit": True, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
+            timeout=float(os.environ.get("FILEAPI_DB_WAIT", 10)),
+            kwargs={"autocommit": True, "connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
                     "keepalives_count": 3})
         self.root = "postgres"
 
     def init(self) -> None:
         with self.pool.connection() as c:
             c.execute(SCHEMA)
+
+    def ping(self) -> str | None:
+        """None when the database answers; else the reason (the server's own error message when it gives one,
+        e.g. a Neon quota), for /health."""
+        try:
+            with self.pool.connection(timeout=3) as c:
+                c.execute("SELECT 1")
+            return None
+        except Exception as e:  # noqa: BLE001
+            pooled = f"{type(e).__name__}: {e}"
+        try:  # the pool only says it timed out; a direct connection says why
+            with psycopg.connect(self.dsn, connect_timeout=5) as c:
+                c.execute("SELECT 1")
+            return pooled
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}".strip()[:500]
 
     # -- helpers -----------------------------------------------------------
     @staticmethod

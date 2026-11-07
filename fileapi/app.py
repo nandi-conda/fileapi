@@ -12,6 +12,7 @@ import base64
 import contextlib
 import gzip
 import mimetypes
+import logging
 import os
 import zlib
 import tempfile
@@ -190,6 +191,7 @@ def create_app(
     jobs.passes = passes
     # Pull mirrors: repos whose jobs.toml has [upstream] follow that host's branches and deploy when they move.
     upstream = Upstream(forge, repo_secrets)
+    forge.listeners.append(upstream)
     # Else learned from requests (see learn_base) and remembered in the KV, so a job a server starts before any
     # signed-in request reaches it (an [upstream] pull right after a deploy, say) still gets FORGE_URL.
     jobs.base_url = public_url.rstrip("/") if public_url else ((kv.get("forge_base_url") or {}).get("url") or None)
@@ -290,6 +292,19 @@ def create_app(
         if auth.identify(_request_token(request)) is None:
             raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
 
+    if database_url:
+        import psycopg
+        from psycopg_pool import PoolTimeout
+
+        async def db_down(_req: Request, exc: Exception):
+            # Postgres unreachable (Neon suspended for a quota, network, ...): say so quickly instead of a 500.
+            logging.getLogger("fileapi").warning("database unavailable: %s: %s", type(exc).__name__, exc)
+            return JSONResponse({"detail": "database unavailable, try again shortly"}, status_code=503,
+                                headers={"Retry-After": "30"})
+
+        app.add_exception_handler(PoolTimeout, db_down)
+        app.add_exception_handler(psycopg.OperationalError, db_down)
+
     @app.exception_handler(StorageError)
     async def storage_error(_req: Request, exc: StorageError):
         status = (404 if isinstance(exc, NotFound) else 409 if isinstance(exc, Conflict)
@@ -353,6 +368,12 @@ code{{background:#eee;padding:.1rem .3rem;border-radius:4px;word-break:break-all
     def health():
         out = {"ok": True, "auth": "atproto", "admin": auth.admin_did, "storage": backend, "git": forge.store.backend,
                "build": BUILD}
+        if database_url:
+            err = storage.ping()
+            if err:
+                out.update(ok=False, db=err)
+                return JSONResponse(out, status_code=503)
+            out["db"] = "ok"
         if migrator is not None:
             store = migrator.cfg.store
             out["blobs"] = store.name if store is not None and migrator.cfg.active is not None else "postgres"

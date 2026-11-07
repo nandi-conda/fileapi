@@ -33,6 +33,11 @@ log = logging.getLogger("fileapi.upstream")
 DEFAULT_INTERVAL = 60
 MIN_INTERVAL = 30
 MAX_INTERVAL = 3600
+# How often the background loop re-reads which repos have an [upstream] from the database. Between those
+# reads it only talks to the upstream hosts, so a quiet forge leaves Postgres alone and a serverless database
+# (Neon) can suspend instead of being woken every few seconds. Pushes, renames, deletes and poke() refresh it
+# early.
+REFRESH = int(os.environ.get("FILEAPI_UPSTREAM_REFRESH", 3600))
 
 
 def parse_upstream(text: str) -> dict | None:
@@ -74,6 +79,9 @@ class Upstream:
         self._configs: dict[str, tuple[str, dict | None]] = {}  # repo -> (default head sha, config)
         self._due: dict[str, float] = {}
         self._locks: dict[str, threading.Lock] = {}
+        self._watch: list[tuple[str, dict]] | None = None  # (repo, config) for repos with an [upstream]
+        self._watch_at = 0.0
+        self._seen: dict[str, dict] = {}  # repo -> upstream refs last pulled in full (no DB work while unchanged)
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -128,13 +136,17 @@ class Upstream:
     # -- syncing -----------------------------------------------------------------------
     def sync(self, repo: str) -> list[dict]:
         """Pull the upstream's listed branches into the forge once. Returns what happened to each."""
-        from dulwich.client import get_transport_and_path
-        from dulwich.graph import can_fast_forward
-
         repo = self.forge.canonical(repo)
         cfg = self.config(repo)
         if cfg is None:
             raise StorageError(f"{repo} has no [upstream] in {JOBS_FILE} on its default branch")
+        return self._sync(repo, cfg)
+
+    def _sync(self, repo: str, cfg: dict, *, quiet: bool = False) -> list[dict]:
+        """quiet: skip the database when the upstream's refs are the ones last pulled (the background loop)."""
+        from dulwich.client import get_transport_and_path
+        from dulwich.graph import can_fast_forward
+
         lock = self._locks.setdefault(repo, threading.Lock())
         if not lock.acquire(blocking=False):
             return [{"status": "busy"}]
@@ -146,6 +158,9 @@ class Upstream:
             wanted = {ref: sha for ref, sha in remote.items()
                       if ref.startswith(b"refs/heads/") and not ref.endswith(b"^{}")
                       and _branch_matches(patterns, ref[len(b"refs/heads/"):].decode(), cfg["default"])}
+            if quiet and self._seen.get(repo) == wanted:
+                return [{"ref": ref.decode(), "status": "up to date", "sha": sha.decode()}
+                        for ref, sha in sorted(wanted.items())]
             r = self.forge.open(repo)
             results, moved = [], []
             try:
@@ -187,6 +202,10 @@ class Upstream:
                     log.info("%s: %s not pulled: %s", repo, x["ref"], x["reason"])
             if moved:
                 self.forge._emit("on_push", repo, moved)
+            if all(x["status"] != "error" for x in results):
+                self._seen[repo] = wanted
+            else:
+                self._seen.pop(repo, None)
             return results
         finally:
             lock.release()
@@ -194,25 +213,47 @@ class Upstream:
     def poke(self, repo: str | None = None) -> None:
         """Check (one repo, or all) on the next tick instead of waiting out the interval."""
         if repo:
-            self._due[self.forge.canonical(repo)] = 0
+            repo = self.forge.canonical(repo)
+            self._due[repo] = 0
+            self._seen.pop(repo, None)
         else:
             self._due.clear()
+            self._seen.clear()
+        self._watch = None  # re-read which repos follow an upstream
         self._wake.set()
+
+    # Forge listener: a push can add, change or drop a repo's [upstream].
+    def on_push(self, repo: str, updates) -> None:
+        self._watch = None
+
+    def on_rename(self, old: str, new: str) -> None:
+        self._watch = None
+
+    def on_delete(self, repo: str) -> None:
+        self._watch = None
+
+    def _watched(self, now: float) -> list[tuple[str, dict]]:
+        if self._watch is None or now - self._watch_at >= REFRESH:
+            watch = []
+            for info in self.forge.list():
+                repo = info.full_name
+                try:
+                    cfg = self.config(repo)
+                except Exception:  # noqa: BLE001
+                    log.exception("%s: reading [upstream] failed", repo)
+                    continue
+                if cfg is not None:
+                    watch.append((repo, cfg))
+            self._watch, self._watch_at = watch, now
+        return self._watch
 
     def run_once(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        for info in self.forge.list():
-            repo = info.full_name
-            try:
-                cfg = self.config(repo)
-            except Exception:  # noqa: BLE001
-                log.exception("%s: reading [upstream] failed", repo)
-                continue
-            if cfg is None or self._due.get(repo, 0) > now:
-                continue
+        due = [(repo, cfg) for repo, cfg in self._watched(now) if self._due.get(repo, 0) <= now]
+        for repo, cfg in due:
             self._due[repo] = now + cfg["interval"]
             try:
-                self.sync(repo)
+                self._sync(repo, cfg, quiet=True)
             except Exception as e:  # noqa: BLE001 - a host being down must not stop the others
                 log.warning("%s: upstream pull failed: %s", repo, e)
 
@@ -228,11 +269,19 @@ class Upstream:
         self._wake.set()
 
     def _loop(self) -> None:
+        failures = 0
         while not self._stop.is_set():
             try:
                 self.run_once()
-            except Exception:  # noqa: BLE001
-                log.exception("upstream pass failed")
+                failures = 0
+            except Exception as e:  # noqa: BLE001
+                # Usually the database being unreachable: log it briefly and back off (up to ~15 min) instead of
+                # a full traceback every tick.
+                failures += 1
+                log.warning("upstream pass failed (%d in a row): %s: %s", failures, type(e).__name__, e)
+                if self._wake.wait(min(self.tick * 2 ** failures, 900)):
+                    self._wake.clear()
+                continue
             self._wake.wait(self.tick)
             self._wake.clear()
 
