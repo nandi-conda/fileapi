@@ -2327,3 +2327,24 @@ def test_release_changelog(tmp_path, backend):
         # No earlier tag or release: everything up to the commit.
         log = client.get(f"{base}/v0.1.0/changelog", headers=AUTH).json()
         assert log["previous"] is None and [c["sha"] for c in log["commits"]] == [c1]
+
+        # Automatic: no notes -> a changelog; explicit false -> stays empty; given notes are kept as they are.
+        rel = client.post(base, json={"tag": "v0.3.0"}, headers=AUTH).json()
+        assert "- Plain change" in rel["notes"] and "v0.2.0...v0.3.0" in rel["notes"]
+        assert "notes_filled" not in rel
+        assert client.post(base, json={"tag": "v0.3.1", "generate_notes": False}, headers=AUTH).json()["notes"] == ""
+        assert client.post(base, json={"tag": "v0.3.2", "notes": "Mine"}, headers=AUTH).json()["notes"] == "Mine"
+        # Uploading with create=true makes one with a changelog too.
+        forge.commit_files(repo, "main", {"a": "6"}, "Another change")
+        client.put(f"{base}/v0.4.0/assets/x.txt", params={"create": "true"}, content=b"x", headers=AUTH)
+        assert "- Another change" in client.get(f"{base}/v0.4.0", headers=AUTH).json()["notes"]
+
+        # Old releases with empty notes get one on first view; opted-out or cleared ones don't.
+        releases = client.app.state.releases
+        releases.store.update("nandi.uk", "cl", lambda d: [r.update(notes="") for r in d["releases"]
+                                                            if r["tag"] == "v0.2.0"])
+        client.patch(f"{base}/v0.3.2", json={"notes": ""}, headers=AUTH)
+        listed = {r["tag"]: r["notes"] for r in client.get(base, headers=AUTH).json()["releases"]}
+        assert "dark mode" in listed["v0.2.0"] and listed["v0.3.1"] == "" and listed["v0.3.2"] == ""
+        stored = {r["tag"]: r for r in releases.store.load("nandi.uk", "cl")["releases"]}
+        assert "dark mode" in stored["v0.2.0"]["notes"]

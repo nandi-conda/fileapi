@@ -303,7 +303,7 @@ def _asset(rel: dict, name: str) -> dict:
 
 
 def _public(rel: dict) -> dict:
-    out = {k: v for k, v in rel.items() if k != "assets"}
+    out = {k: v for k, v in rel.items() if k not in ("assets", "notes_filled")}
     out["assets"] = [{k: v for k, v in a.items() if k != "blob"} for a in rel["assets"]]
     return out
 
@@ -313,14 +313,44 @@ class Releases:
         self.forge = forge
         self.store = store
         self.max_asset = max_asset
+        self.base_url: Callable[[], str | None] = lambda: None  # the server's public URL, for commit links
+
+    def _link(self, repo: str) -> Callable[[str], str] | None:
+        base = self.base_url()
+        return (lambda sha: f"{base.rstrip('/')}/forge/{repo}/-/commits/{sha}") if base else None
 
     def _parts(self, repo: str) -> tuple[str, str]:
         p, _, n = repo.partition("/")
         return p, n
 
     # -- reading --------------------------------------------------------------
+    def _backfill(self, repo: str, doc: dict) -> dict:
+        """Releases made before changelogs existed (or with their notes cleared) get one, saved, on first view.
+        A few per call, so a repo with hundreds of old releases fills in over a few page loads."""
+        todo = [r["tag"] for r in reversed(doc["releases"])
+                if not (r.get("notes") or "").strip() and r.get("target") and not r.get("notes_filled")][:10]
+        if not todo:
+            return doc
+        made = {}
+        for tag in todo:
+            try:
+                made[tag] = self.changelog(repo, tag)["notes"]
+            except Exception:
+                made[tag] = ""
+
+        def fill(d):
+            for r in d["releases"]:
+                if r["tag"] in made and not (r.get("notes") or "").strip():
+                    r["notes"], r["notes_filled"] = made[r["tag"]], True
+            return d
+
+        try:
+            return self.store.update(*self._parts(repo), fill)
+        except Exception:
+            return doc
+
     def list(self, repo: str, drafts: bool = True) -> list[dict]:
-        rels = self.store.load(*self._parts(repo))["releases"]
+        rels = self._backfill(repo, self.store.load(*self._parts(repo)))["releases"]
         rels = [r for r in rels if drafts or not r.get("draft")]
         return [_public(r) for r in reversed(rels)]  # kept in the order they were made: newest last
 
@@ -335,7 +365,7 @@ class Releases:
 
     def get(self, repo: str, tag: str, drafts: bool = True) -> dict:
         tag = self.resolve_tag(repo, tag, drafts)
-        rel = _find(self.store.load(*self._parts(repo)), tag)
+        rel = _find(self._backfill(repo, self.store.load(*self._parts(repo))), tag)
         if rel.get("draft") and not drafts:
             raise NotFound(f"No release {tag}")
         return _public(rel)
@@ -416,17 +446,21 @@ class Releases:
         out["truncated"] = len(commits) > MAX_CHANGELOG
         out["commits"] = commits[:MAX_CHANGELOG]
         out["previous"], out["previous_sha"] = prev_name, prev_sha.decode() if prev_sha else None
-        out["notes"] = format_changelog(out["commits"], tag, prev_name, link)
+        out["notes"] = format_changelog(out["commits"], tag, prev_name, link or self._link(repo))
         if out["truncated"]:
             out["notes"] += f"\n\n_Only the newest {MAX_CHANGELOG} commits are listed._"
         return out
 
     def create(self, repo: str, tag: str, name: str = "", notes: str = "", ref: str | None = None,
-               prerelease: bool = False, draft: bool = False, generate_notes: bool = False,
+               prerelease: bool = False, draft: bool = False, generate_notes: bool | None = None,
                link: Callable[[str], str] | None = None) -> dict:
+        """generate_notes: None (default) = a changelog when no notes are given; True = also after given notes."""
         tag = check_tag(tag)
+        opted_out = generate_notes is False
+        if generate_notes is None:
+            generate_notes = not (notes or "").strip()
         if generate_notes:
-            generated = self.changelog(repo, tag, ref, link=link)["notes"]
+            generated = self.changelog(repo, tag, ref, link=link or self._link(repo))["notes"]
             notes = f"{notes.rstrip()}\n\n{generated}" if (notes or "").strip() else generated
         if len(notes) > MAX_NOTES:
             raise StorageError(f"Release notes are limited to {MAX_NOTES} characters")
@@ -435,6 +469,8 @@ class Releases:
         rel = {"tag": tag, "name": (name or "").strip() or tag, "notes": notes or "", "target": target,
                "tagged": tagged, "prerelease": bool(prerelease), "draft": bool(draft), "created": now,
                "updated": now, "assets": []}
+        if opted_out:
+            rel["notes_filled"] = True  # empty on purpose: don't fill it in later
 
         def add(doc):
             if any(r["tag"] == tag for r in doc["releases"]):
@@ -465,6 +501,7 @@ class Releases:
                 rel["name"] = name.strip() or rel["tag"]
             if notes is not None:
                 rel["notes"] = notes
+                rel["notes_filled"] = True  # whatever they're set to now is deliberate, even empty
             if prerelease is not None:
                 rel["prerelease"] = bool(prerelease)
             if draft is not None:

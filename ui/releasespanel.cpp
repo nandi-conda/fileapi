@@ -137,10 +137,6 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_edit = new QPushButton("Edit");
     m_edit->setIcon(style()->standardIcon(QStyle::SP_FileDialogContentsView));
     m_releaseButtons->addWidget(m_edit);
-    m_changelog = new QPushButton("Generate changelog");
-    m_changelog->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
-    m_changelog->setToolTip("Open the editor with the commits since the previous release or tag added to the notes");
-    m_releaseButtons->addWidget(m_changelog);
     m_publish = new QPushButton("Publish");
     m_publish->setIcon(style()->standardIcon(QStyle::SP_DialogApplyButton));
     m_publish->setToolTip("Make this draft visible to everyone who can see the repo");
@@ -171,7 +167,7 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     form->addRow("Title:", m_editName);
     el->addLayout(form);
     m_editNotes = new QPlainTextEdit;
-    m_editNotes->setPlaceholderText("Release notes (Markdown)");
+    m_editNotes->setPlaceholderText("Release notes (Markdown). Leave empty and a changelog of the commits since the previous release is written for you.");
     el->addWidget(m_editNotes, 1);
     auto *flags = new QHBoxLayout;
     m_editPre = new QCheckBox("Prerelease");
@@ -181,10 +177,6 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     m_editDraft->setToolTip("Only you can see it until you publish it");
     flags->addWidget(m_editDraft);
     flags->addStretch(1);
-    m_editGenerate = new QPushButton("Generate changelog");
-    m_editGenerate->setToolTip("Fill the notes with the commits since the previous release or git tag "
-                               "(feat:/fix: prefixes are grouped). Replaces an earlier generated changelog.");
-    flags->addWidget(m_editGenerate);
     el->addLayout(flags);
     auto *eb = new QHBoxLayout;
     m_editSave = new QPushButton("Save");
@@ -237,14 +229,9 @@ ReleasesPanel::ReleasesPanel(Api *api, QWidget *parent) : QWidget(parent), m_api
     connect(m_upload, &QPushButton::clicked, this, &ReleasesPanel::upload);
     connect(m_deleteAsset, &QPushButton::clicked, this, &ReleasesPanel::deleteAsset);
     connect(m_edit, &QPushButton::clicked, this, [this] { openEditor(current()); });
-    connect(m_changelog, &QPushButton::clicked, this, [this] {
-        openEditor(current());
-        generateNotes();
-    });
     connect(m_publish, &QPushButton::clicked, this, &ReleasesPanel::publish);
     connect(m_deleteRelease, &QPushButton::clicked, this, &ReleasesPanel::deleteRelease);
     connect(m_editSave, &QPushButton::clicked, this, &ReleasesPanel::saveEditor);
-    connect(m_editGenerate, &QPushButton::clicked, this, &ReleasesPanel::generateNotes);
     connect(cancel, &QPushButton::clicked, this, [this] {
         m_right->setCurrentIndex(0);
         if (m_releases.isEmpty())
@@ -421,7 +408,7 @@ void ReleasesPanel::showRelease(const QJsonObject &rel)
     m_download->setEnabled(false);
     m_copyAsset->setEnabled(false);
     m_deleteAsset->setEnabled(false);
-    for (QPushButton *b : {m_upload, m_edit, m_changelog, m_deleteRelease})
+    for (QPushButton *b : {m_upload, m_edit, m_deleteRelease})
         b->setVisible(m_canEdit);
     m_deleteAsset->setVisible(m_canEdit);
     m_publish->setVisible(m_canEdit && rel.value("draft").toBool());
@@ -467,34 +454,6 @@ void ReleasesPanel::saveEditor()
         m_right->setCurrentIndex(0);
         m_shownTag = tag;
         load();
-    });
-}
-
-void ReleasesPanel::generateNotes()
-{
-    // An existing release keeps its own commit (even if the tag box was changed); a new one goes by the tag typed.
-    const QString tag = m_editing.isEmpty() ? m_editTag->text().trimmed() : m_editing;
-    if (tag.isEmpty())
-        return emit statusText("Type the tag first, e.g. v1.0.0.", false);
-    m_editGenerate->setEnabled(false);
-    emit statusText("Collecting commits for " + tag + "…", false);
-    m_api->get("repos/" + m_repo + "/releases/" + enc(tag) + "/changelog", {}, this,
-               [this, tag](const QJsonObject &body, const QString &error) {
-        m_editGenerate->setEnabled(true);
-        if (!error.isEmpty())
-            return emit statusText("Could not make a changelog for " + tag + ": " + error, true);
-        const QString generated = body.value("notes").toString();
-        QString notes = m_editNotes->toPlainText();
-        const int old = notes.indexOf(QStringLiteral("## What's changed"));
-        if (old >= 0)
-            notes.truncate(old);  // regenerate: drop the earlier changelog, keep what was written above it
-        notes = notes.trimmed();
-        m_editNotes->setPlainText(notes.isEmpty() ? generated : notes + "\n\n" + generated);
-        const int n = body.value("commits").toArray().size();
-        const QString prev = body.value("previous").toString();
-        emit statusText(QString("Added %1 commit%2 %3 to the notes. Edit them, then save.")
-                            .arg(n).arg(n == 1 ? "" : "s").arg(prev.isEmpty() ? "(all history)" : "since " + prev),
-                        false);
     });
 }
 

@@ -78,7 +78,9 @@ class NewReleaseBody(BaseModel):
     ref: str | None = None  # commit to point at when the tag isn't in git (default: the default branch)
     prerelease: bool = False
     draft: bool = False
-    generate_notes: bool = False  # add a changelog: the commits since the previous release or tag
+    # A changelog of the commits since the previous release or tag: default = when no notes are given;
+    # true = after the given notes too; false = never.
+    generate_notes: bool | None = None
 
 
 class ReleaseUpdateBody(BaseModel):
@@ -255,6 +257,7 @@ def create_app(
     app.state.auth = auth
     app.state.forge = forge
     app.state.jobs = jobs
+    releases.base_url = lambda: jobs.base_url
     app.state.upstream = upstream
     app.state.releases = releases
     app.state.migrator = migrator

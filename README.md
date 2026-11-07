@@ -254,12 +254,13 @@ and go with deletes. Up to `FILEAPI_RELEASE_MAX_ASSET` bytes each (default 2 GiB
 pieces (`offset`, `final=false`), which keeps each request small however big the file; mind the Postgres
 plan's storage quota.
 
-**Changelogs.** A release's notes can be generated from git: the commits since the previous release or git
-tag behind it (or `since=` any tag/branch/commit), merges left out, each linked to its diff in the web UI.
+**Changelogs.** A release made without notes gets a changelog written for it: the commits since the
+previous release or git tag behind it, merges left out, each linked to its diff in the web UI. That covers
+every way of making one (the UI, the API, MCP, `fileapi-release`, `upload --create` and tag jobs).
 Conventional-commit prefixes (`feat:`, `fix:`, `perf:`, `docs:`, `!` for breaking) sort them under
-headings; plain messages make one list. In the UI it's **Generate changelog** in the release editor (you can
-edit the result before saving); from the API `generate_notes: true` on create (added after any `notes`
-you give) or `GET …/releases/<tag>/changelog` to preview, which works before the release exists.
+headings; plain messages make one list. Releases from before this, with empty notes, get theirs the first
+time they're viewed. `generate_notes: false` keeps a new release's notes empty, `true` adds the changelog
+after notes you give, and `GET …/releases/<tag>/changelog?since=` previews one (even before the release exists).
 
 ```sh
 # curl: the body is the file (Bearer = your access token, or a repo pass / FORGE_TOKEN)
@@ -268,7 +269,7 @@ curl -H "Authorization: Bearer $TOKEN" -T dist/app.tar.gz \
 # the client (`just git-setup` installs it as fileapi-release): splits big files, signs in in the browser
 fileapi-release upload --create v1.2.0 dist/*
 fileapi-release create v1.3.0 --notes-file CHANGES.md --draft
-fileapi-release create v1.4.0 --generate-notes    # notes = the commits since v1.3.0
+fileapi-release create v1.4.0                     # notes = the commits since v1.3.0
 fileapi-release changelog v1.4.0 --since v1.2.0  # just print them
 fileapi-release download latest -o ./bin
 ```
@@ -280,7 +281,7 @@ From CI: a job with `tags` runs when a matching tag is pushed, and every job get
 [[job]]
 name = "release"
 tags = ["v*"]
-run = "make dist && forge-release create $FORGE_TAG --generate-notes && forge-release upload $FORGE_TAG dist/*"
+run = "make dist && forge-release upload --create $FORGE_TAG dist/*"
 ```
 
 MCP: `list_releases`, `create_release` (`generate_notes`), `release_changelog`, `update_release`, `delete_release`, `upload_release_asset` (small
